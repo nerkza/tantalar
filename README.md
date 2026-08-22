@@ -3,7 +3,8 @@
 One self-hosted web app to replace the Plex + \*arr + downloader stack. Library serving, wanted-list automation, indexer search, NZB/torrent acquisition, and post-processing — built "everything is a module/plugin" from the ground up.
 
 - **PRD**: [PRD.md](./PRD.md) (source of truth also at `/srv/knowledge_base/wiki/projects/tantalar/prd.md`)
-- **Status**: pre-development — PRD complete, roadmap pending
+- **Status**: pre-development — PRD (Issue #1) and roadmap (`docs/roadmap.md`) complete; Phase 1 next
+- **Roadmap**: [docs/roadmap.md](./docs/roadmap.md) — 6 phases, core kernel first
 - **License**: MIT (planned)
 - **Stack (planned)**: TypeScript end-to-end · React + Mantine · ffmpeg/HLS · SQLite default / Postgres optional · single Docker image
 
