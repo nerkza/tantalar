@@ -64,13 +64,15 @@ Target user: technical self-hosters replacing their existing *arr + Plex stack.
 28. As an admin, I want one-command deployment (single Docker image) with SQLite default and Postgres option.
 29. As an admin, I want API keys and webhook events so other tools integrate with Tantalar.
 30. As a plugin developer, I want plugin sandboxing so a crashing plugin cannot take down the server.
+31. As an admin, I want VPN support (OpenVPN and WireGuard) so download-client traffic routes through a tunnel.
+32. As an admin, I want a kill switch so downloads halt instead of leaking traffic when the tunnel drops.
 
 ## Implementation Decisions
 
 ### Architecture
 
 - **Core kernel**: process supervision, config, database access, scheduler, typed event bus, service container with `inject`-style dependency declaration, reversible plugin mounting, auth, REST/WebSocket API surface.
-- **Built-in modules** (mount via the same public plugin contract): Series automation, Movies automation, Indexer layer, Download-client abstraction (NZB + torrent), Post-processor/importer, Media library, Streaming/transcode server, Web admin UI, Player UI.
+- **Built-in modules** (mount via the same public plugin contract): Series automation, Movies automation, Indexer layer, Download-client abstraction (NZB + torrent), VPN manager (OpenVPN/WireGuard; per-client tunnel binding with kill-switch), Post-processor/importer, Media library, Streaming/transcode server, Web admin UI, Player UI.
 - **Plugin contract**: out-of-process over gRPC (or HTTP+protobuf fallback). Language-agnostic; crash-isolated via supervisor; resource-limited. Manifest declares services provided/events consumed.
 - **Event log**: append-only, typed events across domains (acquisition / import / serve). Powers the Activity view, debugging, and audit. Replay-safe design inspired by DeepSeek Harness's session log.
 - **Configuration composition**: layered config (defaults → profile → host → CLI overrides); `--dump-config` prints effective tree; anything printed is patchable.

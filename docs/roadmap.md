@@ -44,6 +44,7 @@ Exit criteria: an external developer can build, test, and install a working plug
 - [ ] Release comparison engine (quality, size, seeders, proper/repack) — deep module, heavily tested
 - [ ] Interactive search; failed-download blacklist + re-search
 - [ ] Private-tracker support as per-tracker plugin/config (announce safety, seed goals)
+- [ ] VPN module: OpenVPN and WireGuard protocol support; bindable per download-client so traffic is routed (or killed) via tunnel — kill-switch behaviour on tunnel drop
 
 ## Phase 4 — Library & Import
 
