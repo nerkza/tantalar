@@ -1,0 +1,39 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2023"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": false,
+    "noImplicitOverride": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "outDir": "dist",
+    "types": ["node"]
+  },
+  "references": [
+    { "path": "packages/contracts" },
+    { "path": "packages/config" },
+    { "path": "packages/db" },
+    { "path": "packages/plugin-sdk" },
+    { "path": "packages/testkit" },
+    { "path": "apps/server" },
+    { "path": "plugins/hello-world" },
+    { "path": "plugins/fixture-indexer" },
+    { "path": "plugins/fixture-download-client" },
+    { "path": "plugins/fixture-tracker" },
+    { "path": "plugins/qbittorrent" },
+    { "path": "plugins/sabnzbd" },
+    { "path": "plugins/vpn-manager" },
+    { "path": "plugins/webhook" },
+    { "path": "plugins/mcp-server" },
+    { "path": "plugins/library" },
+    { "path": "plugins/metadata-tmdb-tvdb" }
+  ],
+  "files": []
+}

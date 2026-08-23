@@ -1,0 +1,9 @@
+{
+  "id": "dev.tantalar.plugin.hello-world",
+  "version": "0.1.0",
+  "protocolVersion": 1,
+  "provides": ["dev.tantalar.capability.hello.greet"],
+  "requires": ["dev.tantalar.capability.event.emit"],
+  "subscriptions": [],
+  "entry": { "command": "node dist/plugin.js" }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "@tantalar/testkit",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@tantalar/contracts": "workspace:*",
+    "@tantalar/db": "workspace:*",
+    "@tantalar/plugin-sdk": "workspace:*",
+    "@tantalar/server": "workspace:*",
+    "kysely": "^0.28.0"
+  }
+}

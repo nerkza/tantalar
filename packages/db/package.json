@@ -1,0 +1,22 @@
+{
+  "name": "@tantalar/db",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "kysely": "^0.28.0",
+    "better-sqlite3": "^12.0.0",
+    "pg": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/pg": "^8.15.0"
+  }
+}

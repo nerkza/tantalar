@@ -1,0 +1,14 @@
+{
+  "name": "dev.tantalar.plugin.serving",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": { "serving-plugin": "./dist/plugin.js" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@tantalar/plugin-sdk": "workspace:*",
+    "@tantalar/contracts": "workspace:*"
+  }
+}
