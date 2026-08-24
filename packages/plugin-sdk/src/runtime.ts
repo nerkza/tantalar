@@ -29,6 +29,16 @@ export interface PluginContext {
    */
   introspectApiKey(key: string): Promise<{ valid: boolean; identity: string; scopes: string[] }>;
   log(level: "debug" | "info" | "warn" | "error", message: string): void;
+  /**
+   * Wave 3 (TAN-013) durable storage bridge. Documents live in core's
+   * database under this plugin's id, so state survives restarts and crash
+   * recovery. Plugins never receive a database handle — only these calls.
+   */
+  storage: {
+    get(key: string): Promise<{ doc: unknown; updatedAt: string } | null>;
+    put(key: string, doc: unknown): Promise<void>;
+    delete(key: string): Promise<boolean>;
+  };
 }
 
 export interface PluginDefinition {
@@ -122,6 +132,33 @@ export function runPlugin(plugin: PluginDefinition): void {
     log: (level, message) => {
       // Fire-and-forget diagnostics; core records them in structured logs.
       send({ id: nextId(), op: "log", payload: { level, message } });
+    },
+    storage: {
+      get: async (key) => {
+        const id = nextId();
+        send({ id, op: "storage", payload: { action: "get", key } });
+        const raw = (await waitForResponse(id)) as
+          | { value?: { doc?: unknown; updatedAt?: string } | null; error?: string }
+          | undefined;
+        if (raw && typeof raw === "object" && "error" in raw && raw.error)
+          throw new Error(String(raw.error));
+        const v = raw && typeof raw === "object" && "value" in raw ? raw.value : null;
+        if (!v || typeof v !== "object") return null;
+        return { doc: v.doc ?? null, updatedAt: String(v.updatedAt ?? "") };
+      },
+      put: async (key, doc) => {
+        const id = nextId();
+        send({ id, op: "storage", payload: { action: "put", key, doc } });
+        await waitForResponse(id);
+      },
+      delete: async (key) => {
+        const id = nextId();
+        send({ id, op: "storage", payload: { action: "delete", key } });
+        const raw = (await waitForResponse(id)) as { value?: unknown; error?: string } | undefined;
+        if (raw && typeof raw === "object" && "error" in raw && raw.error)
+          throw new Error(String(raw.error));
+        return Boolean(raw && typeof raw === "object" && "value" in raw ? raw.value : false);
+      },
     },
   };
 

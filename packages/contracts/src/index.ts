@@ -127,6 +127,29 @@ export const EventTypes = {
   PlaybackProgress: "dev.tantalar.event.playback.progress",
   TranscodeSessionOpened: "dev.tantalar.event.transcode.session.opened",
   TranscodeSessionClosed: "dev.tantalar.event.transcode.session.closed",
+  /**
+   * Wave 3 (TAN-020/021) library management. Every library mutation and
+   * catalog change emits a traceable event; `library.media.deleted` fires
+   * ONLY on the explicit confirmDeleteMedia path — never on library removal.
+   */
+  LibraryCreated: "dev.tantalar.event.library.created",
+  LibraryEdited: "dev.tantalar.event.library.edited",
+  LibraryRemoved: "dev.tantalar.event.library.removed",
+  LibraryEnabledChanged: "dev.tantalar.event.library.enabled.changed",
+  LibraryValidated: "dev.tantalar.event.library.validated",
+  LibraryRescanCompleted: "dev.tantalar.event.library.rescan.completed",
+  MediaCataloged: "dev.tantalar.event.media.cataloged",
+  MediaDeleted: "dev.tantalar.event.library.media.deleted",
+  /**
+   * Wave 7 (TAN-014/016/017/018): provider health, discovery, and decision
+   * history. Provider failures and rate-limit states are events so operator
+   * surfaces stay truthful; every accepted OR rejected release decision is
+   * an immutable event with human-readable reasons.
+   */
+  IndexerProviderError: "dev.tantalar.event.indexer.provider.error",
+  IndexerCapsRefreshed: "dev.tantalar.event.indexer.caps.refreshed",
+  MetadataSearchCompleted: "dev.tantalar.event.metadata.search.completed",
+  ReleaseDecisionRecorded: "dev.tantalar.event.release.decision.recorded",
 } as const;
 
 // ---- Phase 3a: provider-neutral indexer schemas ------------------------------
@@ -424,6 +447,152 @@ export function validateDownloadRequest(input: unknown): DownloadRequest {
   };
 }
 
+// ---- Tracker rules (TAN-015) ---------------------------------------------------
+//
+// Private trackers impose per-tracker obligations: minimum share ratio,
+// minimum seed time, tag/limit policy, and safe-removal rules. Tantalar
+// NEVER removes payload data before every obligation of the tracker that
+// served the download passes. Rules are matched by tracker id and by
+// announce-URL host patterns, so two trackers with the same plugin still
+// get independent rules.
+
+/** Capability id for the torrent-native tracker-rules surface. */
+export const TRACKER_RULES_CAPABILITY = "dev.tantalar.capability.torrent.tracker-rules";
+
+export interface TrackerRule {
+  /** Stable rule id (operator-chosen, unique). */
+  readonly id: string;
+  /** Human label shown in the UI. */
+  readonly name: string;
+  /**
+   * Host substrings matched against a job's announce URLs. Empty = default
+   * rule applied to jobs whose announce URLs match no other rule.
+   */
+  readonly announceHosts: readonly string[];
+  /** Minimum upload/download ratio before removal is allowed. */
+  readonly minRatio: number;
+  /** Minimum seeding time in hours before removal is allowed. */
+  readonly minSeedTimeHours: number;
+  /** Tag applied to the job in the engine (per-tracker grouping). */
+  readonly tag?: string;
+  /** Max concurrent downloads through this tracker (0 = unlimited). */
+  readonly maxConcurrent: number;
+  /**
+   * When true the operator explicitly allows removal of data after all
+   * obligations pass. When false, removal ALWAYS keeps payload files.
+   */
+  readonly allowDataRemoval: boolean;
+  readonly enabled: boolean;
+}
+
+export interface TrackerRuleInput {
+  readonly name: string;
+  readonly announceHosts?: readonly string[];
+  readonly minRatio?: number;
+  readonly minSeedTimeHours?: number;
+  readonly tag?: string;
+  readonly maxConcurrent?: number;
+  readonly allowDataRemoval?: boolean;
+  readonly enabled?: boolean;
+}
+
+/** Seeding counters reported by the engine for one job. */
+export interface SeedingStats {
+  readonly uploadedBytes: number;
+  readonly downloadedBytes: number;
+  readonly seedingSeconds: number;
+  readonly ratio: number;
+}
+
+export type ObligationStatus = "satisfied" | "unsatisfied" | "no-rule";
+
+export interface ObligationReport {
+  readonly downloadId: string;
+  readonly ruleId: string | null;
+  readonly ruleName: string | null;
+  readonly status: ObligationStatus;
+  /** Unmet conditions in human-readable form; empty when satisfied. */
+  readonly reasons: readonly string[];
+  readonly stats: SeedingStats | null;
+}
+
+export class TrackerRuleError extends Error {
+  readonly code: "invalid_rule" | "unknown_rule" | "duplicate_rule" | "obligations_unmet";
+  constructor(code: TrackerRuleError["code"], message: string) {
+    super(message);
+    this.code = code;
+    this.name = "TrackerRuleError";
+  }
+}
+
+export function validateTrackerRule(input: unknown): TrackerRuleInput {
+  const r = input as Partial<TrackerRuleInput>;
+  if (!r || typeof r !== "object") throw new TrackerRuleError("invalid_rule", "rule must be an object");
+  if (typeof r.name !== "string" || r.name.trim().length === 0 || r.name.length > 120)
+    throw new TrackerRuleError("invalid_rule", "name must be 1-120 characters");
+  if (r.announceHosts !== undefined) {
+    if (!Array.isArray(r.announceHosts)) throw new TrackerRuleError("invalid_rule", "announceHosts must be an array");
+    for (const h of r.announceHosts) {
+      if (typeof h !== "string" || h.trim().length === 0)
+        throw new TrackerRuleError("invalid_rule", "announceHosts entries must be non-empty strings");
+    }
+  }
+  if (r.minRatio !== undefined && (!Number.isFinite(r.minRatio) || r.minRatio < 0))
+    throw new TrackerRuleError("invalid_rule", "minRatio must be a non-negative number");
+  if (r.minSeedTimeHours !== undefined && (!Number.isFinite(r.minSeedTimeHours) || r.minSeedTimeHours < 0))
+    throw new TrackerRuleError("invalid_rule", "minSeedTimeHours must be a non-negative number");
+  if (r.maxConcurrent !== undefined && (!Number.isInteger(r.maxConcurrent) || r.maxConcurrent < 0))
+    throw new TrackerRuleError("invalid_rule", "maxConcurrent must be a non-negative integer");
+  return r as TrackerRuleInput;
+}
+
+/** Find the rule governing a job's announce URLs; first match wins. */
+export function matchTrackerRule(
+  rules: readonly TrackerRule[],
+  announceUrls: readonly string[],
+): TrackerRule | null {
+  for (const rule of rules) {
+    if (!rule.enabled) continue;
+    for (const host of rule.announceHosts) {
+      if (announceUrls.some((u) => u.includes(host))) return rule;
+    }
+  }
+  // Default rule: enabled rule with no hosts.
+  return rules.find((r) => r.enabled && r.announceHosts.length === 0) ?? null;
+}
+
+/**
+ * Evaluate a job's tracker obligations. Returns a report; removal of data
+ * is allowed only when status is "satisfied" (or "no-rule" with an explicit
+ * operator override at the call site — never silently).
+ */
+export function evaluateObligations(
+  downloadId: string,
+  rule: TrackerRule | null,
+  stats: SeedingStats | null,
+): ObligationReport {
+  if (!rule) {
+    return { downloadId, ruleId: null, ruleName: null, status: "no-rule", reasons: [], stats };
+  }
+  const reasons: string[] = [];
+  const s = stats ?? { uploadedBytes: 0, downloadedBytes: 0, seedingSeconds: 0, ratio: 0 };
+  if (s.ratio < rule.minRatio) {
+    reasons.push(`ratio ${s.ratio.toFixed(2)} below required ${rule.minRatio}`);
+  }
+  const seededHours = s.seedingSeconds / 3600;
+  if (seededHours < rule.minSeedTimeHours) {
+    reasons.push(`seed time ${seededHours.toFixed(1)}h below required ${rule.minSeedTimeHours}h`);
+  }
+  return {
+    downloadId,
+    ruleId: rule.id,
+    ruleName: rule.name,
+    status: reasons.length === 0 ? "satisfied" : "unsatisfied",
+    reasons,
+    stats: s,
+  };
+}
+
 // ---- Phase 3b: release-comparison schemas ------------------------------------
 //
 // The comparer is a replaceable capability (built-in default provider).
@@ -537,7 +706,9 @@ export type ImportMethod = "hardlink" | "copy";
 export interface RenameScheme {
   readonly name: string;
   /**
-   * Template with {series},{season},{episode},{title},{year},{quality}
+   * Template with placeholders. Episode templates accept {series},{season},
+   * {episode},{seasonPad2},{episodePad2},{title},{year},{quality},{codec},
+   * {language},{edition}; movie templates the same minus the episode/season
    * placeholders. Validated to reject path traversal and absolute escapes.
    */
   readonly episodeTemplate: string;
@@ -559,7 +730,7 @@ export function validateRenameTemplate(template: string): string {
     throw new ImportError("invalid_template", "template must be a non-empty string");
   if (template.includes("..") || template.startsWith("/") || /^[a-zA-Z]:/.test(template))
     throw new ImportError("path_escape", "template must not traverse outside the library root");
-  const known = ["series", "season", "episode", "title", "year", "quality", "seasonPad2", "episodePad2"];
+  const known = ["series", "season", "episode", "title", "year", "quality", "seasonPad2", "episodePad2", "codec", "language", "edition"];
   for (const ph of template.match(/\{([^}]*)\}/g) ?? []) {
     if (!known.includes(ph.slice(1, -1)))
       throw new ImportError("invalid_template", `unknown placeholder ${ph}`);
@@ -767,4 +938,114 @@ export function validateResumeUpdate(input: unknown): { fileId: string; position
     positionMs: Math.trunc(r.positionMs),
     ...(r.durationMs !== undefined ? { durationMs: Math.trunc(r.durationMs) } : {}),
   };
+}
+
+// ---- Wave 5 (TAN-011): unified durable download_jobs contract ------------------
+//
+// One stable, provider-neutral job record for every acquisition source
+// (torrent + usenet). Core owns the durable state; download-client plugins
+// mirror their engine progress into it through the DownloadJobStore. The
+// record carries the full transactional lifecycle: progress, ETA, warnings,
+// retry bookkeeping, source identity, failure reason, removal flag, and the
+// import handoff pointer. Durable history is append-shaped: terminal jobs are
+// never deleted, only flagged removed.
+
+export type DownloadJobSource = "torrent" | "usenet";
+
+export interface DownloadJobRecord {
+  readonly jobId: string;
+  /** Stable wanted-item id this job serves; idempotency key per source. */
+  readonly itemKey: string;
+  readonly title: string;
+  readonly source: DownloadJobSource;
+  /** Plugin id that executes the job (e.g. dev.tantalar.plugin.usenet-native). */
+  readonly providerPluginId: string;
+  readonly state: DownloadState;
+  /** 0..100 */
+  readonly progressPercent: number;
+  readonly sizeBytes: number;
+  /** Bytes on disk so far. */
+  readonly receivedBytes: number;
+  /** ISO-8601 timestamp or null when unknown. */
+  readonly etaAt: string | null;
+  /** Non-fatal notes (repair ran, CRC mismatch retried, …). */
+  readonly warnings: readonly string[];
+  readonly retryCount: number;
+  /** Provider-neutral source reference (magnet URI, .torrent path, NZB path). */
+  readonly sourceRef: string;
+  readonly failureReason: string | null;
+  /** True once the user removed the job from the queue (history retained). */
+  readonly removed: boolean;
+  /** Wave 9 (TAN-030): queue priority; higher runs first. */
+  readonly priority: number;
+  /** Import handoff: set when the completed payload was handed to the importer. */
+  readonly importHandoffPath: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export const DOWNLOAD_JOB_STATES: ReadonlySet<DownloadState> = new Set([
+  "queued",
+  "downloading",
+  "paused",
+  "completed",
+  "failed",
+  "cancelled",
+]);
+
+export class DownloadJobError extends Error {
+  readonly code: "invalid_request" | "unknown_job";
+  constructor(code: "invalid_request" | "unknown_job", message: string) {
+    super(message);
+    this.code = code;
+    this.name = "DownloadJobError";
+  }
+}
+
+// ---- Wave 7 (TAN-014/016/017/018): discovery + decision schemas ---------------
+//
+// Provider-neutral shapes for the real Torznab/Newznab indexer plugins, the
+// metadata discovery surface, and the release decision record. Core never
+// parses provider wire formats — the plugins adapt them into these shapes.
+
+/**
+ * Indexer capabilities discovered from a provider (Torznab caps / Newznab
+ * function list). Cached by the plugin; `fetchedAt` records cache age.
+ */
+export interface IndexerCapabilities {
+  readonly protocol: "torznab" | "newznab";
+  readonly categories: ReadonlyArray<{ id: number; name: string }>;
+  readonly searchModes: readonly ("search" | "tv-search" | "movie-search")[];
+  readonly limits: IndexerLimits;
+  /** ISO-8601 timestamp of when the caps were last fetched from the provider. */
+  readonly fetchedAt: string | null;
+}
+
+/**
+ * A durable release decision (TAN-018). One record per accepted OR rejected
+ * candidate; `reasons` are human-readable sentences suitable for direct
+ * display. `overridden` marks an operator manual override of the automatic
+ * verdict; `blocked` marks releases added to the durable blocklist.
+ */
+export interface ReleaseDecisionRecord {
+  readonly decisionId: string;
+  readonly itemKey: string;
+  readonly mode: "automatic" | "interactive";
+  readonly outcome: "accepted" | "rejected";
+  readonly guid: string;
+  readonly title: string;
+  readonly reasons: readonly string[];
+  readonly overridden: boolean;
+  readonly blocked: boolean;
+  readonly decidedAt: string;
+}
+
+/** Validate + normalize an interactive/automatic blocklist entry. */
+export interface BlocklistEntry {
+  readonly guid: string;
+  readonly itemKey: string;
+  readonly reason: string;
+  /** ISO-8601 expiry; null = permanent. Expired entries stop blocking. */
+  readonly expiresAt: string | null;
+  readonly createdAt: string;
 }

@@ -19,6 +19,12 @@ import type { Supervisor } from "./supervisor.js";
 import type { ServiceContainer } from "./container.js";
 import { registerServingRoutes, type ServingDeps } from "./serving.js";
 import { registerAdminRoutes, type AdminDeps } from "./admin.js";
+import { registerLibraryRoutes, type LibraryDeps } from "./library-routes.js";
+import { registerIndexerRoutes, type IndexerDeps } from "./indexer-routes.js";
+import { registerOpsRoutes, type OpsDeps } from "./ops-routes.js";
+import { registerNamingRoutes, type NamingDeps } from "./naming-routes.js";
+import type { IndexerSettingsService } from "./indexer-settings.js";
+import { OnboardingService, OnboardingError } from "./onboarding.js";
 import type { Kysely } from "kysely";
 import type { Db } from "@tantalar/db";
 
@@ -29,8 +35,22 @@ export interface ServerDeps {
   supervisor: Supervisor;
   container: ServiceContainer;
   ready: () => boolean;
+  /** Truthful readiness detail (missing capabilities etc.). Optional for direct buildServer callers. */
+  readiness?: () => {
+    ready: boolean;
+    listening: boolean;
+    missingCapabilities: string[];
+  };
   /** Phase 5A serving surface; absent until the serving plugin is configured. */
   serving?: (invoke: (operation: string, payload: Record<string, unknown>) => Promise<unknown>) => ServingDeps;
+  /** Test hook: omit the guided-onboarding routes. */
+  onboardingDisabled?: boolean;
+  /** Wave 3 (TAN-020/021) library management surface; present with a DB handle. */
+  library?: LibraryDeps["service"];
+  /** Wave 7 (TAN-014) indexer add/test/enable surface; present with a DB handle. */
+  indexerSettings?: IndexerSettingsService;
+  /** Wave 9 (TAN-030–043) operations surface deps; present with a DB handle. */
+  ops?: OpsDeps;
 }
 
 interface AuthContext {
@@ -41,6 +61,7 @@ interface AuthContext {
 }
 
 const LoginBody = Type.Object({ username: Type.String(), password: Type.String() });
+const StepActionBody = Type.Object({ action: Type.Union([Type.Literal("complete"), Type.Literal("skip")]) });
 
 function bearerToken(header: unknown): string | undefined {
   if (typeof header !== "string") return undefined;
@@ -108,8 +129,82 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   app.get("/healthz", async () => ({ ok: true }));
   app.get("/readyz", async (_req: any, reply: any) => {
     if (deps.ready()) return { ok: true };
-    return reply.code(503).send({ ok: false });
+    const detail = deps.readiness?.();
+    return reply.code(503).send({
+      ok: false,
+      listening: detail?.listening ?? null,
+      missingCapabilities: detail?.missingCapabilities ?? [],
+    });
   });
+
+  // Secure one-time bootstrap (wave 2, TAN-002): when no user exists yet,
+  // exactly one administrator may be created without a session. The check
+  // and insert share a database transaction (AuthService.createInitialAdmin),
+  // so concurrent requests cannot create two bootstrap administrators. Once
+  // any user exists the endpoint is permanently closed (403) — it can never
+  // create a second account or overwrite an existing one.
+  app.get("/api/v1/bootstrap/status", async () => ({
+    required: await deps.auth.isBootstrapRequired(),
+  }));
+
+  app.post("/api/v1/bootstrap/admin", async (request: any, reply: any) => {
+    if (!deps.db) return reply.code(503).send({ error: "storage unavailable" });
+    const body = (request.body ?? {}) as { username?: string; password?: string };
+    const result = await deps.auth.createInitialAdmin(
+      String(body.username ?? ""),
+      String(body.password ?? ""),
+    );
+    if (!result.ok) {
+      return reply.code(result.reason === "closed" ? 403 : 400).send({
+        error:
+          result.reason === "closed"
+            ? "Setup is already complete. Sign in with your administrator account."
+            : "Choose a username and a password of at least 8 characters.",
+      });
+    }
+    return { ok: true };
+  });
+
+  // ---- Wave 2 guided onboarding (TAN-003): durable, resumable wizard ----
+  if (deps.db && !deps.onboardingDisabled) {
+    const onboarding = new OnboardingService(deps.db);
+
+    app.get("/api/v1/onboarding", async (request: any, reply: any) => {
+      // First-run probe: before the administrator exists there is no session
+      // to authenticate, so the wizard could never appear. The read is
+      // anonymous only while bootstrap is required (zero users); it exposes
+      // nothing but step statuses. Mutations always require auth + CSRF.
+      if (await deps.auth.isBootstrapRequired()) {
+        return onboarding.getState();
+      }
+      const auth = await requireAuth(reply, request);
+      if (!auth) return;
+      return onboarding.getState();
+    });
+
+    app.post(
+      "/api/v1/onboarding/steps/:stepId",
+      { schema: { body: StepActionBody } },
+      async (request: any, reply: any) => {
+        const auth = await requireAuth(reply, request);
+        if (!auth) return;
+        if (auth.kind !== "session" || auth.role !== "admin") {
+          return reply.code(403).send({ error: "administrator access required" });
+        }
+        if (!csrfOk(request)) return reply.code(403).send({ error: "csrf required" });
+        try {
+          const state = await onboarding.setStep(
+            String(request.params?.stepId ?? ""),
+            request.body.action,
+          );
+          return state;
+        } catch (err) {
+          const status = err instanceof OnboardingError ? err.statusCode : 500;
+          return reply.code(status).send({ error: (err as Error).message });
+        }
+      },
+    );
+  }
 
   app.post(
     "/api/v1/auth/login",
@@ -282,6 +377,89 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     registerAdminRoutes(app, adminDeps);
   }
 
+  // ---- Wave 3 library management (TAN-020/021) ----
+  // Same guard chain as admin: authenticated, admin-only for mutations,
+  // CSRF on cookie mutations. Reads are available to any signed-in user.
+  if (deps.library) {
+    registerLibraryRoutes(app, {
+      service: deps.library,
+      // Reads: any authenticated user. Mutations: admin + CSRF.
+      requireUser: async (request: any, reply: any) => {
+        const auth = await requireAuth(reply, request);
+        return auth ? { userId: auth.userId ?? "", role: auth.role ?? "viewer" } : null;
+      },
+      requireAdmin: async (request: any, reply: any) => {
+        const auth = await requireAuth(reply, request);
+        if (!auth) return null;
+        if (auth.kind !== "session" || auth.role !== "admin") {
+          await reply.code(403).send({ error: "administrator access required" });
+          return null;
+        }
+        return { userId: auth.userId ?? "", role: "admin" };
+      },
+      csrfOk,
+    });
+  }
+
+  // ---- Wave 7 indexer management (TAN-014) ----
+  // Same guard chain as libraries: authenticated reads, admin + CSRF
+  // mutations. Indexer records are always redacted (no apikey leaves core).
+  if (deps.indexerSettings) {
+    registerIndexerRoutes(app, {
+      service: deps.indexerSettings,
+      requireUser: async (request: any, reply: any) => {
+        const auth = await requireAuth(reply, request);
+        return auth ? { userId: auth.userId ?? "", role: auth.role ?? "viewer" } : null;
+      },
+      requireAdmin: async (request: any, reply: any) => {
+        const auth = await requireAuth(reply, request);
+        if (!auth) return null;
+        if (auth.kind !== "session" || auth.role !== "admin") {
+          await reply.code(403).send({ error: "administrator access required" });
+          return null;
+        }
+        return { userId: auth.userId ?? "", role: "admin" };
+      },
+      csrfOk,
+    });
+  }
+
+  // ---- Wave 10 naming/import settings (TAN-022) ----
+  // Reads for any signed-in user; mutations admin-only with CSRF. All work
+  // flows through the library plugin's public importer capability.
+  {
+    const invokeImporter = async (operation: string, payload: Record<string, unknown>) => {
+      const provider = deps.container.resolve("dev.tantalar.capability.importer");
+      return provider.invoke(operation, payload);
+    };
+    const importerAvailable = deps.container.hasProviders("dev.tantalar.capability.importer");
+    if (importerAvailable) {
+    registerNamingRoutes(app, {
+      invoke: invokeImporter,
+      requireUser: async (request: any, reply: any) => {
+        const auth = await requireAuth(reply, request);
+        return auth ? { userId: auth.userId ?? "", role: auth.role ?? "viewer" } : null;
+      },
+      requireAdmin: async (request: any, reply: any) => {
+        const auth = await requireAuth(reply, request);
+        if (!auth) return null;
+        if (auth.kind !== "session" || auth.role !== "admin") {
+          await reply.code(403).send({ error: "administrator access required" });
+          return null;
+        }
+        return { userId: auth.userId ?? "", role: "admin" };
+      },
+      csrfOk,
+    });
+    }
+  }
+
+  // ---- Wave 9 operations surface (TAN-030–043) ----
+  // Same guard chain as admin: authenticated, admin-only mutations with CSRF.
+  if (deps.ops) {
+    registerOpsRoutes(app, deps.ops);
+  }
+
   // Web UI (architecture §4): in production the built SPA under apps/web/dist
   // is served by this process. Absent dist (dev: vite dev server on :5173
   // proxies /api here) means API-only — never a hard failure.
@@ -320,6 +498,29 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       "/api/v1/plugins": { get: { responses: { "200": { description: "plugin list" } } } },
       "/api/v1/plugins/{id}/capabilities/{capability}/{operation}": {
         post: { responses: { "200": { description: "capability result" }, "503": { description: "capability unavailable" } } },
+      },
+      "/api/v1/bootstrap/admin": {
+        post: {
+          responses: {
+            "200": { description: "initial administrator created" },
+            "400": { description: "invalid credentials" },
+            "403": { description: "bootstrap already completed" },
+          },
+        },
+      },
+      "/api/v1/onboarding": {
+        get: { responses: { "200": { description: "guided-onboarding state" } } },
+      },
+      "/api/v1/onboarding/steps/{stepId}": {
+        post: {
+          requestBody: { content: { "application/json": { schema: StepActionBody } } },
+          responses: {
+            "200": { description: "step updated" },
+            "400": { description: "step cannot be skipped" },
+            "404": { description: "unknown step" },
+            "409": { description: "earlier steps still pending" },
+          },
+        },
       },
     },
   }));

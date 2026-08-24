@@ -2,7 +2,7 @@
 # PostgreSQL via config/secret. Build from the repo root:
 #   docker build -t tantalar:v1 .
 # Run (SQLite):
-#   docker run -p 8787:8787 -v tantalar-data:/data tantalar:v1
+#   docker run -p 8790:8790 -v tantalar-data:/data tantalar:v1
 # See docs/deploy.md for PostgreSQL mode and compose examples.
 
 FROM node:22-bookworm-slim AS build
@@ -33,9 +33,9 @@ RUN chmod +x /usr/local/bin/tantalar-entrypoint \
   && mkdir -p /data /config \
   && ln -s /data /app/data
 
-EXPOSE 8787
+EXPOSE 8790
 HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \
-  CMD curl -fsS http://127.0.0.1:${TANTALAR_PORT:-8787}/healthz || exit 1
+  CMD curl -fsS http://127.0.0.1:${TANTALAR_PORT:-8790}/healthz || exit 1
 
 ENTRYPOINT ["tantalar-entrypoint"]
 CMD ["server"]

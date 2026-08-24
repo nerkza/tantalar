@@ -30,7 +30,7 @@ type Json = Record<string, unknown>;
 export const DEFAULT_CONFIG: Json = {
   server: {
     host: "127.0.0.1",
-    port: 8787,
+    port: 8790, // default surface port (wave 1); TANTALAR_PORT still overrides in containers
   },
   database: {
     dialect: "sqlite", // "sqlite" | "postgres"
@@ -47,7 +47,31 @@ export const DEFAULT_CONFIG: Json = {
     csrfCookie: "tantalar_csrf",
   },
   plugins: {
-    set: {}, // id -> { enabled: true, config: {...} }
+    // Standard install (wave 1 decision): the first-party modules below mount
+    // by default so the required capabilities exist. Every first-party module
+    // speaks the public capability contract (ADR-0006); none link core.
+    // Paths resolve relative to the process working directory (repo root or
+    // /app in the container image).
+    set: {
+      "dev.tantalar.plugin.fixture-indexer": { enabled: true, manifestPath: "plugins/fixture-indexer/manifest.json" },
+      "dev.tantalar.plugin.fixture-tracker": { enabled: true, manifestPath: "plugins/fixture-tracker/manifest.json" },
+      "dev.tantalar.plugin.fixture-download-client": { enabled: true, manifestPath: "plugins/fixture-download-client/manifest.json" },
+      "dev.tantalar.plugin.library": { enabled: true, manifestPath: "plugins/library/manifest.json" },
+      "dev.tantalar.plugin.metadata-tmdb-tvdb": { enabled: true, manifestPath: "plugins/metadata-tmdb-tvdb/manifest.json" },
+      "dev.tantalar.plugin.movies": { enabled: true, manifestPath: "plugins/movies/manifest.json" },
+      "dev.tantalar.plugin.series": { enabled: true, manifestPath: "plugins/series/manifest.json" },
+      "dev.tantalar.plugin.serving": { enabled: true, manifestPath: "plugins/serving/manifest.json" },
+      "dev.tantalar.plugin.vpn-manager": { enabled: true, manifestPath: "plugins/vpn-manager/manifest.json" },
+    } as Json,
+    // Readiness gate (wave 1 decision): these capabilities MUST have live
+    // providers before /readyz reports ready. Mount completion alone is not
+    // capability readiness.
+    requiredCapabilities: [
+      "dev.tantalar.capability.indexer",
+      "dev.tantalar.capability.importer",
+      "dev.tantalar.capability.metadata-provider",
+      "dev.tantalar.capability.serving",
+    ] as unknown as Json,
     restart: {
       initialBackoffMs: 500,
       maxBackoffMs: 30000,

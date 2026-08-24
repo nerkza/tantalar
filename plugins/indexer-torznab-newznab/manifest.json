@@ -1,0 +1,9 @@
+{
+  "id": "dev.tantalar.plugin.indexer-torznab-newznab",
+  "version": "0.1.0",
+  "protocolVersion": 1,
+  "provides": ["dev.tantalar.capability.indexer"],
+  "requires": ["dev.tantalar.capability.event.emit", "dev.tantalar.capability.log"],
+  "subscriptions": [],
+  "entry": { "command": "node dist/plugin.js" }
+}

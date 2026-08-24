@@ -6,11 +6,15 @@
 set -eu
 
 CONFIG="${TANTALAR_CONFIG_FILE:-/config/tantalar.yaml}"
-PORT="${TANTALAR_PORT:-8787}"
+PORT="${TANTALAR_PORT:-8790}"
 DATA_DIR="${TANTALAR_DATA_DIR:-/data}"
 mkdir -p "$DATA_DIR" "$(dirname "$CONFIG")"
 
+# Durability decision (wave 1): the host config layer is a STARTER file.
+# It is written only when absent so operator edits survive container
+# restarts. Set TANTALAR_RESET_CONFIG=1 to regenerate it deliberately.
 write_config() {
+  [ -f "$CONFIG" ] && [ "${TANTALAR_RESET_CONFIG:-0}" != "1" ] && return 0
   # Host config layer: bind all interfaces; dialect from TANTALAR_DB_DIALECT
   # ("sqlite" default | "postgres" with TANTALAR_SECRET_DATABASE_POSTGRES_URL).
   DIALECT="${TANTALAR_DB_DIALECT:-sqlite}"

@@ -1,7 +1,14 @@
 /**
- * Shared dense-grid primitives (story 27): a TanStack Table wrapper with
- * sorting, text filtering, column show/hide customization, and density
- * control. Grid layout choices persist per user through ui-preferences.
+ * Shared dense-grid primitives (story 27, extended Wave 9 TAN-036/037/038):
+ * a TanStack Table wrapper with sorting, text filtering, column show/hide
+ * customization, and density control. Grid layout choices persist per user
+ * through ui-preferences.
+ *
+ * Wave 9 additions:
+ *  - `loading` renders fixed-height placeholder rows so table geometry never
+ *    jumps when data arrives;
+ *  - an accessible caption names the grid for screen readers;
+ *  - the filter input exposes an explicit label relationship.
  */
 import { useMemo, useState } from "react";
 import {
@@ -13,7 +20,7 @@ import {
   type ColumnDef,
   type SortingState,
 } from "@tanstack/react-table";
-import { Group, Menu, TextInput, Button, Table, Box } from "@mantine/core";
+import { Group, Menu, TextInput, Button, Table, Box, Skeleton } from "@mantine/core";
 
 export interface DenseGridProps<T> {
   columns: ReadonlyArray<ColumnDef<T, unknown>>;
@@ -23,6 +30,10 @@ export interface DenseGridProps<T> {
   layout?: GridLayout;
   onLayoutChange?: (layout: GridLayout) => void;
   emptyMessage?: string;
+  /** While true, placeholder rows render with stable geometry. */
+  loading?: boolean;
+  /** Accessible name for the table. Defaults to the test id. */
+  ariaLabel?: string;
 }
 
 export interface GridLayout {
@@ -30,7 +41,9 @@ export interface GridLayout {
   density: "dense" | "comfortable";
 }
 
-export function DenseGrid<T>({ columns, data, testId, layout, onLayoutChange, emptyMessage }: DenseGridProps<T>) {
+const LOADING_ROWS = 5;
+
+export function DenseGrid<T>({ columns, data, testId, layout, onLayoutChange, emptyMessage, loading, ariaLabel }: DenseGridProps<T>) {
   const [sorting, setSorting] = useState<SortingState>([]);
   const [globalFilter, setGlobalFilter] = useState("");
 
@@ -65,12 +78,13 @@ export function DenseGrid<T>({ columns, data, testId, layout, onLayoutChange, em
   };
 
   const padding = layout?.density === "dense" ? "4px 8px" : "8px 12px";
+  const leafCount = visibleColumns.length;
 
   return (
     <Box data-testid={testId}>
       <Group justify="space-between" mb="xs" wrap="wrap">
         <TextInput
-          aria-label={`Filter ${testId}`}
+          aria-label={`Filter ${ariaLabel ?? testId}`}
           placeholder="Filter…"
           value={globalFilter}
           onChange={(e) => setGlobalFilter(e.currentTarget.value)}
@@ -109,6 +123,7 @@ export function DenseGrid<T>({ columns, data, testId, layout, onLayoutChange, em
           highlightOnHover
           captionSide="top"
           className={layout?.density === "dense" ? "tantalar-grid-dense" : undefined}
+          aria-label={ariaLabel ?? testId}
         >
           <Table.Thead>
             {table.getHeaderGroups().map((hg) => (
@@ -123,7 +138,7 @@ export function DenseGrid<T>({ columns, data, testId, layout, onLayoutChange, em
                           ? "descending"
                           : "none"
                     }
-                    style={{ cursor: h.column.getCanSort() ? "pointer" : undefined, padding }}
+                    style={{ cursor: h.column.getCanSort() && !loading ? "pointer" : undefined, padding }}
                     onClick={h.column.getToggleSortingHandler()}
                     onKeyDown={(e) => {
                       if ((e.key === "Enter" || e.key === " ") && h.column.getCanSort()) {
@@ -131,7 +146,7 @@ export function DenseGrid<T>({ columns, data, testId, layout, onLayoutChange, em
                         h.column.getToggleSortingHandler()?.(e);
                       }
                     }}
-                    tabIndex={h.column.getCanSort() ? 0 : -1}
+                    tabIndex={h.column.getCanSort() && !loading ? 0 : -1}
                   >
                     {h.isPlaceholder ? null : flexRender(h.column.columnDef.header, h.getContext())}
                     {h.column.getIsSorted() ? (h.column.getIsSorted() === "asc" ? " ▲" : " ▼") : ""}
@@ -140,10 +155,20 @@ export function DenseGrid<T>({ columns, data, testId, layout, onLayoutChange, em
               </Table.Tr>
             ))}
           </Table.Thead>
-          <Table.Tbody>
-            {table.getRowModel().rows.length === 0 ? (
+          <Table.Tbody className={loading ? "tantalar-grid-loading" : undefined}>
+            {loading ? (
+              Array.from({ length: LOADING_ROWS }, (_, i) => (
+                <Table.Tr key={`loading-${i}`}>
+                  {Array.from({ length: leafCount }, (_, j) => (
+                    <Table.Td key={j} style={{ padding }}>
+                      <Skeleton height={12} radius="sm" />
+                    </Table.Td>
+                  ))}
+                </Table.Tr>
+              ))
+            ) : table.getRowModel().rows.length === 0 ? (
               <Table.Tr>
-                <Table.Td colSpan={table.getVisibleLeafColumns().length} style={{ padding }}>
+                <Table.Td colSpan={leafCount} style={{ padding }}>
                   {emptyMessage ?? "Nothing to show."}
                 </Table.Td>
               </Table.Tr>

@@ -5,9 +5,12 @@
  * saved state so "revert" is always possible without a reload.
  */
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { useMantineColorScheme } from "@mantine/core";
 import {
   applyTokens,
   sanitizeTokenOverrides,
+  LIGHT_TOKENS,
+  type ThemeScheme,
   type TokenMap,
 } from "./tokens";
 import { api, type TrajectoryEvent } from "../api";
@@ -25,6 +28,9 @@ interface ThemeContextValue {
   preview: TokenMap | null;
   themes: readonly SavedTheme[];
   activeThemeId: string | null;
+  /** Built-in light/dark scheme (wave 8); persisted per user. */
+  scheme: ThemeScheme;
+  setScheme: (scheme: ThemeScheme) => void;
   applyPreview: (tokens: Record<string, string>) => { ok: boolean; errors?: string[] };
   clearPreview: () => void;
   /** Persist preview (or explicit tokens) as the user's theme + preference. */
@@ -46,6 +52,9 @@ export function ThemeEngineProvider({ children, adminId }: { children: React.Rea
   const [preview, setPreview] = useState<TokenMap | null>(null);
   const [themes, setThemes] = useState<readonly SavedTheme[]>([]);
   const [activeThemeId, setActiveThemeId] = useState<string | null>(null);
+  // Wave 8: built-in light/dark scheme. Dark stays the product default.
+  const [scheme, setSchemeState] = useState<ThemeScheme>("dark");
+  const { setColorScheme } = useMantineColorScheme();
   // Latest known grid prefs, so a theme save can merge instead of clobbering
   // them with hardcoded defaults (review finding on parent t_89f131b7).
   const gridPrefsRef = useRef<{ gridDensity?: string; hiddenColumns?: string[] }>({});
@@ -68,6 +77,10 @@ export function ThemeEngineProvider({ children, adminId }: { children: React.Rea
       const overrides = (prefs.tokenOverrides && typeof prefs.tokenOverrides === "object")
         ? (prefs.tokenOverrides as TokenMap)
         : {};
+      if (prefs.colorScheme === "light" || prefs.colorScheme === "dark") {
+        setSchemeState(prefs.colorScheme);
+        setColorScheme(prefs.colorScheme);
+      }
       setActiveThemeId(themeId);
       setSaved(overrides);
     })();
@@ -76,10 +89,27 @@ export function ThemeEngineProvider({ children, adminId }: { children: React.Rea
     };
   }, [adminId]);
 
-  // Apply saved + preview to :root whenever either changes.
+  // Apply saved + preview to :root whenever either changes. The scheme is a
+  // base palette: light swaps in the light token set under any overrides.
   useEffect(() => {
-    applyTokens(document.documentElement, { ...(saved ?? {}), ...(preview ?? {}) });
-  }, [saved, preview]);
+    const base: TokenMap = scheme === "light" ? { ...LIGHT_TOKENS } : {};
+    applyTokens(document.documentElement, { ...base, ...(saved ?? {}), ...(preview ?? {}) });
+  }, [saved, preview, scheme]);
+
+  /** Switch the built-in scheme and persist the choice per user. */
+  const setScheme = useCallback(
+    (next: ThemeScheme) => {
+      setSchemeState(next);
+      setColorScheme(next);
+      if (adminId) {
+        void api
+          .uiPreferences(adminId)
+          .then((r) => api.saveUiPreferences(adminId, { ...r.preferences, colorScheme: next }))
+          .catch(() => undefined);
+      }
+    },
+    [adminId, setColorScheme],
+  );
 
   const applyPreview = useCallback((tokens: Record<string, string>) => {
     const result = sanitizeTokenOverrides(tokens);
@@ -123,8 +153,8 @@ export function ThemeEngineProvider({ children, adminId }: { children: React.Rea
   );
 
   const value = useMemo<ThemeContextValue>(
-    () => ({ saved, preview, themes, activeThemeId, applyPreview, clearPreview, save, revert }),
-    [saved, preview, themes, activeThemeId, applyPreview, clearPreview, save, revert],
+    () => ({ saved, preview, themes, activeThemeId, scheme, setScheme, applyPreview, clearPreview, save, revert }),
+    [saved, preview, themes, activeThemeId, scheme, setScheme, applyPreview, clearPreview, save, revert],
   );
 
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;

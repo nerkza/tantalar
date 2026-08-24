@@ -34,6 +34,55 @@ export function fullTokenName(key: string): string {
   return `${TOKEN_PREFIX}${key}`;
 }
 
+/**
+ * Wave 8: light scheme palette. Same token keys as the dark defaults so a
+ * theme switch is only ever a different override set, never new variable
+ * names. The UI offers "Light" and "Dark" by these human names; the internal
+ * `--tantalar-*` identifiers never appear as user-facing settings.
+ */
+export const LIGHT_TOKENS: TokenMap = {
+  "color-bg": "#f5f6fa",
+  "color-surface": "#ffffff",
+  "color-surface-raised": "#ffffff",
+  "color-text": "#1a1c26",
+  "color-text-dimmed": "#5b6070",
+  "color-primary": "#2f6fd8",
+  "color-primary-contrast": "#ffffff",
+  "color-danger": "#d13438",
+  "color-success": "#2e7d43",
+  "color-warning": "#b97a0a",
+  "color-border": "#d8dbe4",
+};
+
+export type ThemeScheme = "dark" | "light";
+
+/** Human-readable names for the built-in schemes (never raw token names). */
+export const SCHEME_LABELS: Record<ThemeScheme, string> = {
+  dark: "Dark",
+  light: "Light",
+};
+
+/**
+ * Human-readable names for every token key. Settings UIs show these labels;
+ * the raw `--tantalar-*` identifiers are internal and never user-facing.
+ */
+export const TOKEN_LABELS: Record<string, string> = {
+  "color-bg": "Page background",
+  "color-surface": "Card background",
+  "color-surface-raised": "Raised surface",
+  "color-text": "Text",
+  "color-text-dimmed": "Secondary text",
+  "color-primary": "Accent color",
+  "color-primary-contrast": "Text on accent",
+  "color-danger": "Error color",
+  "color-success": "Success color",
+  "color-warning": "Warning color",
+  "color-border": "Borders",
+  "space-unit": "Spacing unit",
+  "radius-md": "Corner radius",
+  "font-size-base": "Base font size",
+};
+
 const VALUE_RE = /^[#%(),.\s/a-z0-9-]{0,120}$/i;
 const FORBIDDEN_RE = /(url\s*\(|expression|@import|@media|javascript:|<|>|;|\\|\{|\})/i;
 const NAME_RE = /^[a-z0-9-]+$/;

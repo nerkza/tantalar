@@ -4,7 +4,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { validateEnvelope, uuidv7, type EventEnvelope } from "@tantalar/contracts";
-import type { Kysely } from "kysely";
+import { Kysely, sql } from "kysely";
 import type { Db, EventsTable } from "@tantalar/db";
 
 export interface PublishInput {
@@ -97,10 +97,12 @@ export class EventBus {
     let q = this.#db
       .selectFrom("events")
       .selectAll()
-      // eventId is UUIDv7, so it orders consistently within a shared
-      // occurredAt millisecond (stable pagination tiebreaker).
+      // Insertion order is the authoritative tiebreaker: UUIDv7 random bits
+      // do not preserve append order within one occurredAt millisecond, so
+      // an eventId sort can invert a causal chain. SQLite rowid is strictly
+      // monotonic per insert and stable under concurrent writers.
       .orderBy("occurredAt asc")
-      .orderBy("eventId asc");
+      .orderBy(sql`rowid asc`);
     if (filter.from) q = q.where("occurredAt", ">=", filter.from);
     if (filter.to) q = q.where("occurredAt", "<=", filter.to);
     if (filter.typePrefix) q = q.where("type", "like", `${filter.typePrefix}%`);
@@ -113,12 +115,13 @@ export class EventBus {
         .where("eventId", "=", filter.afterEventId)
         .execute();
       if (!anchor) throw new Error(`unknown afterEventId ${filter.afterEventId}`);
-      q = q.where((eb) =>
-        eb.or([
-          eb("occurredAt", ">", anchor.occurredAt),
-          eb.and([eb("occurredAt", "=", anchor.occurredAt), eb("eventId", ">", (anchor as { eventId: string }).eventId)]),
-        ]),
-      );
+      // Cursor pagination uses the identical insertion-order tiebreaker.
+      const anchorRowid = await this.#db
+        .selectFrom("events")
+        .select(sql<number>`rowid`.as("rowid"))
+        .where("eventId", "=", filter.afterEventId)
+        .executeTakeFirstOrThrow();
+      q = q.where(sql`rowid`, ">", anchorRowid.rowid);
     }
     const rows = await q.limit(filter.limit ?? 1000).execute();
     return rows.map(rowToEnvelope);

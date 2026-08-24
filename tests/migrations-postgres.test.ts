@@ -15,6 +15,9 @@ const pgUrl =
     : undefined);
 
 let db: Kysely<Db> | null = null;
+// Gate on pgUrl, not db: it.skipIf is evaluated during suite definition,
+// before beforeAll assigns db (same pattern as wave2-postgres-concurrency).
+const pgUrlForGate = pgUrl !== undefined;
 
 beforeAll(async () => {
   if (!pgUrl) return;
@@ -26,7 +29,7 @@ afterAll(async () => {
 });
 
 describe("PostgreSQL migration path (ADR-0009)", () => {
-  it.skipIf(!db)("applies the initial schema and is idempotent", async () => {
+  it.skipIf(!pgUrlForGate)("applies the initial schema and is idempotent", async () => {
     if (!db) return;
     const applied = await migrate(db);
     expect(applied).toContain("0001_initial_schema");

@@ -66,8 +66,8 @@ test("grid customization persists density preference across navigation", async (
   await page.waitForTimeout(500);
 
   // Navigate away and back.
-  await page.evaluate(() => { window.location.hash = "/library"; });
-  await expect(page.getByTestId("library-page")).toBeVisible();
+  await page.evaluate(() => { window.location.hash = "/home"; });
+  await expect(page.getByTestId("home-page")).toBeVisible();
   await goAdmin(page);
   await clickTab(page, "Settings");
   await expect(page.getByRole("switch")).toBeChecked({ timeout: 15_000 });
@@ -77,7 +77,8 @@ test("theme editor: token override previews in both UIs, saves, reverts; malicio
   await clickTab(page, "Settings");
   const editor = page.getByTestId("theme-editor");
 
-  const primary = editor.getByLabel("--tantalar-color-primary", { exact: true });
+  // Settings use human labels; internal CSS variable names never appear.
+  const primary = editor.getByLabel("Accent color", { exact: true });
   await fillSafely(primary, "#ff00ff");
   await expect
     .poll(() =>
@@ -87,7 +88,7 @@ test("theme editor: token override previews in both UIs, saves, reverts; malicio
     )
     .toBe("#ff00ff");
 
-  const bg = editor.getByLabel("--tantalar-color-bg", { exact: true });
+  const bg = editor.getByLabel("Page background", { exact: true });
   await fillSafely(bg, "url(javascript:alert(1))");
   await expect(page.getByTestId("theme-errors")).toBeVisible();
 
@@ -99,8 +100,8 @@ test("theme editor: token override previews in both UIs, saves, reverts; malicio
   await page.waitForTimeout(500);
 
   // Navigate away and back.
-  await page.evaluate(() => { window.location.hash = "/library"; });
-  await expect(page.getByTestId("library-page")).toBeVisible();
+  await page.evaluate(() => { window.location.hash = "/home"; });
+  await expect(page.getByTestId("home-page")).toBeVisible();
   await goAdmin(page);
   await clickTab(page, "Settings");
 
@@ -117,8 +118,8 @@ test("theme editor: token override previews in both UIs, saves, reverts; malicio
     if (btn) btn.click();
   });
   await page.waitForTimeout(300);
-  await page.evaluate(() => { window.location.hash = "/library"; });
-  await expect(page.getByTestId("library-page")).toBeVisible();
+  await page.evaluate(() => { window.location.hash = "/home"; });
+  await expect(page.getByTestId("home-page")).toBeVisible();
   const css = await page.evaluate(() =>
     getComputedStyle(document.documentElement).getPropertyValue("--tantalar-color-bg").trim(),
   );

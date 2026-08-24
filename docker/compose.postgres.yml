@@ -6,7 +6,7 @@ services:
     build: .
     image: tantalar:v1
     ports:
-      - "8787:8787"
+      - "8790:8790"
     environment:
       TANTALAR_DB_DIALECT: postgres
       TANTALAR_SECRET_DATABASE_POSTGRES_URL: "postgres://tantalar:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@db:5432/tantalar"

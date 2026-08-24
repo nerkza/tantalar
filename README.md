@@ -21,7 +21,7 @@ pnpm run typecheck
 pnpm test            # unit and integration suites; Postgres migration job in CI
 pnpm --filter @tantalar/server build
 node apps/server/dist/main.js --dump-config   # redacted effective config
-node apps/server/dist/main.js                 # boots on 127.0.0.1:8787
+node apps/server/dist/main.js                 # boots on 127.0.0.1:8790
 ```
 
 ## Layout

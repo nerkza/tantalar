@@ -95,13 +95,19 @@ immutable previous image tag and restore the matching pre-upgrade database
 backup. That cross-version rehearsal remains a release follow-up after a
 second image version exists. Database downgrade is not supported.
 
-### Fixture pipeline (search → playback)
+### Fixture pipeline (search → playback) — prototype evidence
 
 Covered end-to-end by the Playwright suite against a running server
 (`e2e/viewer.spec.ts`, 9 tests): seeded fixture indexer/search → grab →
 import → library browse → direct-play negotiation and byte-range decode,
 HLS fallback with quality ladder, subtitle selection with content served,
 resume progress restore, seek during playback, next-episode autoplay.
+
+This pipeline is **prototype evidence only**: every indexer, tracker,
+metadata provider, and download client in it is an in-repo synthetic
+fixture. It proves wiring and product flow, not behavior against real
+indexers or clients.
+
 Admin side (`e2e/admin.spec.ts`, 8 tests): grids render/filter/sort,
 density persistence, theme editor preview/save/revert with malicious-CSS
 rejection, trajectory reconstruction of the grab→import chain, user

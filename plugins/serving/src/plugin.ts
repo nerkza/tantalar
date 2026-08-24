@@ -73,48 +73,85 @@ const embeddedSubtitleContent = new Map<string, { fileId: string; content: strin
  */
 let stateFile: string | null = null;
 
+/**
+ * Wave 3 (TAN-013): durable storage bridge. When core provides one, catalog
+ * state lands in the server database (survives restarts without a shared
+ * filesystem path). The legacy JSON `stateFile` remains as a fallback for
+ * mounts without a document store.
+ */
+type StorageBridge = {
+  get(key: string): Promise<{ doc: unknown; updatedAt: string } | null>;
+  put(key: string, doc: unknown): Promise<void>;
+  delete(key: string): Promise<boolean>;
+};
+const STATE_DOC_KEY = "state";
+let storeBridge: StorageBridge | null = null;
+const buildSnapshot = () => ({
+  entries: [...entries.values()],
+  viewers: [...viewers].map(([userId, libs]) => ({ userId, libraries: [...libs] })),
+  resumes: [...resumes.values()],
+  history: [...history].map(([key, list]) => ({ key, list })),
+  externalSubtitles: [...externalSubtitles].map(([fileId, tracks]) => ({ fileId, tracks })),
+  externalSubtitleContent: [...externalSubtitleContent].map(([trackId, v]) => ({ trackId, ...v })),
+  embeddedSubtitleContent: [...embeddedSubtitleContent].map(([trackId, v]) => ({ trackId, ...v })),
+  workers: [...durableWorkers].map(([sessionId, pid]) => ({ sessionId, pid })),
+});
+
+function applySnapshot(snap: Record<string, unknown>): void {
+  const s = snap as {
+    entries?: LibraryEntry[];
+    viewers?: Array<{ userId: string; libraries: string[] }>;
+    resumes?: ResumePoint[];
+    history?: Array<{ key: string; list: Array<{ startedAt: string; positionMs: number; completed: boolean }> }>;
+    externalSubtitles?: Array<{ fileId: string; tracks: Array<{ trackId: string; lang: string; format: string }> }>;
+    externalSubtitleContent?: Array<{ trackId: string; fileId: string; content: string }>;
+    embeddedSubtitleContent?: Array<{ trackId: string; fileId: string; content: string }>;
+    workers?: Array<{ sessionId: string; pid: number }>;
+  };
+  for (const e of s.entries ?? []) entries.set(e.fileId, e);
+  for (const v of s.viewers ?? []) viewers.set(v.userId, new Set(v.libraries));
+  for (const r of s.resumes ?? []) resumes.set(`${r.userId}:${r.fileId}`, r);
+  for (const h of s.history ?? []) history.set(h.key, h.list);
+  for (const x of s.externalSubtitles ?? []) externalSubtitles.set(x.fileId, x.tracks);
+  for (const c of s.externalSubtitleContent ?? []) externalSubtitleContent.set(c.trackId, { fileId: c.fileId, content: c.content });
+  for (const c of s.embeddedSubtitleContent ?? []) embeddedSubtitleContent.set(c.trackId, { fileId: c.fileId, content: c.content });
+  // Worker records restore BEFORE cleanupOrphans runs at mount, so pids
+  // recorded by a crashed instance are killed during startup.
+  for (const w of s.workers ?? []) durableWorkers.set(w.sessionId, w.pid);
+}
+
 function persistState(): void {
-  if (!stateFile) return;
-  try {
-    const snapshot = {
-      entries: [...entries.values()],
-      viewers: [...viewers].map(([userId, libs]) => ({ userId, libraries: [...libs] })),
-      resumes: [...resumes.values()],
-      history: [...history].map(([key, list]) => ({ key, list })),
-      externalSubtitles: [...externalSubtitles].map(([fileId, tracks]) => ({ fileId, tracks })),
-      externalSubtitleContent: [...externalSubtitleContent].map(([trackId, v]) => ({ trackId, ...v })),
-      embeddedSubtitleContent: [...embeddedSubtitleContent].map(([trackId, v]) => ({ trackId, ...v })),
-      workers: [...durableWorkers].map(([sessionId, pid]) => ({ sessionId, pid })),
-    };
-    writeFileSync(stateFile, JSON.stringify(snapshot));
-  } catch {
-    /* best-effort persistence; serving continues from memory */
+  const snapshot = buildSnapshot();
+  if (stateFile) {
+    try {
+      writeFileSync(stateFile, JSON.stringify(snapshot));
+    } catch {
+      /* best-effort persistence; serving continues from memory */
+    }
   }
+  void storeBridge?.put(STATE_DOC_KEY, snapshot).catch(() => undefined);
 }
 
 function restoreState(): void {
+  // Durable document store wins when present; fall back to the file.
+  if (storeBridge) {
+    storeBridge
+      .get(STATE_DOC_KEY)
+      .then((hit) => {
+        if (hit && hit.doc && typeof hit.doc === "object") applySnapshot(hit.doc as Record<string, unknown>);
+        else if (stateFile) restoreFromFile();
+      })
+      .catch(() => restoreFromFile());
+    return;
+  }
+  restoreFromFile();
+}
+
+function restoreFromFile(): void {
   if (!stateFile || !existsSync(stateFile)) return;
   try {
-    const snap = JSON.parse(readFileSync(stateFile, "utf8")) as {
-      entries?: LibraryEntry[];
-      viewers?: Array<{ userId: string; libraries: string[] }>;
-      resumes?: ResumePoint[];
-      history?: Array<{ key: string; list: Array<{ startedAt: string; positionMs: number; completed: boolean }> }>;
-      externalSubtitles?: Array<{ fileId: string; tracks: Array<{ trackId: string; lang: string; format: string }> }>;
-      externalSubtitleContent?: Array<{ trackId: string; fileId: string; content: string }>;
-      embeddedSubtitleContent?: Array<{ trackId: string; fileId: string; content: string }>;
-      workers?: Array<{ sessionId: string; pid: number }>;
-    };
-    for (const e of snap.entries ?? []) entries.set(e.fileId, e);
-    for (const v of snap.viewers ?? []) viewers.set(v.userId, new Set(v.libraries));
-    for (const r of snap.resumes ?? []) resumes.set(`${r.userId}:${r.fileId}`, r);
-    for (const h of snap.history ?? []) history.set(h.key, h.list);
-    for (const x of snap.externalSubtitles ?? []) externalSubtitles.set(x.fileId, x.tracks);
-    for (const c of snap.externalSubtitleContent ?? []) externalSubtitleContent.set(c.trackId, { fileId: c.fileId, content: c.content });
-    for (const c of snap.embeddedSubtitleContent ?? []) embeddedSubtitleContent.set(c.trackId, { fileId: c.fileId, content: c.content });
-    // Worker records restore BEFORE cleanupOrphans runs at mount, so pids
-    // recorded by a crashed instance are killed during startup.
-    for (const w of snap.workers ?? []) durableWorkers.set(w.sessionId, w.pid);
+    const snap = JSON.parse(readFileSync(stateFile, "utf8")) as Record<string, unknown>;
+    applySnapshot(snap);
   } catch {
     /* corrupt snapshot: start clean rather than fail the mount */
   }
@@ -407,11 +444,15 @@ const plugin: PluginDefinition = definePlugin({
   manifest,
   async mount(ctx) {
     emitFn = async (type, payload, opts) => ctx.emit(type, payload, opts);
+    storeBridge = ctx.storage ?? null;
     ensureRoots(ctx.config);
     if (typeof ctx.config["stateFile"] === "string" && ctx.config["stateFile"]) {
       stateFile = ctx.config["stateFile"];
-      restoreState();
     }
+    // Restore from the durable document store (preferred) or the legacy
+    // snapshot file; orphan-worker cleanup runs AFTER restore so recorded
+    // pids from a crashed instance are killed during startup.
+    restoreState();
     const orphans = await cleanupOrphans();
     ctx.log("info", `serving mounted; cleaned ${orphans} orphaned worker record(s)`);
   },
@@ -426,6 +467,7 @@ const plugin: PluginDefinition = definePlugin({
     }
     persistState();
     emitFn = null;
+    storeBridge = null;
     ctx.log("info", "serving unmounted");
   },
   handlers: {

@@ -63,6 +63,16 @@ export interface SupervisorOptions {
   /** Resolve the executable for a manifest entry command. */
   resolveEntry: (manifest: PluginManifest) => { command: string; args: string[]; env: Record<string, string> };
   healthIntervalMs?: number;
+  /**
+   * Wave 3 (TAN-013): durable document store backing the plugin storage
+   * bridge. Optional so unit tests can mount plugins without a database;
+   * production always supplies it (kernel boot wires PluginDocumentStore).
+   */
+  documents?: {
+    get(pluginId: string, key: string): Promise<{ doc: unknown; updatedAt: string } | null>;
+    put(pluginId: string, key: string, doc: unknown): Promise<void>;
+    delete(pluginId: string, key: string): Promise<boolean>;
+  };
 }
 
 export class Supervisor {
@@ -91,6 +101,19 @@ export class Supervisor {
     const p = this.#plugins.get(pluginId);
     if (!p) return undefined;
     return { manifest: p.manifest, state: p.state, restartCount: p.restartCount };
+  }
+
+  /**
+   * Wave 9 (TAN-031) operator-initiated restart: unmount then remount with
+   * the original config. Mount completion is awaited so the response reports
+   * the truthful post-restart state.
+   */
+  async restart(pluginId: string): Promise<PluginRuntime> {
+    const existing = this.#plugins.get(pluginId);
+    if (!existing) throw new Error(`plugin not mounted: ${pluginId}`);
+    const { manifest, config } = existing;
+    await this.unmount(pluginId);
+    return this.mount(manifest, config);
   }
 
   async mount(manifestInput: unknown, config: Record<string, unknown> = {}): Promise<PluginRuntime> {
@@ -311,6 +334,39 @@ export class Supervisor {
       // Plugin logs pass through structured core logging in later phases.
       if (msg.id) {
         plugin.proc?.stdin?.write(JSON.stringify({ id: msg.id, result: { ok: true } }) + "\n");
+      }
+    } else if (msg.op === "storage") {
+      // Wave 3 (TAN-013): durable plugin document storage. The plugin may
+      // only touch documents namespaced under its OWN plugin id — the
+      // namespace is derived here, never from the wire payload.
+      const p = msg.payload ?? {};
+      const action = String(p.action ?? "");
+      const key = String(p.key ?? "");
+      let result: unknown;
+      try {
+        if (!this.#opts.documents) throw new Error("durable storage unavailable");
+        if (!key) throw new Error("storage key required");
+        switch (action) {
+          case "get": {
+            const hit = await this.#opts.documents.get(plugin.manifest.id, key);
+            result = { value: hit };
+            break;
+          }
+          case "put":
+            await this.#opts.documents.put(plugin.manifest.id, key, p.doc ?? null);
+            result = { value: { ok: true } };
+            break;
+          case "delete":
+            result = { value: await this.#opts.documents.delete(plugin.manifest.id, key) };
+            break;
+          default:
+            throw new Error(`unknown storage action ${action}`);
+        }
+      } catch (err) {
+        result = { error: (err as Error).message };
+      }
+      if (msg.id) {
+        plugin.proc?.stdin?.write(JSON.stringify({ id: msg.id, result }) + "\n");
       }
     } else if (msg.op === "introspect") {
       // Auth introspection (phase-2 contract): routed through the core

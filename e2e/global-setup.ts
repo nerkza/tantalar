@@ -177,6 +177,16 @@ async function start() {
     supervisor,
     container,
     ready: () => true,
+    ops: {
+      auth,
+      db,
+      bus,
+      supervisor,
+      container,
+      ready: () => true,
+      sqlitePath: join(dir, "t.db"),
+      dataDir: dir,
+    },
     serving: (invoke) => ({
       invoke,
       resolvePath: (fileId: string) => files[fixtureOf[fileId] ?? fileId.replace(/^f-/, "")] ?? null,

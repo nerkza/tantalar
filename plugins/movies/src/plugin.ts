@@ -9,7 +9,7 @@
  * `movie.acquired`. All state is in-process fixture state. Every accepted
  * operation is event-traced with the caller's correlationId.
  */
-import { runPlugin, definePlugin, type PluginDefinition } from "@tantalar/plugin-sdk";
+import { runPlugin, definePlugin, type PluginContext, type PluginDefinition } from "@tantalar/plugin-sdk";
 import {
   PROTOCOL_VERSION,
   validateManifest,
@@ -45,6 +45,30 @@ let emitFn:
 
 const movies = new Map<string, MovieState>(); // movieId -> state
 
+/** Wave 3 (TAN-013): durable storage bridge; null when storage is unavailable. */
+let store: PluginContext["storage"] | null = null;
+const DOC_KEY = "state";
+
+async function persist(): Promise<void> {
+  if (!store) return;
+  try {
+    await store.put(DOC_KEY, { movies: [...movies.entries()].map(([id, m]) => ({ id, ...m })) });
+  } catch {
+    /* durability resumes on the next mutation */
+  }
+}
+
+async function restore(): Promise<void> {
+  if (!store) return;
+  try {
+    const hit = await store.get(DOC_KEY);
+    const doc = hit?.doc as { movies?: Array<{ id: string } & MovieState> } | undefined;
+    for (const m of doc?.movies ?? []) movies.set(m.id, { ...m });
+  } catch {
+    /* corrupt snapshot: start clean rather than fail the mount */
+  }
+}
+
 function slug(title: string): string {
   return title
     .toLowerCase()
@@ -54,14 +78,17 @@ function slug(title: string): string {
 
 const plugin: PluginDefinition = definePlugin({
   manifest,
-  mount(ctx) {
+  async mount(ctx) {
     emitFn = async (type, payload, opts) => {
       await ctx.emit(type, payload, opts);
     };
+    store = ctx.storage ?? null;
+    await restore();
     ctx.log("info", "movies mounted");
   },
   unmount(ctx) {
     emitFn = null;
+    store = null;
     ctx.log("info", "movies unmounted");
   },
   handlers: {
@@ -82,6 +109,7 @@ const plugin: PluginDefinition = definePlugin({
             acquiredGuid: null,
           });
           await emitFn?.(EventTypes.MovieAdded, { movieId: id, title, monitored: true });
+          await persist();
           return { movieId: id, created: true };
         }
         case "get-movie": {
@@ -103,6 +131,7 @@ const plugin: PluginDefinition = definePlugin({
             movieId: String(payload.movieId),
             monitored: rec.monitored,
           });
+          await persist();
           return { movieId: String(payload.movieId), monitored: rec.monitored };
         }
         case "scan": {
@@ -129,6 +158,7 @@ const plugin: PluginDefinition = definePlugin({
           const upgrade = rec.acquiredGuid !== null;
           rec.acquiredGuid = guid;
           await emitFn?.(EventTypes.MovieAcquired, { movieId, guid, upgrade });
+          await persist();
           return { acquired: true, upgrade };
         }
         case "conformance-probe":

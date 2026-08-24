@@ -8,7 +8,7 @@
  * real metadata provider. Every accepted operation emits an event carrying
  * the caller's correlationId so the decision chain reconstructs from the log.
  */
-import { runPlugin, definePlugin, type PluginDefinition } from "@tantalar/plugin-sdk";
+import { runPlugin, definePlugin, type PluginContext, type PluginDefinition } from "@tantalar/plugin-sdk";
 import {
   PROTOCOL_VERSION,
   validateManifest,
@@ -54,8 +54,59 @@ let emitFn:
   | ((type: string, payload: Record<string, unknown>, opts?: { correlationId?: string }) => Promise<void>)
   | null = null;
 
+/** Wave 3 (TAN-013): durable storage bridge; null when storage is unavailable. */
+let store: PluginContext["storage"] | null = null;
+const DOC_KEY = "state";
+
 const shows = new Map<string, SeriesState>();
 let seq = 0;
+
+/** Snapshot the in-memory state into the durable document store. */
+async function persist(): Promise<void> {
+  if (!store) return;
+  try {
+    await store.put(DOC_KEY, {
+      shows: [...shows.entries()].map(([id, s]) => ({
+        id,
+        name: s.name,
+        monitored: s.monitored,
+        profile: s.profile,
+        seasons: s.seasons,
+        episodesPerSeason: s.episodesPerSeason,
+      })),
+    });
+  } catch {
+    // Storage failures never lose the in-memory answer; durability resumes
+    // on the next mutation once the bridge is healthy again.
+  }
+}
+
+/** Restore from the durable document store at mount (crash/restart recovery). */
+async function restore(): Promise<void> {
+  if (!store) return;
+  try {
+    const hit = await store.get(DOC_KEY);
+    const doc = hit?.doc as
+      | { shows?: Array<{ id: string; name: string; monitored: boolean; profile: QualityProfile; seasons: number; episodesPerSeason: number }> }
+      | undefined;
+    for (const s of doc?.shows ?? []) {
+      const episodes = new Map<string, EpisodeRecord>();
+      for (let se = 1; se <= s.seasons; se++) {
+        for (let e = 1; e <= s.episodesPerSeason; e++) {
+          episodes.set(episodeKey(se, e), {
+            seriesId: s.id,
+            season: se,
+            episode: e,
+            query: `${s.name} S${String(se).padStart(2, "0")}E${String(e).padStart(2, "0")}`,
+          });
+        }
+      }
+      shows.set(s.id, { ...s, episodes });
+    }
+  } catch {
+    // Corrupt/absent snapshot: start clean rather than fail the mount.
+  }
+}
 
 function episodeKey(season: number, episode: number): string {
   return `S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`;
@@ -71,14 +122,17 @@ function slug(name: string): string {
 
 const plugin: PluginDefinition = definePlugin({
   manifest,
-  mount(ctx) {
+  async mount(ctx) {
     emitFn = async (type, payload, opts) => {
       await ctx.emit(type, payload, opts);
     };
+    store = ctx.storage ?? null;
+    await restore();
     ctx.log("info", "series mounted");
   },
   unmount(ctx) {
     emitFn = null;
+    store = null;
     ctx.log("info", "series unmounted");
   },
   handlers: {
@@ -110,6 +164,7 @@ const plugin: PluginDefinition = definePlugin({
           }
           shows.set(id, { name, monitored: true, profile, seasons, episodesPerSeason, episodes });
           await emitFn?.(EventTypes.SeriesAdded, { seriesId: id, name, seasons, episodesPerSeason });
+          await persist();
           return { seriesId: id, created: true };
         }
         case "get-series": {
@@ -131,6 +186,7 @@ const plugin: PluginDefinition = definePlugin({
             seriesId: String(payload.seriesId),
             monitored: rec.monitored,
           });
+          await persist();
           return { seriesId: String(payload.seriesId), monitored: rec.monitored };
         }
         case "wanted": {

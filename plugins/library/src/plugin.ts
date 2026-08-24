@@ -16,7 +16,7 @@
  *  - every accepted operation is event-traced with correlationId and is
  *    idempotent on (itemKey + source hash).
  */
-import { runPlugin, definePlugin, type PluginDefinition } from "@tantalar/plugin-sdk";
+import { runPlugin, definePlugin, type PluginContext, type PluginDefinition } from "@tantalar/plugin-sdk";
 import {
   PROTOCOL_VERSION,
   validateManifest,
@@ -74,7 +74,7 @@ function defaultSchemes(): Map<string, CompiledScheme> {
   return out;
 }
 
-const PLACEHOLDER_RE = /\{(series|season|episode|title|year|quality|seasonPad2|episodePad2)\}/g;
+const PLACEHOLDER_RE = /\{(series|season|episode|title|year|quality|seasonPad2|episodePad2|codec|language|edition)\}/g;
 
 function renderTemplate(
   template: string,
@@ -125,6 +125,47 @@ const libraryItems = new Map<string, LibraryFileRecord[]>();
 /** Idempotency ledger: `${itemKey}:${sourceHash}` -> result. */
 const importLedger = new Map<string, ImportOutcome>();
 const calendarEntries = new Map<string, CalendarEntry>();
+
+/** Wave 3 (TAN-013): durable storage bridge; null when storage is unavailable. */
+let store: PluginContext["storage"] | null = null;
+const DOC_KEY = "state";
+
+/** Snapshot library items + calendar into the durable document store. */
+async function persist(): Promise<void> {
+  if (!store) return;
+  try {
+    await store.put(DOC_KEY, {
+      items: [...libraryItems.entries()].map(([key, list]) => ({ key, list })),
+      ledger: [...importLedger.entries()].map(([k, v]) => ({ k, v })),
+      calendar: [...calendarEntries.values()],
+      schemes: [...schemes.values()],
+    });
+  } catch {
+    /* durability resumes on the next mutation */
+  }
+}
+
+/** Restore from the durable document store at mount (crash/restart recovery). */
+async function restore(): Promise<void> {
+  if (!store) return;
+  try {
+    const hit = await store.get(DOC_KEY);
+    const doc = hit?.doc as
+      | {
+          items?: Array<{ key: string; list: LibraryFileRecord[] }>;
+          ledger?: Array<{ k: string; v: ImportOutcome }>;
+          calendar?: CalendarEntry[];
+          schemes?: CompiledScheme[];
+        }
+      | undefined;
+    for (const it of doc?.items ?? []) libraryItems.set(it.key, [...it.list]);
+    for (const l of doc?.ledger ?? []) importLedger.set(l.k, l.v);
+    for (const c of doc?.calendar ?? []) calendarEntries.set(c.itemKey, c);
+    for (const s of doc?.schemes ?? []) if (!schemes.has(s.name)) schemes.set(s.name, s);
+  } catch {
+    /* corrupt snapshot: start clean rather than fail the mount */
+  }
+}
 
 /**
  * Test-only fault injection. When TANTALAR_FAULT is set, the named fault
@@ -233,6 +274,9 @@ function renderFor(req: Record<string, unknown>, scheme: CompiledScheme): string
     episodePad2: episode.padStart(2, "0"),
     year: typeof req.year === "number" ? String(Math.trunc(req.year)) : "",
     quality: String(req.quality ?? "unknown"),
+    codec: String(req.codec ?? ""),
+    language: String(req.language ?? ""),
+    edition: String(req.edition ?? ""),
   };
   return renderTemplate(template, values);
 }
@@ -323,6 +367,7 @@ async function doImport(payload: Record<string, unknown>): Promise<ImportOutcome
         upgraded: false,
       };
       importLedger.set(ledgerKey, outcome);
+      await persist();
       return { ...outcome, deduplicated: true };
     }
   }
@@ -400,6 +445,7 @@ async function doImport(payload: Record<string, unknown>): Promise<ImportOutcome
       ...(existing ? { replacedPath: existing.destinationPath } : {}),
     };
     importLedger.set(ledgerKey, outcome);
+    await persist();
 
     const corr = typeof payload.correlationId === "string" ? { correlationId: payload.correlationId } : undefined;
     if (existing) {
@@ -434,13 +480,16 @@ async function doImport(payload: Record<string, unknown>): Promise<ImportOutcome
 
 const plugin: PluginDefinition = definePlugin({
   manifest,
-  mount(ctx) {
+  async mount(ctx) {
     emitFn = async (type, payload, opts) => ctx.emit(type, payload, opts);
+    store = ctx.storage ?? null;
     ensureRoots(ctx.config);
+    await restore();
     ctx.log("info", "library importer mounted");
   },
   unmount(ctx) {
     emitFn = null;
+    store = null;
     ctx.log("info", "library importer unmounted");
   },
   handlers: {
@@ -452,10 +501,56 @@ const plugin: PluginDefinition = definePlugin({
           const ep = validateRenameTemplate(String(payload.episodeTemplate ?? ""));
           const mv = validateRenameTemplate(String(payload.movieTemplate ?? ""));
           schemes.set(name, { name, episodeTemplate: ep, movieTemplate: mv });
+          await persist();
           return { set: name };
         }
         case "list-schemes":
           return { schemes: [...schemes.values()], roots: [...importRoots] };
+        case "preview-rename": {
+          // TAN-022: live preview of the output path for a candidate scheme
+          // and item without touching disk. Throws on an invalid template so
+          // invalid schemes can never be saved by the caller.
+          const kind = payload.kind === "movie" ? "movie" : "series";
+          const schemeName = String(payload.scheme ?? "default");
+          const scheme = schemes.get(schemeName);
+          if (!scheme) throw new ImportError("invalid_template", `unknown scheme ${schemeName}`);
+          const episodeTemplate = validateRenameTemplate(
+            typeof payload.episodeTemplate === "string" ? payload.episodeTemplate : scheme.episodeTemplate,
+          );
+          const movieTemplate = validateRenameTemplate(
+            typeof payload.movieTemplate === "string" ? payload.movieTemplate : scheme.movieTemplate,
+          );
+          const rel = renderFor({ ...payload, kind }, { name: schemeName, episodeTemplate, movieTemplate });
+          const ext = typeof payload.ext === "string" && payload.ext ? payload.ext : ".mkv";
+          const root = importRoots[0] ?? "(no import root configured)";
+          return { path: `${root}/${rel}${ext}`, scheme: schemeName, kind };
+        }
+        case "rename-plan": {
+          // TAN-022: bulk review — re-render every imported item under a
+          // candidate scheme and report which destinations would change.
+          // Nothing moves; the result is reviewable before any bulk change.
+          const schemeName = String(payload.scheme ?? "default");
+          const scheme = schemes.get(schemeName);
+          if (!scheme) throw new ImportError("invalid_template", `unknown scheme ${schemeName}`);
+          const root = importRoots[0];
+          if (!root) throw new ImportError("invalid_template", "no import root configured");
+          const plan: Array<{ itemKey: string; currentPath: string; newPath: string; changes: boolean }> = [];
+          for (const [itemKey, records] of libraryItems) {
+            const last = records.at(-1)!;
+            const kind = itemKey.startsWith("movie") ? "movie" : "series";
+            const title = itemKey.split(":").slice(1).join(":") || itemKey;
+            let newPath: string;
+            try {
+              const rel = renderFor({ kind, title, series: title, quality: last.quality }, scheme);
+              newPath = join(root, rel) + extname(last.destinationPath);
+            } catch (err) {
+              newPath = `(invalid under this scheme: ${(err as Error).message})`;
+            }
+            plan.push({ itemKey, currentPath: last.destinationPath, newPath, changes: newPath !== last.destinationPath });
+          }
+          plan.sort((a, b) => a.itemKey.localeCompare(b.itemKey));
+          return { scheme: schemeName, total: plan.length, changed: plan.filter((p) => p.changes).length, plan };
+        }
         case "import":
           return doImport(payload);
         case "library": {
@@ -500,6 +595,7 @@ const plugin: PluginDefinition = definePlugin({
           if (!itemKey || !title || Number.isNaN(Date.parse(date)))
             throw new Error("itemKey, title, and ISO date required");
           calendarEntries.set(itemKey, { itemKey, kind, title, date: date.slice(0, 10) });
+          await persist();
           return { registered: itemKey };
         }
         case "conformance-probe":

@@ -4,13 +4,13 @@ import { expect, test } from "@playwright/test";
 const USER = "admin";
 const PASS = "password-admin-1";
 
-/** Sign in through the UI and land on the library. */
+/** Sign in through the UI and land on Home (product shell default). */
 export async function signIn(page: import("@playwright/test").Page): Promise<void> {
   await page.goto("/");
   await page.getByLabel("Username").fill(USER);
   await page.getByLabel("Password").fill(PASS);
   await page.getByRole("button", { name: "Sign in" }).click();
-  await expect(page.getByTestId("library-page")).toBeVisible();
+  await expect(page.getByTestId("home-page")).toBeVisible();
 }
 
 export { test };

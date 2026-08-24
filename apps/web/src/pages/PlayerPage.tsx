@@ -97,6 +97,51 @@ export function PlayerPage({ fileId }: { fileId: string }) {
     }
   }, [autoplayNext, nextFileId]);
 
+  // Wave 8: product keyboard controls on the page (the native controls keep
+  // their own shortcuts). Space toggles play, arrows seek ±10s, M mutes,
+  // F requests fullscreen — only when focus is not inside another form
+  // control so selects and sliders keep their own keys.
+  useEffect(() => {
+    if (!decision) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName ?? "";
+      if ((tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || target?.isContentEditable === true)) return;
+      if (target?.getAttribute("role") === "slider") return;
+      const v = videoRef.current;
+      if (!v) return;
+      switch (e.key) {
+        case " ":
+        case "k":
+          e.preventDefault();
+          if (v.paused) void v.play().catch(() => undefined);
+          else v.pause();
+          break;
+        case "ArrowLeft":
+        case "j":
+          e.preventDefault();
+          v.currentTime = Math.max(0, v.currentTime - 10);
+          break;
+        case "ArrowRight":
+        case "l":
+          e.preventDefault();
+          v.currentTime = Math.min(v.duration || Infinity, v.currentTime + 10);
+          break;
+        case "m":
+          v.muted = !v.muted;
+          break;
+        case "f":
+          if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
+          else void v.requestFullscreen?.().catch(() => undefined);
+          break;
+        default:
+          break;
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [decision]);
+
   if (negotiate.isPending) return <div aria-busy="true">Preparing playback…</div>;
   if (negotiate.isError) {
     return (
@@ -111,6 +156,9 @@ export function PlayerPage({ fileId }: { fileId: string }) {
   return (
     <Stack gap="sm" data-testid="player-page" data-mode={decision?.mode ?? ""}>
       <Title order={4}>Now playing</Title>
+      <Text size="xs" c="var(--tantalar-color-text-dimmed)">
+        Keyboard: space or K play/pause · J/L or arrows seek 10s · M mute · F fullscreen
+      </Text>
       <Paper p="md" radius="md">
         <video
           ref={videoRef}

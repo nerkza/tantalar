@@ -1,11 +1,11 @@
 # One-command SQLite deployment (default). Data lives in the `tantalar-data`
-# volume; the server listens on host port 8787.
+# volume; the server listens on host port 8790.
 services:
   tantalar:
     build: .
     image: tantalar:v1
     ports:
-      - "8787:8787"
+      - "8790:8790"
     volumes:
       - tantalar-data:/data
     restart: unless-stopped

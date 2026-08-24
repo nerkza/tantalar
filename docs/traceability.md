@@ -2,16 +2,9 @@
 
 Maps every PRD story (1–32) to exactly one owning phase, named components, acceptance tests, and documentation. Phase docs live in [phases/](phases/). "Owner phase" is the phase that may not exit without the story demonstrably working.
 
-## Scope defect flag (do not silently resolve)
+## Scope defect flag (resolved by TAN-047)
 
-PRD lines 99–104 ("In Scope (v1)") list four items whose own wording contradicts v1 scope:
-
-1. **Disc image formats (ISO/BDMV) playback** — listed In Scope, but no user story, roadmap item, or component covers it.
-2. **Polished hardware-acceleration tuning UI** — the PRD text itself says "usable but not a polished feature", i.e. explicitly not polished in v1.
-3. **Multi-server federation/sync** — no story, no roadmap item; commonly a later-version feature.
-4. **Request portal (Overseerr-style)** — the PRD text itself calls it "candidate for v2 plugin".
-
-This package treats only stories 1–32 as v1 requirements. The four bullets above are recorded as **unowned and uncommitted**: they have no phase, no tests, and no traceability row. Correcting them requires a Lewis-approved PRD edit; this card deliberately leaves PRD.md unchanged.
+Earlier revisions listed four items under "In Scope (v1)" whose own wording contradicted v1 scope. TAN-047 moved them to "Out of Scope (v1)" in PRD.md with one consistent statement each: disc image playback, polished hardware-acceleration tuning UI, multi-server federation/sync, and the Overseerr-style request portal. The settled all-in-one boundary is now explicit in the PRD: embedded download engines are core; external daemons are optional integration plugins only.
 
 ## Traceability matrix
 
@@ -21,12 +14,12 @@ This package treats only stories 1–32 as v1 requirements. The four bullets abo
 | 2 | Movie monitoring + quality profiles | Phase 3c | plugins/movies, release-comparison engine | Integration: monitored movie auto-grabs on qualifying release end-to-end on fixtures (tests/phase3c-automation.test.ts) | phases/phase-3c-automation.md |
 | 3 | Multiple NZB providers; retention/API limits | Phase 3a | plugins/indexers (nzb), downloader abstraction | Contract test: retention/API-limit respected against fixtures | phases/phase-3a-acquisition.md |
 | 4 | Torrent support, public trackers | Phase 3a | plugins/downloaders (torrent), qBittorrent client plugin | Integration: public-tracker grab → download via fixture client | phases/phase-3a-acquisition.md |
-| 5 | Private trackers: per-tracker rules, announce safety, seed goals | Phase 3b | per-tracker plugin/config, announce guard | Unit: announce-URL guard rejects wrong tracker/passkey leaks; seed-goal policy test | phases/phase-3b-acquisition.md |
+| 5 | Private trackers: per-tracker rules, announce safety, seed goals | Wave 10 (TAN-015) | torrent-native tracker-rules capability (ratio, seed-time, tags, limits, safe removal), announce-host matching in packages/contracts | Rules differ by tracker; removal blocked until obligations pass; decisions surfaced in history (tests/wave10-tracker-naming.test.ts) | reviews/wave10-tracker-naming.md, phases/phase-3b-acquisition.md |
 | 6 | Release comparison before grabbing | Phase 3b | release-comparison engine (deep module) | Behavior-level unit suite: quality/size/seeders/proper-repack scoring | phases/phase-3b-acquisition.md |
 | 7 | Interactive manual search/pick | Phase 3b | indexer layer API, grab pipeline interactive mode | Integration: interactive search returns ranked releases; manual grab emits event chain (tests/phase3b-acquisition.test.ts, tests/phase3c-automation.test.ts) | phases/phase-3b-acquisition.md |
 | 8 | Failed-download handling: blacklist + re-search | Phase 3b | grab pipeline handleFailure + blacklist in comparison | Integration: failed import blacklists release, re-search picks next-best (tests/phase3b-acquisition.test.ts, tests/phase3c-automation.test.ts) | phases/phase-3b-acquisition.md |
 | 9 | Calendars of upcoming releases | Phase 4 | calendar entries in plugins/library, monitored media registration | Calendar derived from registered monitored media; upcoming-only default with includePast opt-in (tests/phase4-library.test.ts) | phases/phase-4-library-import.md |
-| 10 | Configurable rename/import schemes | Phase 4 | plugins/library (rename schemes via validated templates), contracts validateRenameTemplate | Default + custom scheme rendering to nested paths; traversal/placeholder rejection (tests/phase4-library.test.ts) | phases/phase-4-library-import.md |
+| 10 | Configurable rename/import schemes | Wave 10 (TAN-022) | plugins/library (validateRenameTemplate incl. codec/language/edition, preview-rename, rename-plan), /api/v1/naming routes, Settings Import section | Live preview path rendering; invalid templates cannot save (fail-closed 400); bulk rename-plan review-only; recovery guidance served (tests/wave10-tracker-naming.test.ts, tests/phase4-library.test.ts) | reviews/wave10-tracker-naming.md, phases/phase-4-library-import.md |
 | 11 | Hardlink-first import, copy fallback | Phase 4 | plugins/library import path (hardlink-first, copy fallback, atomic temp+rename placement) | Same-fs hardlink asserted; idempotency on itemKey+source hash; source-root and symlink rejection (tests/phase4-library.test.ts) | phases/phase-4-library-import.md |
 | 12 | Quality upgrades replace files cleanly | Phase 4 | plugins/library upgrade path (verify-then-swap, rollback-safe staging) | Upgrade swaps verified bytes, old copy removed after verification, per-item history preserved, downgrade refused, interrupted-upgrade rollback keeps the old copy with no staging leftovers, corrupt/truncated staged copies rejected (tests/phase4-library.test.ts) | phases/phase-4-library-import.md |
 | 13 | Broad direct-play format support | Phase 5 (done) | plugins/serving negotiation + isDirectPlayable matrix; /api/v1/negotiate/:fileId | Full container×video×audio grid asserted against the endpoint; unsupported combos negotiate HLS with quality ladder (tests/phase5-serving.test.ts) | phases/phase-5-serving.md |
@@ -49,6 +42,60 @@ This package treats only stories 1–32 as v1 requirements. The four bullets abo
 | 30 | Plugin sandboxing / crash isolation | Phase 1 | supervisor process isolation | Test: kill -9 plugin process; server healthy; restart per policy | phases/phase-0-foundations.md |
 | 31 | VPN support OpenVPN/WireGuard, tunnel binding | Phase 3b | plugins/vpn manager | Integration (mocked network namespace): traffic routed via tunnel interface | phases/phase-3b-acquisition.md |
 | 32 | Kill switch on tunnel drop | Phase 3b | vpn manager kill-switch enforcement | Test: tunnel drop halts download clients before leak window | phases/phase-3b-acquisition.md |
+
+## Post-audit product traceability (TAN-001..047)
+
+The 2026-08-23 product audit re-scored acceptance at the product level (TAN-046): each story must identify a production route, a durable data path, a UI path, and automated acceptance evidence. Fixture-only evidence is labeled prototype evidence and cannot close a story. Delivery waves live in the personal KB (audit-delivery-backlog); this table is the repository-side integration.
+
+| TAN | Story | Production route | Durable data path | UI path | Automated acceptance evidence |
+|---|---|---|---|---|---|
+| 001 | Default port 8790 | config default + docker entrypoint | tantalar.yaml resolved config | Setup/General settings | tests/config.test.ts |
+| 002 | Secure first-run bootstrap | POST /api/v1/bootstrap/admin | users table (Argon2id) | SetupPage bootstrap form | tests/wave2-bootstrap-onboarding.test.ts |
+| 003 | Guided onboarding | /api/v1/onboarding(+step) | onboarding state in DB | SetupPage stepper | tests/wave2-bootstrap-onboarding.test.ts; e2e/product.spec.ts |
+| 004 | Production server composition | buildServer mounts all route surfaces | n/a composition | app loads every view | tests/packaged-runtime.test.ts |
+| 005 | First-party module set mounts | supervisor mount of packaged plugins | plugin_documents per plugin | Plugins settings tab | tests/packaged-runtime.test.ts |
+| 006 | Manifest loading matches doc | supervisor manifest parser | packaged .tpk layout | Plugins list | tests/phase2-contract-packaging.test.ts |
+| 007 | Docker preserves config | entrypoint write-once config | mounted tantalar.yaml | restart-resilient bootstrap | tests/entrypoint-durability.test.ts |
+| 008 | Truthful readiness | /readyz reports missing capabilities | readiness detail | System health card | tests/http.test.ts readiness checks |
+| 009 | Embedded torrent engine | torrent-native capability | download resume doc (plugin_documents) | Queue grids | tests/wave4-torrent-native.test.ts; reviews/wave4-torrent-native.md |
+| 010 | Embedded Usenet engine | usenet-native capability | durable jobs same contract | Queue grids | tests/wave5-usenet-native.test.ts; reviews/wave5-usenet-native.md |
+| 011 | One durable download job model | /api/v1/queue over download_jobs | download_jobs table (Kysely) | Queue admin view | tests/wave9-operations.test.ts |
+| 012 | Download storage safety | torrent-native storage gates | roots configured per plugin | n/a system-level | tests/wave4-torrent-native.test.ts (containment, free-space, quota, cleanup) |
+| 013 | Persistent media/monitoring state | series/movies plugins durable store | plugin_documents | Wanted/admin views | tests/wave3-media-state.test.ts |
+| 014 | Real indexer integrations | /api/v1/indexers CRUD + test | indexers owner docs | Indexers settings tab | tests/wave7-providers.test.ts; tests/wave7-indexer-api.test.ts |
+| 015 | Private tracker rules | /api/v1 queue removals gated | tracker rules in plugin resume doc + decision events | queue/history rule surface | tests/wave10-tracker-naming.test.ts |
+| 016 | Real metadata providers | metadata-tmdb-tvdb plugin | neutral MediaMetadata | Discovery/add flows | tests/phase4-library.test.ts (fixture adapters; product contract real) |
+| 017 | Discovery and add flows | indexer search + add routes | wanted/monitoring records | Add media UI | tests/phase3c-automation.test.ts |
+| 018 | Release selection + decision history | comparison + decisions store | decisions table | Activity/queue reasons | tests/phase3b-acquisition.test.ts |
+| 019 | Complete acquisition tracer bullet | search→grab→download→import→serve chain | end-to-end durable records | full product path | tests/wave7-tracer.test.ts |
+| 020 | Library management | /api/v1/libraries CRUD/rescan/validate | libraries table | Libraries settings tab | tests/wave3-library-api.test.ts |
+| 021 | Persist import/library records | catalog + history routes | import records + ledger durable | Import settings catalog | tests/phase4-library.test.ts; wave3 |
+| 022 | Import and naming settings | /api/v1/naming routes | schemes in importer durable doc | Settings Import tab (preview, plan, guidance) | tests/wave10-tracker-naming.test.ts |
+| 023 | Player reachable | serving routes in production | resume/watch state | PlayerPage | tests/phase5-serving.test.ts; e2e/viewer.spec.ts |
+| 024 | Library browsing experience | /api/v1/library browse | serving catalog | ProductPages browsing | tests/phase5-serving.test.ts; e2e/product.spec.ts |
+| 025 | Playback UX and accessibility | negotiate/stream/HLS routes | resume points | PlayerPage controls | e2e/viewer.spec.ts Playwright |
+| 026 | Product information architecture | route table + views | n/a | information hierarchy | e2e/product.spec.ts; reviews/wave8-product-ui.md |
+| 027 | Visual design system | theme tokens | themes table | General settings theme | test/phase6-ui.test.tsx; e2e |
+| 028 | Product settings replace raw CSS vars | settings sections | ui_preferences + themes | SettingsPage sections | apps/web/test/wave8-product.test.tsx |
+| 029 | Home dashboard | catalog/queue APIs | n/a | dashboard view | e2e/product.spec.ts |
+| 030 | Queue and history UX | /api/v1/queue actions | download_jobs | Queue admin view | tests/wave9-operations.test.ts; e2e/wave9-operations.spec.ts |
+| 031 | Plugin management | /api/v1/plugins actions | supervisor state | Plugins settings tab | tests/wave9-operations.test.ts |
+| 032 | User and library permission management | /api/v1/users + library grants | users, audit_log | Users settings tab | tests/wave9-operations.test.ts |
+| 033 | API key, webhook, MCP settings | integrations routes | api_keys, webhook configs | Integrations settings tab | tests/wave9-operations.test.ts; e2e/wave9-operations.spec.ts |
+| 034 | Activity operational | /api/v1/events replay | events table | Activity view | tests/phase6-admin.test.ts; trajectory tests |
+| 035 | Mobile navigation and tables | responsive product shell | ui_preferences | 320px layouts | e2e/product.spec.ts; e2e/wave9-operations.spec.ts |
+| 036 | Loading/empty/error/offline states | consistent API envelopes | n/a | state components | apps/web/test/wave8-product.test.tsx |
+| 037 | Keyboard and screen-reader support | focus/ARIA conventions | n/a | keyboard nav | e2e/admin.spec.ts; wave9-operations.spec.ts |
+| 038 | Data grids scale | catalog paging routes | paging queries | DenseGrid virtualization | tests/wave9-operations.test.ts (catalog paging) |
+| 039 | Plugin readiness race removed | supervisor mount ordering | readiness detail | System health | tests/packaged-runtime.test.ts |
+| 040 | Deterministic tests | vitest single-suite config | n/a | n/a | repeated stability runs green |
+| 041 | Packaged-runtime smoke tests | Dockerfile entrypoint | runtime containers | n/a | tests/packaged-runtime.test.ts |
+| 042 | Backup, restore, migration controls | /api/v1 backup/restore ops | managed backups dir + snapshots | System settings | tests/wave9-operations.test.ts; dual-dialect migrations |
+| 043 | Diagnostics and support bundle | /api/v1 diagnostics ops | redacted bundle artifacts | System settings | tests/wave9-operations.test.ts |
+| 044 | Real VPN lifecycle | vpn-manager capability | VPN profiles durable | VPN settings | tests/wave6-vpn-lifecycle.test.ts |
+| 045 | Kill switch real path | pre-dispatch gate in engines | binding profiles | VPN settings impact notice | tests/wave6-vpn-lifecycle.test.ts |
+| 046 | Product evidence acceptance | this table (TAN rows above) | docs/traceability.md | reviews + acceptance docs | each row's evidence cell |
+| 047 | PRD contradictions resolved | PRD.md In/Out of Scope | PRD.md | n/a | the four flagged items have one consistent statement each |
 
 ## Cross-cutting requirements
 

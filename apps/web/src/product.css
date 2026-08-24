@@ -1,0 +1,46 @@
+/* Tantalar product global styles (wave 8, extended wave 9). All values read
+   the --tantalar-* token layer; nothing here is user-facing configuration. */
+
+/* Screen-reader-only live region used by the player announcer. */
+.visually-hidden-live {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+body {
+  background: var(--tantalar-color-bg);
+  color: var(--tantalar-color-text);
+  font-size: var(--tantalar-font-size-base);
+}
+
+/* Wave 9 (TAN-037): visible focus ring for keyboard users across the app. */
+a:focus-visible,
+button:focus-visible,
+[role="tab"]:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--tantalar-color-accent, #4d8df6);
+  outline-offset: 2px;
+}
+
+/* Wave 9 (TAN-036): shared view-state blocks. */
+.tantalar-view-state {
+  display: grid;
+  place-items: center;
+  gap: 8px;
+  padding: 32px 12px;
+  text-align: center;
+  color: var(--tantalar-color-text-dimmed);
+}
+
+/* Wave 9 (TAN-038): stable table geometry while loading. Loading rows keep
+   the same height as data rows so the layout never jumps. */
+.tantalar-grid-loading td {
+  color: var(--tantalar-color-text-dimmed);
+}

@@ -11,6 +11,8 @@ Self-hosters run a fragmented stack to manage media: Plex for serving, Sonarr/Ra
 
 Tantalar is a single open-source, self-hosted web application that unifies library serving, wanted-list automation, indexer search, NZB and torrent acquisition, and post-download processing. It is built "everything is a module/plugin" from day one: core provides a plugin runtime, typed event bus, and append-only activity log; all functionality — including first-party Sonarr/Radarr-equivalents — registers through the same public contract third-party plugins use. Admins configure or replace any capability without touching core source.
 
+The torrent and NZB download engines are embedded in the product and are core: Tantalar works end-to-end with no external downloader daemon. External daemons (for example qBittorrent or SABnzbd) are optional integrations only — adapter plugins that exist alongside, never underneath, the embedded engines.
+
 Target user: technical self-hosters replacing their existing *arr + Plex stack.
 
 ## Guiding Principles
@@ -72,7 +74,7 @@ Target user: technical self-hosters replacing their existing *arr + Plex stack.
 ### Architecture
 
 - **Core kernel**: process supervision, config, database access, scheduler, typed event bus, service container with `inject`-style dependency declaration, reversible plugin mounting, auth, REST/WebSocket API surface.
-- **Built-in modules** (mount via the same public plugin contract): Series automation, Movies automation, Indexer layer, Download-client abstraction (NZB + torrent), VPN manager (OpenVPN/WireGuard; per-client tunnel binding with kill-switch), Post-processor/importer, Media library, Streaming/transcode server, Web admin UI, Player UI.
+- **Built-in modules** (mount via the same public plugin contract): Series automation, Movies automation, Indexer layer, embedded download engines (NZB + torrent — core, no external daemon required), VPN manager (OpenVPN/WireGuard; per-client tunnel binding with kill-switch), Post-processor/importer, Media library, Streaming/transcode server, Web admin UI, Player UI.
 - **Plugin contract**: out-of-process over gRPC (or HTTP+protobuf fallback). Language-agnostic; crash-isolated via supervisor; resource-limited. Manifest declares services provided/events consumed.
 - **Event log**: append-only, typed events across domains (acquisition / import / serve). Powers the Activity view, debugging, and audit. Replay-safe design inspired by DeepSeek Harness's session log.
 - **Configuration composition**: layered config (defaults → profile → host → CLI overrides); `--dump-config` prints effective tree; anything printed is patchable.
@@ -98,15 +100,18 @@ Target user: technical self-hosters replacing their existing *arr + Plex stack.
 
 ## In Scope (v1)
 
-- Disc image formats (ISO/BDMV) playback.
-- Hardware-accelerated transcoding tuning UI beyond basic detection (VAAPI/NVDEC usable but not a polished feature).
-- Multi-server federation/sync.
-- Request portal for non-admin users (Overseerr-style) — candidate for v2 plugin.
+- The complete all-in-one path: discover → monitor → search → select → embedded download → verify → import → serve → play.
+- Embedded torrent and NZB engines as core; external downloader daemons as optional integration plugins only.
+- Basic hardware-acceleration detection (VAAPI/NVDEC) for transcoding.
 
 ## Out of Scope (v1)
 
 - Native mobile/TV apps (web player only).
 - Public wiki/marketing site implementation (launch workstream, tracked separately).
+- Disc image formats (ISO/BDMV) playback.
+- Polished hardware-acceleration tuning UI: detection is in scope, tuning polish is not.
+- Multi-server federation/sync.
+- Request portal for non-admin users (Overseerr-style) — candidate for a v2 plugin.
 
 ## Further Notes
 

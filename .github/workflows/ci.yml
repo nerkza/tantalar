@@ -86,9 +86,9 @@ jobs:
         run: docker build -t tantalar:ci .
       - name: Smoke boot (SQLite)
         run: |
-          docker run -d --name tantalar-smoke -p 8787:8787 tantalar:ci
+          docker run -d --name tantalar-smoke -p 8790:8790 tantalar:ci
           for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8787/healthz | grep -q '"ok":true'; then
+            if curl -fsS http://127.0.0.1:8790/healthz | grep -q '"ok":true'; then
               echo "smoke boot OK"; exit 0
             fi
             sleep 2
