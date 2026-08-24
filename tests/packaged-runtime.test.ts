@@ -15,6 +15,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, existsSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -27,6 +28,24 @@ let address = "";
 let sessionCookie = "";
 let csrfToken = "";
 const BOOT_TIMEOUT_MS = 60_000;
+
+async function availableLoopbackPort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolveListen, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolveListen);
+  });
+  const bound = server.address();
+  if (!bound || typeof bound === "string") {
+    server.close();
+    throw new Error("failed to allocate a loopback test port");
+  }
+  const port = bound.port;
+  await new Promise<void>((resolveClose, reject) =>
+    server.close((error) => (error ? reject(error) : resolveClose())),
+  );
+  return port;
+}
 
 async function waitFor(fn: () => Promise<boolean>, what: string): Promise<void> {
   const deadline = Date.now() + BOOT_TIMEOUT_MS;
@@ -45,13 +64,14 @@ beforeAll(async () => {
   // the container does (this also exercises the starter-config contract).
   const sqlitePath = join(dir, "tantalar.db");
   const configFile = join(dir, "tantalar.yaml");
+  const port = await availableLoopbackPort();
   const { writeFileSync } = await import("node:fs");
   writeFileSync(
     configFile,
     [
       "server:",
       "  host: 127.0.0.1",
-      "  port: 8790",
+      `  port: ${port}`,
       "database:",
       "  dialect: sqlite",
       "  sqlite:",
@@ -69,8 +89,7 @@ beforeAll(async () => {
     stdio: ["ignore", "pipe", "pipe"],
   });
   child.stderr?.on("data", () => undefined);
-  // The dist server binds the config default port (8790) on 127.0.0.1.
-  address = "http://127.0.0.1:8790";
+  address = `http://127.0.0.1:${port}`;
 }, BOOT_TIMEOUT_MS);
 
 afterAll(async () => {

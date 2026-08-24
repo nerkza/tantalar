@@ -113,6 +113,7 @@ async function configInspect(_args: Record<string, unknown>, _ctx: ToolCtx): Pro
  * names declared in `requires`. */
 let coreInvoke:
   ((capability: string, operation: string, payload: Record<string, unknown>) => Promise<unknown>) | null = null;
+let coreStorage: PluginContext["storage"] | null = null;
 
 function invokeCore(operation: string, payload: Record<string, unknown>): Promise<unknown> {
   if (!coreInvoke) throw new Error("mcp server not mounted");
@@ -322,7 +323,7 @@ export function createMcpHttpHandler(deps: {
 }
 
 function makeToolPlugin(): PluginContext {
-  if (!coreInvoke) throw new Error("mcp server not mounted");
+  if (!coreInvoke || !coreStorage) throw new Error("mcp server not mounted");
   return {
     pluginId: manifest.id,
     config: {},
@@ -330,6 +331,7 @@ function makeToolPlugin(): PluginContext {
     invoke: (cap, op, payload) => coreInvoke!(cap, op, payload),
     introspectApiKey: async () => ({ valid: true, identity: "", scopes: [] }),
     log: () => undefined,
+    storage: coreStorage,
   };
 }
 
@@ -337,6 +339,7 @@ const plugin: PluginDefinition = definePlugin({
   manifest,
   mount(ctx: PluginContext) {
     coreInvoke = (cap, op, payload) => ctx.invoke(cap, op, payload);
+    coreStorage = ctx.storage;
     const cfg = (ctx.config ?? {}) as McpConfig;
     const httpCfg = cfg.http ?? {};
     if (httpCfg.enabled === false) return;
@@ -366,6 +369,7 @@ const plugin: PluginDefinition = definePlugin({
   },
   unmount(ctx: PluginContext) {
     coreInvoke = null;
+    coreStorage = null;
     ctx.log("info", "mcp server unmounted");
   },
   handlers: {

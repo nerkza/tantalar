@@ -51,7 +51,7 @@ async function main(): Promise<void> {
   const config = JSON.parse(process.env.TANTALAR_PLUGIN_CONFIG ?? "{}") as Record<string, unknown>;
   let ctx: PluginContext | null = null;
 
-  const baseCtx = {
+  const baseCtx: PluginContext = {
     pluginId: plugin.manifest.id,
     config,
     emit: async (
@@ -83,6 +83,35 @@ async function main(): Promise<void> {
     },
     log: (level: "debug" | "info" | "warn" | "error", message: string) => {
       send({ id: nextId(), op: "log", payload: { level, message } });
+    },
+    storage: {
+      get: async (key) => {
+        const id = nextId();
+        send({ id, op: "storage", payload: { action: "get", key } });
+        const raw = (await waitForResponse(id)) as
+          | { value?: { doc?: unknown; updatedAt?: string } | null; error?: string }
+          | undefined;
+        if (raw && typeof raw === "object" && "error" in raw && raw.error) {
+          throw new Error(String(raw.error));
+        }
+        const value = raw && typeof raw === "object" && "value" in raw ? raw.value : null;
+        if (!value || typeof value !== "object") return null;
+        return { doc: value.doc ?? null, updatedAt: String(value.updatedAt ?? "") };
+      },
+      put: async (key, doc) => {
+        const id = nextId();
+        send({ id, op: "storage", payload: { action: "put", key, doc } });
+        await waitForResponse(id);
+      },
+      delete: async (key) => {
+        const id = nextId();
+        send({ id, op: "storage", payload: { action: "delete", key } });
+        const raw = (await waitForResponse(id)) as { value?: unknown; error?: string } | undefined;
+        if (raw && typeof raw === "object" && "error" in raw && raw.error) {
+          throw new Error(String(raw.error));
+        }
+        return Boolean(raw && typeof raw === "object" && "value" in raw ? raw.value : false);
+      },
     },
   };
 
