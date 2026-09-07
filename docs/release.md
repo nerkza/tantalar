@@ -2,8 +2,11 @@
 
 Current release: **0.0.1 Alpha** (`0.0.1-alpha.0`).
 
-Status: **pre-release**. Nothing below has been executed against a public
-registry; publishing is approval-gated (Lewis).
+Status: **pre-release**. On 7 September 2026, Lewis confirmed that the public release process remains undecided.
+The checklist below is a draft procedure, not an approved release policy.
+Release tags, stable/beta channels, version policy, and self-hoster updates still need a decision.
+Staging publishes commit-specific development images to GHCR; it does not publish a public release or promote to production.
+See [staging deployment](staging.md). Public release publication requires Lewis's approval.
 
 The root `package.json` is the release source of truth. It contains the SemVer
 value, human label, and release channel. Derived app manifests, image defaults,

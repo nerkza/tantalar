@@ -173,6 +173,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/staging'
     needs: [check, licenses, vulnerability-scan]
     uses: ./.github/workflows/metadata-staging.yml
+    secrets: inherit
 
   app-staging:
     if: github.event_name == 'push' && github.ref == 'refs/heads/staging'

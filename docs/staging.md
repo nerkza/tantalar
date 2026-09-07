@@ -116,18 +116,28 @@ The Docker job uses its GitHub token to publish the image. No personal write tok
 The reusable metadata workflow obtains its Cloudflare secret from the `staging` environment.
 Do not also connect native Cloudflare Builds to these staging targets; that would create competing deployments.
 
-## First deployment and acceptance
+## Using staging
 
-1. Review and commit the required source in both checkouts. Both contain substantial unpublished work.
-2. Activation and first staging pushes were approved in this setup session.
-3. Push the reviewed commits to `staging` in both repositories.
-4. Confirm the marketing, metadata, and application workflow checks pass.
-5. Confirm an unauthenticated application request reaches Access, not Tantalar setup.
-6. Sign in through Access. Create a staging-only administrator and confirm movie search uses the staging gateway.
-7. Verify the application version reports the deployed commit.
-8. Restart staging and confirm its users and settings persist.
+1. Commit the changes you want to test in the relevant repository.
+2. Push the reviewed commit to that repository's `staging` branch.
+3. Open GitHub Actions and check the deployment job result.
+4. Open the relevant staging address from the table above.
 
-Never report staging as live from local dry runs alone.
+The marketing repository updates only the website. The application repository updates the metadata Worker and VPS application.
+For application staging, check `app-staging` for deployment success. A separate `browser-staging` failure can make the overall run red after a successful deployment.
+Do not infer deployment failure from the overall icon alone. Open the failed job and inspect its result.
+
+### First application visit
+
+1. Open `https://app-staging.tantalar.app`.
+2. Enter `lewis@cookson.xyz` at the Cloudflare Access login.
+3. Enter the one-time code sent to that email address.
+4. Create a staging-only Tantalar administrator in the first-run screen.
+5. Complete the application setup with staging libraries and test data.
+
+Access controls who can reach Tantalar. The Tantalar account controls permissions inside the application.
+The metadata gateway is already configured. You do not need to enter a personal TMDB key.
+The first account and setup remain operator actions; deployment does not create credentials for you.
 
 ## Verified locally
 
