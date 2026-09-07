@@ -201,6 +201,92 @@ describe("indexer settings API (TAN-014)", () => {
     expect(listText.includes("sekret-tan014")).toBe(false);
   });
 
+  it("edits and deletes an indexer without exposing or accidentally clearing its key", async () => {
+    const created = await fetch(`${address}/api/v1/indexers`, {
+      method: "POST",
+      ...authed({
+        method: "POST",
+        body: JSON.stringify({
+          name: "Editable Newznab",
+          protocol: "newznab",
+          baseUrl: "https://editable.invalid/",
+          apiKey: "edit-secret-1",
+        }),
+      }),
+    });
+    const id = ((await created.json()) as { indexer: { id: string } }).indexer.id;
+
+    const viewerEdit = await fetch(`${address}/api/v1/indexers/${id}`, {
+      method: "PATCH",
+      ...authed({ method: "PATCH", useViewer: true, body: JSON.stringify({ name: "Nope" }) }),
+    });
+    expect(viewerEdit.status).toBe(403);
+    const noCsrf = await fetch(`${address}/api/v1/indexers/${id}`, {
+      method: "PATCH",
+      ...authed({ method: "PATCH", noCsrf: true, body: JSON.stringify({ name: "Nope" }) }),
+    });
+    expect(noCsrf.status).toBe(403);
+
+    const edited = await fetch(`${address}/api/v1/indexers/${id}`, {
+      method: "PATCH",
+      ...authed({
+        method: "PATCH",
+        body: JSON.stringify({
+          name: "Edited Newznab",
+          baseUrl: "https://edited.invalid/",
+          apiKey: "",
+          priority: 4,
+          enabled: false,
+          limits: { maxSearchesPerWindow: 12, windowMs: 120_000, retentionDays: 90 },
+        }),
+      }),
+    });
+    expect(edited.status).toBe(200);
+    const editedText = await edited.text();
+    expect(editedText).not.toContain("edit-secret-1");
+    expect(JSON.parse(editedText)).toMatchObject({
+      indexer: {
+        name: "Edited Newznab",
+        baseUrl: "https://edited.invalid",
+        hasApiKey: true,
+        priority: 4,
+        enabled: false,
+        limits: { maxSearchesPerWindow: 12, windowMs: 120_000, retentionDays: 90 },
+      },
+    });
+
+    let keptKey = false;
+    const previous = service.setTransport(async (url) => {
+      keptKey = url.includes("edit-secret-1");
+      return { status: 200, body: CAPS_XML };
+    });
+    await service.test(id);
+    service.setTransport(previous);
+    expect(keptKey).toBe(true);
+
+    const replaced = await fetch(`${address}/api/v1/indexers/${id}`, {
+      method: "PATCH",
+      ...authed({ method: "PATCH", body: JSON.stringify({ apiKey: "edit-secret-2" }) }),
+    });
+    expect(replaced.status).toBe(200);
+    expect(await replaced.text()).not.toContain("edit-secret-2");
+    let replacedKey = false;
+    const restore = service.setTransport(async (url) => {
+      replacedKey = url.includes("edit-secret-2");
+      return { status: 200, body: CAPS_XML };
+    });
+    await service.test(id);
+    service.setTransport(restore);
+    expect(replacedKey).toBe(true);
+
+    const removed = await fetch(`${address}/api/v1/indexers/${id}`, {
+      method: "DELETE",
+      ...authed({ method: "DELETE", body: "{}" }),
+    });
+    expect(removed.status).toBe(204);
+    expect((await service.list()).some((indexer) => indexer.id === id)).toBe(false);
+  });
+
   it("tests the connection through the injected seam with truthful codes", async () => {
     const listed = await fetch(`${address}/api/v1/indexers`, authed({}));
     const indexers = (JSON.parse(await listed.text()) as { indexers: Array<{ id: string }> }).indexers;
@@ -279,6 +365,34 @@ describe("indexer settings API (TAN-014)", () => {
       ...authed({ method: "PUT", body: JSON.stringify({ enabled: true }) }),
     });
     expect(missing.status).toBe(404);
+  });
+
+  it("uses enabled search modes, categories and tags at runtime", async () => {
+    const runtime = await service.add({
+      name: "Runtime Newznab",
+      protocol: "newznab",
+      baseUrl: "https://runtime.invalid",
+      apiKey: "runtime-secret",
+      searchModes: { interactive: false, automatic: true },
+      categories: [1010],
+      tags: ["movies"],
+    });
+    let searchedUrl = "";
+    const previous = service.setTransport(async (url) => {
+      searchedUrl = url;
+      return {
+        status: 200,
+        body: `<?xml version="1.0"?><rss><channel><item><title>Runtime Movie 1080p</title><guid>runtime-release</guid><pubDate>Wed, 26 Aug 2026 12:00:00 GMT</pubDate><enclosure url="https://runtime.invalid/release.nzb" length="1000"/><category>1010</category></item></channel></rss>`,
+      };
+    });
+    const result = await service.search({ mode: "automatic", query: "Runtime Movie", categories: [1000], tags: ["movies"], limit: 20 });
+    service.setTransport(previous);
+    expect(result.releases).toHaveLength(1);
+    expect(result.releases[0]).toMatchObject({ guid: "runtime-release", indexerId: runtime.id, kind: "nzb" });
+    expect(new URL(searchedUrl).searchParams.get("t")).toBe("movie");
+    expect(searchedUrl).toContain("cat=1010");
+    await expect(service.search({ mode: "interactive", query: "Runtime Movie", categories: [1000], tags: ["movies"] }))
+      .rejects.toThrow("No enabled indexer accepts this search");
   });
 
   it("keeps records durable across a full database close/reopen", async () => {

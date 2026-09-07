@@ -2,8 +2,16 @@
   "id": "dev.tantalar.plugin.torrent-native",
   "version": "0.1.0",
   "protocolVersion": 1,
-  "provides": ["dev.tantalar.capability.download-client", "dev.tantalar.capability.torrent.engine"],
-  "requires": ["dev.tantalar.capability.event.emit", "dev.tantalar.capability.log"],
+  "provides": [
+    "dev.tantalar.capability.download-client",
+    "dev.tantalar.capability.torrent.engine",
+    "dev.tantalar.capability.torrent.tracker-rules"
+  ],
+  "requires": [
+    "dev.tantalar.capability.event.emit",
+    "dev.tantalar.capability.log",
+    "dev.tantalar.capability.vpn-binding"
+  ],
   "subscriptions": [],
   "entry": { "command": "node dist/plugin.js" }
 }

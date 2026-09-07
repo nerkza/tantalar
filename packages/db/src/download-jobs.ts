@@ -37,6 +37,7 @@ function rowToRecord(row: DownloadJobsTable): DownloadJobRecord {
     title: row.title,
     source: row.source,
     providerPluginId: row.providerPluginId,
+    providerJobId: row.providerJobId,
     state: row.state as DownloadState,
     progressPercent: row.progressPercent,
     sizeBytes: Number(row.sizeBytes),
@@ -49,6 +50,7 @@ function rowToRecord(row: DownloadJobsTable): DownloadJobRecord {
     removed: row.removed === 1,
     priority: Number(row.priority ?? 0),
     importHandoffPath: row.importHandoffPath,
+    correlationId: row.correlationId,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -78,33 +80,54 @@ export class DownloadJobStore {
     return row ? rowToRecord(row) : null;
   }
 
+  async findByProvider(providerPluginId: string, providerJobId: string): Promise<DownloadJobRecord | null> {
+    const row = await this.#db
+      .selectFrom("download_jobs")
+      .selectAll()
+      .where("providerPluginId", "=", providerPluginId)
+      .where("providerJobId", "=", providerJobId)
+      .executeTakeFirst();
+    return row ? rowToRecord(row) : null;
+  }
+
   async create(input: {
     itemKey: string;
     title: string;
     source: DownloadJobSource;
     providerPluginId: string;
+    providerJobId: string;
     sourceRef: string;
     sizeBytes?: number;
     jobId?: string;
+    correlationId?: string;
   }): Promise<{ record: DownloadJobRecord; created: boolean }> {
     for (const [k, v] of Object.entries({
       itemKey: input.itemKey,
       title: input.title,
       sourceRef: input.sourceRef,
       providerPluginId: input.providerPluginId,
+      providerJobId: input.providerJobId,
     })) {
       if (typeof v !== "string" || v.length === 0)
         throw new DownloadJobError("invalid_request", `${k} required`);
     }
+    if (!/^sha256:[0-9a-f]{64}$/.test(input.sourceRef)) {
+      throw new DownloadJobError("invalid_request", "sourceRef must be a SHA-256 fingerprint");
+    }
+    if (input.correlationId !== undefined && input.correlationId.length === 0) {
+      throw new DownloadJobError("invalid_request", "correlationId must not be empty");
+    }
     const existing = await this.findActive(input.itemKey, input.source);
     if (existing) return { record: existing, created: false };
     const now = new Date().toISOString();
+    const jobId = input.jobId ?? uuidv7();
     const row: DownloadJobsTable = {
-      jobId: input.jobId ?? uuidv7(),
+      jobId,
       itemKey: input.itemKey,
       title: input.title,
       source: input.source,
       providerPluginId: input.providerPluginId,
+      providerJobId: input.providerJobId,
       state: "queued",
       progressPercent: 0,
       sizeBytes: Math.max(0, Math.trunc(input.sizeBytes ?? 0)),
@@ -117,6 +140,7 @@ export class DownloadJobStore {
       removed: 0,
       priority: 0,
       importHandoffPath: null,
+      correlationId: input.correlationId ?? null,
       createdAt: now,
       updatedAt: now,
     };
@@ -159,6 +183,7 @@ export class DownloadJobStore {
     if (patch.state !== undefined) {
       if (!DOWNLOAD_JOB_STATES.has(patch.state)) throw new DownloadJobError("invalid_request", `bad state ${patch.state}`);
       updates.state = patch.state;
+      if (patch.state !== "failed") updates.failureReason = null;
     }
     if (patch.progressPercent !== undefined) {
       updates.progressPercent = Math.max(0, Math.min(100, Math.round(patch.progressPercent)));

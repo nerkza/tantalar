@@ -6,8 +6,7 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/api": { target: process.env.TANTALAR_API ?? "http://127.0.0.1:3199", changeOrigin: true },
+      "/api": { target: process.env.TANTALAR_API ?? "http://127.0.0.1:8790", changeOrigin: true, ws: true },
     },
   },
-  test: undefined,
 });

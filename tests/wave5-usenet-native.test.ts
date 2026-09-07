@@ -7,19 +7,21 @@
  *  - yEnc decode + CRC32 verification (unit);
  *  - fill-server behavior: missing segment on the primary falls through to
  *    the backup, with a visible warning;
- *  - deterministic transfer to completion; pause/resume/retry/queue controls;
+ *  - real local TLS NNTP transfer to completion; pause/resume/retry/queue controls;
  *  - restart without duplicates (durable resume, idempotent add);
- *  - PAR2 repair and unpack visibility via engine capability events;
+ *  - explicit PAR2 and archive-processing blocks;
  *  - provider-neutral download_jobs history: progress/ETA/warnings/retry/
  *    failure/removal/import handoff, durable across restarts.
  *
- * All fixtures are synthetic — no real servers, no network, no copyrighted
- * content.
+ * All article data is legal synthetic content served by a local TLS fixture.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { mkdtempSync, existsSync, writeFileSync } from "node:fs";
+import { mkdtempSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import type { AddressInfo } from "node:net";
+import { createServer, type Server, type TLSSocket } from "node:tls";
+import { createServer as createHttpServer } from "node:http";
 import { Kysely } from "kysely";
 import { migrate, openDatabase, DownloadJobStore, type Db } from "@tantalar/db";
 import { EventTypes } from "@tantalar/contracts";
@@ -38,7 +40,7 @@ import {
   parseNzb,
   type NntpServerConfig,
 } from "../plugins/usenet-native/src/engine.js";
-import { makeSyntheticNzb, yencBodyFor } from "../plugins/usenet-native/src/fixtures.js";
+import { makeSyntheticNzb as createSyntheticNzb, yencBodyFor } from "../plugins/usenet-native/src/fixtures.js";
 
 const PLUGIN_ID = "dev.tantalar.plugin.usenet-native";
 const CLIENT_CAP = "dev.tantalar.capability.download-client";
@@ -52,6 +54,85 @@ let supervisor: Supervisor;
 let dir: string;
 let downloadRoot: string;
 let fixtureDir: string;
+let tlsServer: Server;
+let pluginConfig: Record<string, unknown>;
+const tlsSockets = new Set<TLSSocket>();
+const pluginArticles = new Map<string, string>();
+const TLS_CERT_PATH = resolve("tests/fixtures/usenet/localhost-cert.pem");
+const TLS_KEY_PATH = resolve("tests/fixtures/usenet/localhost-key.pem");
+const FIXTURE_SECRET_ENV = "TANTALAR_SECRET_USENET_FIXTURE";
+const FIXTURE_PASSWORD = "legal-fixture-password";
+let vpnAllowDispatch = true;
+
+function makeSyntheticNzb(
+  ...args: Parameters<typeof createSyntheticNzb>
+): ReturnType<typeof createSyntheticNzb> {
+  const nzb = createSyntheticNzb(...args);
+  for (const [index, fileName] of nzb.fileNames.entries()) {
+    pluginArticles.set(
+      `<synthetic-${nzb.name}-${index + 1}@fixture.invalid>`,
+      yencBodyFor(nzb.payloads, fileName),
+    );
+  }
+  return nzb;
+}
+
+async function startPluginNntpFixture(): Promise<number> {
+  tlsServer = createServer(
+    { key: readFileSync(TLS_KEY_PATH), cert: readFileSync(TLS_CERT_PATH) },
+    (socket) => {
+      tlsSockets.add(socket);
+      socket.on("close", () => tlsSockets.delete(socket));
+      socket.setEncoding("latin1");
+      socket.write("200 Tantalar legal fixture ready\r\n", "latin1");
+      let buffer = "";
+      socket.on("data", (chunk: string) => {
+        buffer += chunk;
+        for (;;) {
+          const end = buffer.indexOf("\r\n");
+          if (end < 0) break;
+          const command = buffer.slice(0, end);
+          buffer = buffer.slice(end + 2);
+          if (command === "AUTHINFO USER fixture-user") {
+            socket.write("381 password required\r\n", "latin1");
+          } else if (command.startsWith("AUTHINFO PASS ")) {
+            socket.write(
+              command === `AUTHINFO PASS ${FIXTURE_PASSWORD}`
+                ? "281 authentication accepted\r\n"
+                : "481 authentication rejected\r\n",
+              "latin1",
+            );
+          } else if (command.startsWith("ARTICLE ")) {
+            const messageId = command.slice("ARTICLE ".length);
+            const article = pluginArticles.get(messageId);
+            if (!article) {
+              socket.write("430 no such article\r\n", "latin1");
+              continue;
+            }
+            const body = article
+              .split(/\r?\n/)
+              .map((line) => (line.startsWith(".") ? `.${line}` : line))
+              .join("\r\n");
+            socket.write(`220 article follows\r\nMessage-ID: ${messageId}\r\n\r\n${body}\r\n.\r\n`, "latin1");
+          } else if (command === "QUIT") {
+            socket.end("205 closing connection\r\n", "latin1");
+          } else {
+            socket.write("500 unsupported command\r\n", "latin1");
+          }
+        }
+      });
+    },
+  );
+  tlsServer.on("tlsClientError", () => {});
+  await new Promise<void>((resolveListen, reject) => {
+    tlsServer.once("error", reject);
+    tlsServer.listen(0, "127.0.0.1", () => {
+      tlsServer.off("error", reject);
+      resolveListen();
+    });
+  });
+  return (tlsServer.address() as AddressInfo).port;
+}
 
 // Shared fixture servers assembled per-test below.
 function primaryConfig(): NntpServerConfig {
@@ -99,13 +180,27 @@ async function mountPlugin(config: Record<string, unknown> = {}): Promise<void> 
     version: "0.1.0",
     protocolVersion: 1,
     provides: [CLIENT_CAP, ENGINE_CAP],
-    requires: ["dev.tantalar.capability.event.emit", "dev.tantalar.capability.log"],
+    requires: [
+      "dev.tantalar.capability.event.emit",
+      "dev.tantalar.capability.log",
+      "dev.tantalar.capability.vpn-binding",
+    ],
     subscriptions: [],
     entry: { command: PLUGIN_ENTRY },
   };
   Object.assign(m, { __config: config });
   const rt = await supervisor.mount(m as never, config);
   expect(["healthy", "restarting"]).toContain(rt.state);
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try {
+      container.resolve(CLIENT_CAP);
+      container.resolve(ENGINE_CAP);
+      return;
+    } catch {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+    }
+  }
+  throw new Error(`usenet-native did not become ready (state=${supervisor.get(PLUGIN_ID)?.state ?? "missing"})`);
 }
 
 beforeAll(async () => {
@@ -121,6 +216,33 @@ beforeAll(async () => {
   container = new ServiceContainer();
   container.register({ pluginId: "core", capability: "dev.tantalar.capability.event.emit", invoke: async () => ({ ok: true }) });
   container.register({ pluginId: "core", capability: "dev.tantalar.capability.log", invoke: async () => ({ ok: true }) });
+  container.register({
+    pluginId: "core",
+    capability: "dev.tantalar.capability.vpn-binding",
+    invoke: async () => ({
+      allowDispatch: vpnAllowDispatch,
+      health: vpnAllowDispatch ? "healthy" : "down",
+      profileId: "fixture-vpn",
+    }),
+  });
+  const nntpPort = await startPluginNntpFixture();
+  pluginConfig = {
+    downloadRoots: [downloadRoot],
+    maxConcurrent: 50,
+    servers: [
+      {
+        id: "fixture-primary",
+        name: "Legal local TLS fixture",
+        host: "127.0.0.1",
+        port: nntpPort,
+        tls: "implicit",
+        username: "fixture-user",
+        passwordEnv: FIXTURE_SECRET_ENV,
+        priority: 0,
+        connections: 2,
+      },
+    ],
+  };
   supervisor = new Supervisor({
     bus,
     container,
@@ -133,15 +255,21 @@ beforeAll(async () => {
       return {
         command: cmd ?? "node",
         args: rest.filter(Boolean),
-        env: (m.__config ? { TANTALAR_PLUGIN_CONFIG: JSON.stringify(m.__config) } : {}) as Record<string, string>,
+        env: {
+          ...(m.__config ? { TANTALAR_PLUGIN_CONFIG: JSON.stringify(m.__config) } : {}),
+          [FIXTURE_SECRET_ENV]: FIXTURE_PASSWORD,
+          NODE_EXTRA_CA_CERTS: TLS_CERT_PATH,
+        },
       };
     },
   });
-  await mountPlugin({ downloadRoots: [downloadRoot], maxConcurrent: 50 });
+  await mountPlugin(pluginConfig);
 });
 
 afterAll(async () => {
   await supervisor.stopAll();
+  for (const socket of tlsSockets) socket.destroy();
+  await new Promise<void>((resolveClose) => tlsServer.close(() => resolveClose()));
   await db.destroy();
 });
 
@@ -206,6 +334,115 @@ describe("yEnc + CRC + NZB parsing (legal synthetic units)", () => {
 // ---- Full lifecycle over the process boundary ---------------------------------------
 
 describe("usenet-native embedded engine (TAN-010)", () => {
+  it("reports redacted configuration and tests the configured TLS server", async () => {
+    const status = (await engineCap().invoke("configuration-status", {})) as {
+      ready: boolean;
+      servers: Array<Record<string, unknown>>;
+      limitations: Record<string, boolean>;
+    };
+    expect(status.ready).toBe(true);
+    expect(status.servers).toHaveLength(1);
+    expect(status.servers[0]).toMatchObject({
+      id: "fixture-primary",
+      hasPassword: true,
+      passwordSource: "environment",
+    });
+    expect(status.servers[0]).not.toHaveProperty("password");
+    expect(status.limitations).toEqual({ starttls: false, par2: true, archives: true });
+
+    const server = (pluginConfig.servers as Array<Record<string, unknown>>)[0]!;
+    await expect(engineCap().invoke("test-server", { server })).resolves.toMatchObject({ ok: true });
+    await expect(engineCap().invoke("test-server", { server: { ...server, tls: "starttls" } })).rejects.toThrow(
+      /STARTTLS is not supported/,
+    );
+    await expect(
+      engineCap().invoke("configure", { servers: [{ ...server, passwordEnv: "plaintext-name" }] }),
+    ).rejects.toThrow(/TANTALAR_SECRET_/);
+    await expect(engineCap().invoke("configure", { servers: [{ ...server, password: FIXTURE_PASSWORD }] })).rejects.toThrow(
+      /inline Usenet passwords are forbidden/,
+    );
+    await expect(engineCap().invoke("configure", { servers: [server] })).resolves.toMatchObject({ ready: true });
+    await supervisor.unmount(PLUGIN_ID);
+    await mountPlugin({ downloadRoots: [downloadRoot], maxConcurrent: 50 });
+    await expect(engineCap().invoke("configuration-status", {})).resolves.toMatchObject({ ready: true });
+  });
+
+  it("advances queued jobs in the bounded background worker", async () => {
+    const nzb = makeSyntheticNzb(fixtureDir, "wave5-background", { fileCount: 2, fileBytes: 8 * 1024 });
+    const added = (await client().invoke("add", {
+      itemKey: "movie-wave5-background",
+      title: "Wave5 Background",
+      kind: "nzb",
+      sourceUrl: nzb.nzbPath,
+    })) as { downloadId: string };
+    let state = "queued";
+    for (let attempt = 0; attempt < 30 && state !== "completed"; attempt++) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+      state = ((await client().invoke("status", { downloadId: added.downloadId })) as { state: string }).state;
+    }
+    expect(state).toBe("completed");
+    const completed = (await client().invoke("completed-files", { downloadId: added.downloadId })) as {
+      files: Array<{ path: string; sizeBytes: number }>;
+    };
+    expect(completed.files).toHaveLength(2);
+    expect(completed.files.every((file) => resolve(file.path).startsWith(resolve(downloadRoot)) && file.sizeBytes > 0)).toBe(true);
+  });
+
+  it("gates add, advance, resume, and retry when VPN binding is unhealthy", async () => {
+    const blockedAdd = makeSyntheticNzb(fixtureDir, "wave5-vpn-add", { fileCount: 1, fileBytes: 4 * 1024 });
+    vpnAllowDispatch = false;
+    try {
+      await expect(
+        client().invoke("add", {
+          itemKey: "movie-wave5-vpn-add",
+          title: "Wave5 VPN Add",
+          kind: "nzb",
+          sourceUrl: blockedAdd.nzbPath,
+        }),
+      ).rejects.toThrow(/kill switch/);
+    } finally {
+      vpnAllowDispatch = true;
+    }
+
+    const queued = makeSyntheticNzb(fixtureDir, "wave5-vpn-advance", { fileCount: 2, fileBytes: 4 * 1024 });
+    const added = (await client().invoke("add", {
+      itemKey: "movie-wave5-vpn-advance",
+      title: "Wave5 VPN Advance",
+      kind: "nzb",
+      sourceUrl: queued.nzbPath,
+    })) as { downloadId: string };
+    vpnAllowDispatch = false;
+    try {
+      await expect(client().invoke("advance", {})).rejects.toThrow(/kill switch/);
+    } finally {
+      vpnAllowDispatch = true;
+    }
+    await client().invoke("pause", { downloadId: added.downloadId });
+    vpnAllowDispatch = false;
+    try {
+      await expect(client().invoke("resume", { downloadId: added.downloadId })).rejects.toThrow(/kill switch/);
+    } finally {
+      vpnAllowDispatch = true;
+    }
+    await client().invoke("resume", { downloadId: added.downloadId });
+
+    const missing = makeSyntheticNzb(fixtureDir, "wave5-vpn-retry", { fileCount: 1, fileBytes: 4 * 1024 });
+    const missingBody = pluginArticles.get(missing.messageIds[0]!)!;
+    pluginArticles.delete(missing.messageIds[0]!);
+    const failed = await driveToCompletion("movie-wave5-vpn-retry", "Wave5 VPN Retry", missing.nzbPath);
+    expect(failed.state).toBe("failed");
+    vpnAllowDispatch = false;
+    try {
+      await expect(client().invoke("retry", { downloadId: failed.downloadId })).rejects.toThrow(/kill switch/);
+    } finally {
+      vpnAllowDispatch = true;
+      pluginArticles.set(missing.messageIds[0]!, missingBody);
+    }
+    await client().invoke("retry", { downloadId: failed.downloadId });
+    const completed = await driveToCompletion("movie-wave5-vpn-retry", "Wave5 VPN Retry", missing.nzbPath);
+    expect(completed.state).toBe("completed");
+  });
+
   it("downloads a legal synthetic NZB end-to-end WITHOUT SABnzbd (add → advance → completed)", async () => {
     const nzb = makeSyntheticNzb(fixtureDir, "wave5-show-s01e01", { fileCount: 2, fileBytes: 64 * 1024 });
     const result = await driveToCompletion("series-wave5:S01E01", "Wave5 Show S01E01", nzb.nzbPath);
@@ -218,10 +455,21 @@ describe("usenet-native embedded engine (TAN-010)", () => {
     expect(status.state).toBe("completed");
     expect(status.progressPercent).toBe(100);
 
-    // Payload bytes landed under the configured root only (engine roots the
-    // job at <root>/<file name>).
-    const written = join(downloadRoot, nzb.fileNames[0]!);
+    // Payload bytes land in a dedicated root for this job.
+    const written = join(downloadRoot, result.downloadId, nzb.fileNames[0]!);
     expect(existsSync(written)).toBe(true);
+  });
+
+  it("downloads an indexer NZB URL through the real plugin and NNTP transport", async () => {
+    const nzb = makeSyntheticNzb(fixtureDir, "wave5-http", { fileCount: 1, fileBytes: 4096 });
+    const server = createHttpServer((_request, response) => { response.setHeader("Content-Type", "application/x-nzb"); response.end(readFileSync(nzb.nzbPath)); });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api?t=get&id=fixture&apikey=private-key`;
+      const result = await driveToCompletion("movie-wave5-http", "HTTP fixture", url);
+      await expect.poll(async () => (await client().invoke("status", { downloadId: result.downloadId })).state).toBe("completed");
+      expect(readFileSync(join(downloadRoot, result.downloadId, nzb.fileNames[0]!))).toEqual(nzb.payloads.get(nzb.fileNames[0]!));
+    } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
   });
 
   it("falls back to the fill server when the primary misses a segment, with a visible warning", async () => {
@@ -289,8 +537,8 @@ describe("usenet-native embedded engine (TAN-010)", () => {
       client().invoke("add", { itemKey: "x-tor", title: "X", kind: "torrent", sourceUrl: "/tmp/x.torrent" }),
     ).rejects.toThrow(/NZB releases only/);
     await expect(
-      client().invoke("add", { itemKey: "x-url", title: "X", kind: "nzb", sourceUrl: "https://example.invalid/a.nzb" }),
-    ).rejects.toThrow(/contained absolute .nzb path/);
+      client().invoke("add", { itemKey: "x-url", title: "X", kind: "nzb", sourceUrl: "file://example.invalid/a.nzb" }),
+    ).rejects.toThrow(/absolute .nzb path/);
   });
 
   it("is idempotent on repeated adds for the same itemKey", async () => {
@@ -313,7 +561,7 @@ describe("restart without duplicates (durable resume)", () => {
     })) as { downloadId: string };
 
     await supervisor.unmount(PLUGIN_ID);
-    await mountPlugin({ downloadRoots: [downloadRoot], maxConcurrent: 50 });
+    await mountPlugin(pluginConfig);
 
     // Same itemKey add after remount must NOT create a second job.
     const dupe = (await client().invoke("add", {
@@ -332,44 +580,19 @@ describe("restart without duplicates (durable resume)", () => {
   });
 });
 
-describe("repair and unpack visibility (TAN-010)", () => {
-  it("PAR2 repair recovers corrupted files and records the warning", async () => {
-    const nzb = makeSyntheticNzb(fixtureDir, "wave5-repair", { fileCount: 1, fileBytes: 16 * 1024 });
-    const { engine } = buildEngine(
-      new Map(nzb.fileNames.map((f, i) => [`<synthetic-${nzb.name}-${i + 1}@fixture.invalid>`, yencBodyFor(nzb.payloads, f)])),
-      new Map(),
-      new Map([[join(downloadRoot, nzb.fileNames[0]!), nzb.payloads.get(nzb.fileNames[0]!)!]]),
+describe("post-processing boundaries (TAN-010)", () => {
+  it("reports missing recovery data and handles jobs without archives", async () => {
+    const nzb = makeSyntheticNzb(fixtureDir, "wave5-post-processing", { fileCount: 1, fileBytes: 16 * 1024 });
+    const done = await driveToCompletion(
+      "movie-wave5-post-processing",
+      "Wave5 Post Processing",
+      nzb.nzbPath,
     );
-    const added = await engine.add({ sourceKind: "nzb-path", sourcePath: nzb.nzbPath, downloadPath: downloadRoot });
-    while (engine.get(added.id)!.state === "queued" || engine.get(added.id)!.state === "downloading") await engine.advance(added.id);
-    expect(engine.get(added.id)!.state).toBe("completed");
-
-    // Corrupt the completed file on disk, then run the repair seam.
-    writeFileSync(join(downloadRoot, nzb.fileNames[0]!), Buffer.alloc(1024, 9));
-    const before = await engine.repair(added.id);
-    expect(before.repaired).toBe(true);
-    expect(before.recoveredFiles).toEqual([nzb.fileNames[0]]);
-    expect(engine.get(added.id)!.warnings).toContain("par2 repair ran");
-  });
-
-  it("unpack results surface through the engine capability", async () => {
-    const nzb = makeSyntheticNzb(fixtureDir, "wave5-unpack", { fileCount: 1, fileBytes: 16 * 1024 });
-    const added = (await client().invoke("add", {
-      itemKey: "movie-wave5-unpack",
-      title: "Wave5 Unpack",
-      kind: "nzb",
-      sourceUrl: nzb.nzbPath,
-    })) as { downloadId: string };
-    // Drive the job to completion first — unpack requires a completed job.
-    let state = "";
-    for (let i = 0; i < 50 && state !== "completed"; i++) {
-      const res = (await client().invoke("advance", {})) as { downloads: Array<{ itemKey: string; state: string }> };
-      state = res.downloads.find((d) => d.itemKey === "movie-wave5-unpack")?.state ?? state;
-    }
-    expect(state).toBe("completed");
-    const result = (await engineCap().invoke("unpack", { downloadId: added.downloadId })) as { unpacked: boolean };
-    // The default plugin unpacker has no data for this archive — truthful negative.
-    expect(result.unpacked).toBe(false);
+    expect(done.state).toBe("completed");
+    await expect(engineCap().invoke("repair", { downloadId: done.downloadId })).rejects.toThrow(
+      /has no PAR2 recovery files/,
+    );
+    await expect(engineCap().invoke("unpack", { downloadId: done.downloadId })).resolves.toMatchObject({ unpacked: false, files: [] });
   });
 });
 
@@ -388,7 +611,8 @@ describe("unified durable download_jobs (TAN-011)", () => {
       title: "Usenet Job",
       source: "usenet",
       providerPluginId: PLUGIN_ID,
-      sourceRef: "/fixtures/wave5.nzb",
+      providerJobId: "usenet-transaction-1",
+      sourceRef: `sha256:${"1".repeat(64)}`,
       sizeBytes: 1000,
     });
     expect(u.created).toBe(true);
@@ -399,7 +623,8 @@ describe("unified durable download_jobs (TAN-011)", () => {
       title: "Torrent Job",
       source: "torrent",
       providerPluginId: "dev.tantalar.plugin.torrent-native",
-      sourceRef: "/fixtures/wave5.torrent",
+      providerJobId: "torrent-transaction-1",
+      sourceRef: `sha256:${"2".repeat(64)}`,
       sizeBytes: 2000,
     });
     expect(t.created).toBe(true);
@@ -439,7 +664,8 @@ describe("unified durable download_jobs (TAN-011)", () => {
       title: "History Job",
       source: "usenet",
       providerPluginId: PLUGIN_ID,
-      sourceRef: "/fixtures/h.nzb",
+      providerJobId: "usenet-history-1",
+      sourceRef: `sha256:${"3".repeat(64)}`,
     });
     await store.updateProgress(j.record.jobId, { state: "completed", progressPercent: 100 });
     await store.remove(j.record.jobId);
@@ -457,7 +683,8 @@ describe("unified durable download_jobs (TAN-011)", () => {
       title: "History Job v2",
       source: "usenet",
       providerPluginId: PLUGIN_ID,
-      sourceRef: "/fixtures/h.nzb",
+      providerJobId: "usenet-history-2",
+      sourceRef: `sha256:${"3".repeat(64)}`,
     });
     expect(fresh.created).toBe(true);
     expect(fresh.record.jobId).not.toBe(j.record.jobId);
@@ -469,7 +696,8 @@ describe("unified durable download_jobs (TAN-011)", () => {
       title: "Active",
       source: "usenet",
       providerPluginId: PLUGIN_ID,
-      sourceRef: "/x.nzb",
+      providerJobId: "usenet-active-1",
+      sourceRef: `sha256:${"4".repeat(64)}`,
     });
     expect(a.created).toBe(true);
     const b = await store.create({
@@ -477,10 +705,46 @@ describe("unified durable download_jobs (TAN-011)", () => {
       title: "Active",
       source: "usenet",
       providerPluginId: PLUGIN_ID,
-      sourceRef: "/x.nzb",
+      providerJobId: "usenet-active-race",
+      sourceRef: `sha256:${"4".repeat(64)}`,
     });
     expect(b.created).toBe(false);
     expect(b.record.jobId).toBe(a.record.jobId);
     await expect(store.retry(b.record.jobId)).rejects.toThrow(/only failed or paused/);
+  });
+
+  it("requires redacted source and real provider identities", async () => {
+    await expect(store.create({
+      itemKey: "unsafe-source",
+      title: "Unsafe source",
+      source: "usenet",
+      providerPluginId: PLUGIN_ID,
+      providerJobId: "unsafe-source-job",
+      sourceRef: "/private/news/passkey.nzb",
+    })).rejects.toThrow(/SHA-256 fingerprint/);
+
+    const first = await store.create({
+      itemKey: "provider-identity-a",
+      title: "Provider identity A",
+      source: "usenet",
+      providerPluginId: PLUGIN_ID,
+      providerJobId: "shared-provider-id",
+      sourceRef: `sha256:${"5".repeat(64)}`,
+    });
+    await expect(store.create({
+      itemKey: "provider-identity-b",
+      title: "Provider identity B",
+      source: "usenet",
+      providerPluginId: PLUGIN_ID,
+      providerJobId: "shared-provider-id",
+      sourceRef: `sha256:${"6".repeat(64)}`,
+    })).rejects.toThrow();
+
+    await db
+      .updateTable("download_jobs")
+      .set({ providerJobId: null })
+      .where("jobId", "=", first.record.jobId)
+      .execute();
+    expect((await store.getOrThrow(first.record.jobId)).providerJobId).toBeNull();
   });
 });

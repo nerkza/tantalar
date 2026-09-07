@@ -4,9 +4,10 @@
  * and library wiring against mocked fetch).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MantineProvider } from "@mantine/core";
+import { NotificationProvider } from "../src/notifications";
 import React from "react";
 
 // ---- api mock -------------------------------------------------------------------
@@ -65,9 +66,9 @@ if (!window.matchMedia) {
 function renderUi(node: React.ReactElement): void {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
-    <MantineProvider defaultColorScheme="dark">
+    <MantineProvider defaultColorScheme="dark"><NotificationProvider userId={null} isAdmin={false} navigate={() => {}}>
       <QueryClientProvider client={qc}>{node}</QueryClientProvider>
-    </MantineProvider>,
+    </NotificationProvider></MantineProvider>,
   );
 }
 
@@ -83,6 +84,11 @@ const BROWSE = {
 function seedProductRoutes(overrides: Record<string, () => unknown> = {}): void {
   routes.push((path, init) => {
     const method = init?.method ?? "GET";
+    if (path.startsWith("/api/v1/library?")) {
+      const q = new URL(path, "http://localhost").searchParams;
+      const items = BROWSE.items.filter(item => (!q.get("filter_kind") || item.kind === q.get("filter_kind")) && item.title.toLowerCase().includes((q.get("search") ?? "").toLowerCase()));
+      return { status: 200, body: { ...BROWSE, items, total: items.length } };
+    }
     if (path === "/api/v1/library") return { status: 200, body: BROWSE };
     if (path.startsWith("/api/v1/libraries")) {
       return {
@@ -124,8 +130,10 @@ function seedProductRoutes(overrides: Record<string, () => unknown> = {}): void 
     if (path === "/api/v1/catalog") {
       return { status: 200, body: { items: overrides["catalog"]?.() ?? [] } };
     }
-    if (path === "/api/v1/themes") return { status: 200, body: { themes: [] } };
-    if (/\/ui-preferences$/.test(path)) return { status: 200, body: { preferences: {} } };
+    if (path === "/api/v1/themes") return { status: 200, body: { themes: overrides["themes"]?.() ?? [] } };
+    if (/\/ui-preferences$/.test(path)) {
+      return { status: 200, body: { preferences: overrides["preferences"]?.() ?? {} } };
+    }
     if (/\/resume$/.test(path)) return { status: 200, body: { resumePoint: null } };
     return undefined;
   });
@@ -168,11 +176,11 @@ describe("Catalog page (Movies / Series)", () => {
     expect(document.querySelector('[data-testid="catalog-f-mov"]')).toBeNull();
 
     // Search narrows to no matches with a truthful message.
-    const input = screen.getByLabelText("Search Series") as HTMLInputElement;
+    const input = screen.getByLabelText("Filter Series") as HTMLInputElement;
     const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!;
     setter.call(input, "zzz-nothing");
     input.dispatchEvent(new Event("input", { bubbles: true }));
-    await waitFor(() => expect(screen.getByText(/No series match/i)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/No matching series/i)).toBeTruthy());
   });
 });
 
@@ -213,6 +221,76 @@ describe("Settings page", () => {
     expect(TOKEN_LABELS["color-primary"]).toBe("Accent color");
   });
 
+  it("keeps the simple color customizer obvious and Advanced collapsed", async () => {
+    seedProductRoutes({
+      themes: () => [{ id: "theme-cinema", name: "Cinema", tokens: { "color-primary": "#cc7744" } }],
+    });
+    renderUi(<SettingsPage adminId="u1" isAdmin={true} />);
+
+    expect(await screen.findByRole("button", { name: "Edit Accent" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Edit Text" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Edit Background" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Edit Surface" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Edit Raised surface" })).toBeTruthy();
+    expect(screen.queryByTestId("appearance-advanced-editor")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Advanced appearance" }));
+    expect(screen.getByTestId("appearance-advanced-editor")).toBeTruthy();
+    expect(screen.getByText("Import theme")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Export theme" })).toBeTruthy();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Use Cinema theme" }));
+    await waitFor(() => expect(screen.getByText("Cinema activated.")).toBeTruthy());
+  });
+
+  it("stores custom colors with the server-safe CSS token prefix", async () => {
+    let savedBody: { name: string; tokens: Record<string, string> } | null = null;
+    routes.push((path, init) => {
+      if (path === "/api/v1/themes" && init?.method === "POST") {
+        savedBody = JSON.parse(String(init.body));
+        return { status: 201, body: { theme: { id: "theme-new", name: savedBody!.name } } };
+      }
+      return undefined;
+    });
+    seedProductRoutes();
+    renderUi(<SettingsPage adminId="u1" isAdmin={true} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Accent" }));
+    fireEvent.change(await screen.findByLabelText("Accent hex value"), { target: { value: "#5da2ff" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Theme name" }), { target: { value: "My colors" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save theme" }));
+
+    await waitFor(() => expect(screen.getByText("My colors saved and activated.")).toBeTruthy());
+    expect(savedBody?.tokens["--tantalar-color-primary"]).toBe("#5da2ff");
+    expect(savedBody?.tokens["color-primary"]).toBeUndefined();
+  });
+
+  it("restores a built-in mode instead of leaving custom overrides active", async () => {
+    let savedPreferences: Record<string, unknown> | null = null;
+    routes.push((path, init) => {
+      if (/\/ui-preferences$/.test(path) && init?.method === "PUT") {
+        savedPreferences = (JSON.parse(String(init.body)) as { preferences: Record<string, unknown> }).preferences;
+        return { status: 200, body: { saved: true } };
+      }
+      return undefined;
+    });
+    seedProductRoutes({
+      preferences: () => ({
+        colorScheme: "dark",
+        themeId: "theme-old",
+        tokenOverrides: { "color-primary": "#f64c4c" },
+      }),
+    });
+    renderUi(<SettingsPage adminId="u1" isAdmin={true} />);
+
+    expect((await screen.findByRole("button", { name: "Edit Accent" })).textContent).toContain("#F64C4C");
+    fireEvent.change(screen.getByRole("combobox", { name: "Theme" }), { target: { value: "light" } });
+
+    await waitFor(() => expect(savedPreferences?.tokenOverrides).toEqual({}));
+    expect(savedPreferences?.themeId).toBeNull();
+    expect(screen.getByRole("button", { name: "Edit Accent" }).textContent).toContain("#2864C7");
+  });
+
   it("wires libraries and indexers to their real endpoints", async () => {
     seedProductRoutes();
     renderUi(<SettingsPage adminId="u1" isAdmin={true} />);
@@ -232,6 +310,6 @@ describe("Settings page", () => {
       openTab("Libraries");
       expect(screen.getByTestId("settings-libraries")).toBeTruthy();
     });
-    await waitFor(() => expect(screen.getByText("Movies")).toBeTruthy());
+    await waitFor(() => expect(screen.getAllByText("Movies").length).toBeGreaterThan(0));
   });
 });

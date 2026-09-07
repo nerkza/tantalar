@@ -1,11 +1,16 @@
-# Tantalar v1 — single image (story 28): Node LTS + ffmpeg, SQLite default,
+# Tantalar — single image (story 28): Node LTS + ffmpeg, SQLite default,
 # PostgreSQL via config/secret. Build from the repo root:
-#   docker build -t tantalar:v1 .
+#   docker build --build-arg TANTALAR_BUILD_VERSION=<version> -t tantalar:<version> .
 # Run (SQLite):
-#   docker run -p 8790:8790 -v tantalar-data:/data tantalar:v1
+#   docker run -p 8790:8790 -v tantalar-data:/data tantalar:<version>
 # See docs/deploy.md for PostgreSQL mode and compose examples.
 
+ARG TANTALAR_BUILD_VERSION=0.0.1-alpha.0
+ARG TANTALAR_BUILD_REVISION=""
+ARG TANTALAR_BUILD_DATE=""
+
 FROM node:22-bookworm-slim AS build
+ARG TANTALAR_BUILD_VERSION
 RUN corepack enable
 WORKDIR /app
 COPY pnpm-lock.yaml pnpm-workspace.yaml package.json tsconfig.base.json tsconfig.json ./
@@ -13,11 +18,20 @@ COPY apps ./apps
 COPY packages ./packages
 COPY plugins ./plugins
 COPY scripts ./scripts
+RUN node scripts/version.mjs assert "$TANTALAR_BUILD_VERSION"
 RUN pnpm install --frozen-lockfile
 RUN pnpm run build
 RUN pnpm --filter @tantalar/web run build
 
 FROM node:22-bookworm-slim
+ARG TANTALAR_BUILD_VERSION
+ARG TANTALAR_BUILD_REVISION
+ARG TANTALAR_BUILD_DATE
+LABEL org.opencontainers.image.title="Tantalar" \
+      org.opencontainers.image.version="$TANTALAR_BUILD_VERSION" \
+      org.opencontainers.image.revision="$TANTALAR_BUILD_REVISION" \
+      org.opencontainers.image.created="$TANTALAR_BUILD_DATE" \
+      org.opencontainers.image.source="https://github.com/nerkza/tantalar"
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ffmpeg curl \
   && rm -rf /var/lib/apt/lists/*
@@ -25,7 +39,10 @@ RUN corepack enable
 WORKDIR /app
 ENV NODE_ENV=production \
     TANTALAR_CONFIG_FILE=/config/tantalar.yaml \
-    TANTALAR_DATA_DIR=/data
+    TANTALAR_DATA_DIR=/data \
+    TANTALAR_BUILD_VERSION=$TANTALAR_BUILD_VERSION \
+    TANTALAR_BUILD_COMMIT=$TANTALAR_BUILD_REVISION \
+    TANTALAR_BUILD_DATE=$TANTALAR_BUILD_DATE
 COPY --from=build /app ./
 
 COPY docker/entrypoint.sh /usr/local/bin/tantalar-entrypoint

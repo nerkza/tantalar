@@ -1,6 +1,6 @@
 /**
  * Wave 7 (TAN-014): core indexer-settings service — the operator surface to
- * ADD, TEST, and ENABLE Torznab/Newznab indexer configurations.
+ * ADD, EDIT, TEST, ENABLE, and DELETE Torznab/Newznab indexer configurations.
  *
  * Locked decisions implemented here:
  *  - API keys arrive through this API or TANTALAR_SECRET_* env secrets and
@@ -16,8 +16,16 @@
  */
 import type { Kysely } from "kysely";
 import { PluginDocumentStore } from "@tantalar/db";
-import { uuidv7 } from "@tantalar/contracts";
+import {
+  IndexerError,
+  uuidv7,
+  validateIndexedRelease,
+  validateIndexerQuery,
+  type IndexedRelease,
+  type IndexerSearchResult,
+} from "@tantalar/contracts";
 import type { Db } from "@tantalar/db";
+import { buildQueryUrl, parseCaps, parseResults } from "dev.tantalar.plugin.indexer-torznab-newznab/wire";
 
 const OWNER = "dev.tantalar.core.indexers";
 
@@ -42,6 +50,15 @@ export interface IndexerSettingsRecord {
   readonly maxSearchesPerWindow: number;
   readonly windowMs: number;
   readonly retentionDays: number;
+  readonly interactiveSearch: boolean;
+  readonly automaticSearch: boolean;
+  readonly categories: readonly number[];
+  readonly tags: readonly string[];
+  readonly capabilities?: {
+    readonly searchModes: readonly ("search" | "tv-search" | "movie-search")[];
+    readonly categories: ReadonlyArray<{ id: number; name: string }>;
+    readonly testedAt: string;
+  };
 }
 
 /** Redacted public shape: safe to return over HTTP. */
@@ -53,6 +70,10 @@ export interface RedactedIndexer {
   hasApiKey: boolean;
   priority: number;
   enabled: boolean;
+  searchModes: { interactive: boolean; automatic: boolean };
+  categories: readonly number[];
+  tags: readonly string[];
+  capabilities?: IndexerSettingsRecord["capabilities"];
   limits: { maxSearchesPerWindow: number; windowMs: number; retentionDays: number };
 }
 
@@ -65,6 +86,10 @@ function redact(r: IndexerSettingsRecord): RedactedIndexer {
     hasApiKey: r.apiKey.length > 0,
     priority: r.priority,
     enabled: r.enabled,
+    searchModes: { interactive: r.interactiveSearch, automatic: r.automaticSearch },
+    categories: r.categories,
+    tags: r.tags,
+    ...(r.capabilities ? { capabilities: r.capabilities } : {}),
     limits: {
       maxSearchesPerWindow: r.maxSearchesPerWindow,
       windowMs: r.windowMs,
@@ -80,6 +105,23 @@ export interface AddIndexerInput {
   apiKey?: string;
   priority?: number;
   enabled?: boolean;
+  searchModes?: { interactive?: boolean; automatic?: boolean };
+  categories?: readonly number[];
+  tags?: readonly string[];
+  limits?: { maxSearchesPerWindow?: number; windowMs?: number; retentionDays?: number };
+}
+
+export interface UpdateIndexerInput {
+  name?: string;
+  protocol?: "torznab" | "newznab";
+  baseUrl?: string;
+  /** Blank or omitted keeps the stored key. */
+  apiKey?: string;
+  priority?: number;
+  enabled?: boolean;
+  searchModes?: { interactive?: boolean; automatic?: boolean };
+  categories?: readonly number[];
+  tags?: readonly string[];
   limits?: { maxSearchesPerWindow?: number; windowMs?: number; retentionDays?: number };
 }
 
@@ -109,6 +151,8 @@ export class IndexerSettingsService {
   readonly #db: Kysely<Db>;
   readonly #store: PluginDocumentStore;
   #transport: CapsTransport = defaultTransport;
+  #onChanged: () => Promise<void> = async () => undefined;
+  readonly #searchWindows = new Map<string, number[]>();
 
   constructor(db: Kysely<Db>) {
     this.#db = db;
@@ -122,8 +166,13 @@ export class IndexerSettingsService {
     return prev;
   }
 
+  setOnChanged(callback: () => Promise<void>): void {
+    this.#onChanged = callback;
+  }
+
   async #put(record: IndexerSettingsRecord): Promise<void> {
     await this.#store.put(OWNER, record.id, record);
+    await this.#onChanged();
   }
 
   #parse(doc: unknown): IndexerSettingsRecord | null {
@@ -148,6 +197,11 @@ export class IndexerSettingsService {
       maxSearchesPerWindow: Number.isFinite(r.maxSearchesPerWindow) ? (r.maxSearchesPerWindow as number) : 0,
       windowMs: Number.isFinite(r.windowMs) ? (r.windowMs as number) : 60_000,
       retentionDays: Number.isFinite(r.retentionDays) ? (r.retentionDays as number) : 0,
+      interactiveSearch: r.interactiveSearch !== false,
+      automaticSearch: r.automaticSearch !== false,
+      categories: Array.isArray(r.categories) ? r.categories.filter((value): value is number => Number.isInteger(value) && value > 0) : [],
+      tags: Array.isArray(r.tags) ? r.tags.filter((value): value is string => typeof value === "string").slice(0, 20) : [],
+      ...(r.capabilities && typeof r.capabilities === "object" ? { capabilities: r.capabilities } : {}),
     };
   }
 
@@ -174,11 +228,20 @@ export class IndexerSettingsService {
     if (input.priority !== undefined && (!Number.isFinite(input.priority) || input.priority < 0)) {
       throw new IndexerSettingsError("priority must be a non-negative number", 400);
     }
+    if (input.categories !== undefined && (!Array.isArray(input.categories) || !input.categories.every((value) => Number.isInteger(value) && value > 0))) {
+      throw new IndexerSettingsError("categories must contain positive integers", 400);
+    }
+    if (input.tags !== undefined && (!Array.isArray(input.tags) || input.tags.length > 20 || !input.tags.every((value) => typeof value === "string" && value.trim().length > 0 && value.length <= 40))) {
+      throw new IndexerSettingsError("tags must contain at most 20 short names", 400);
+    }
     if (
       input.limits?.maxSearchesPerWindow !== undefined &&
       (!Number.isInteger(input.limits.maxSearchesPerWindow) || input.limits.maxSearchesPerWindow < 0)
     ) {
       throw new IndexerSettingsError("limits.maxSearchesPerWindow must be a non-negative integer", 400);
+    }
+    if (input.limits?.windowMs !== undefined && (!Number.isInteger(input.limits.windowMs) || input.limits.windowMs < 0)) {
+      throw new IndexerSettingsError("limits.windowMs must be a non-negative integer", 400);
     }
     if (input.limits?.retentionDays !== undefined && (!Number.isInteger(input.limits.retentionDays) || input.limits.retentionDays < 0)) {
       throw new IndexerSettingsError("limits.retentionDays must be a non-negative integer", 400);
@@ -205,6 +268,10 @@ export class IndexerSettingsService {
       maxSearchesPerWindow: input.limits?.maxSearchesPerWindow ?? 0,
       windowMs: input.limits?.windowMs ?? 60_000,
       retentionDays: input.limits?.retentionDays ?? 0,
+      interactiveSearch: input.searchModes?.interactive ?? true,
+      automaticSearch: input.searchModes?.automatic ?? true,
+      categories: [...new Set(input.categories ?? [])],
+      tags: [...new Set((input.tags ?? []).map((tag) => tag.trim().toLowerCase()))],
     };
     await this.#put(record);
     return redact(record);
@@ -235,6 +302,64 @@ export class IndexerSettingsService {
 
   async get(id: string): Promise<RedactedIndexer> {
     return redact(await this.#getRaw(id));
+  }
+
+  /** Update one definition. A blank API key deliberately preserves the stored secret. */
+  async update(id: string, input: UpdateIndexerInput): Promise<RedactedIndexer> {
+    const rec = await this.#getRaw(id);
+    const merged: AddIndexerInput = {
+      name: input.name ?? rec.name,
+      protocol: input.protocol ?? rec.protocol,
+      baseUrl: input.baseUrl ?? rec.baseUrl,
+      priority: input.priority ?? rec.priority,
+      enabled: input.enabled ?? rec.enabled,
+      searchModes: {
+        interactive: input.searchModes?.interactive ?? rec.interactiveSearch,
+        automatic: input.searchModes?.automatic ?? rec.automaticSearch,
+      },
+      categories: input.categories ?? rec.categories,
+      tags: input.tags ?? rec.tags,
+      limits: {
+        maxSearchesPerWindow: input.limits?.maxSearchesPerWindow ?? rec.maxSearchesPerWindow,
+        windowMs: input.limits?.windowMs ?? rec.windowMs,
+        retentionDays: input.limits?.retentionDays ?? rec.retentionDays,
+      },
+    };
+    this.validate(merged);
+    const name = merged.name.trim();
+    for (const existing of await this.list()) {
+      if (existing.id !== id && existing.name.toLowerCase() === name.toLowerCase()) {
+        throw new IndexerSettingsError(`an indexer named "${name}" already exists`, 409);
+      }
+    }
+    const apiKey = typeof input.apiKey === "string" && input.apiKey.trim().length > 0
+      ? input.apiKey
+      : rec.apiKey;
+    const updated: IndexerSettingsRecord = {
+      ...rec,
+      name,
+      protocol: merged.protocol,
+      baseUrl: merged.baseUrl.replace(/\/$/, ""),
+      apiKey,
+      priority: merged.priority ?? rec.priority,
+      enabled: merged.enabled ?? rec.enabled,
+      maxSearchesPerWindow: merged.limits?.maxSearchesPerWindow ?? rec.maxSearchesPerWindow,
+      windowMs: merged.limits?.windowMs ?? rec.windowMs,
+      retentionDays: merged.limits?.retentionDays ?? rec.retentionDays,
+      interactiveSearch: merged.searchModes?.interactive ?? rec.interactiveSearch,
+      automaticSearch: merged.searchModes?.automatic ?? rec.automaticSearch,
+      categories: [...new Set(merged.categories ?? rec.categories)],
+      tags: [...new Set((merged.tags ?? rec.tags).map((tag) => tag.trim().toLowerCase()))],
+    };
+    await this.#put(updated);
+    return redact(updated);
+  }
+
+  async delete(id: string): Promise<void> {
+    await this.#getRaw(id);
+    await this.#store.delete(OWNER, id);
+    this.#searchWindows.delete(id);
+    await this.#onChanged();
   }
 
   /** Enable or disable one indexer. Disabled indexers stop being searched. */
@@ -273,17 +398,101 @@ export class IndexerSettingsService {
       if (res.status >= 500) {
         return { ok: false, code: "unavailable", detail: `provider unavailable (HTTP ${res.status})`, probedUrl: redactUrl(url) };
       }
-      const categoryCount = [...res.body.matchAll(/<(?:sub)?category\s+[^>]*>/g)].length;
-      const searchModes: string[] = [];
-      if (/<search\s+available="yes"/.test(res.body)) searchModes.push("search");
-      if (/<tv-search\s+available="yes"/.test(res.body)) searchModes.push("tv-search");
-      if (/<movie-search\s+available="yes"/.test(res.body)) searchModes.push("movie-search");
-      if (res.status !== 200 || (categoryCount === 0 && searchModes.length === 0)) {
-        return { ok: false, code: "parse_error", detail: "response had no parsable caps", probedUrl: redactUrl(url) };
-      }
-      return { ok: true, detail: "caps fetched", categoryCount, searchModes, probedUrl: redactUrl(url) };
+      if (res.status !== 200) return { ok: false, code: "unavailable", detail: `provider returned HTTP ${res.status}`, probedUrl: redactUrl(url) };
+      const caps = parseCaps(res.body);
+      const updated: IndexerSettingsRecord = {
+        ...rec,
+        capabilities: { ...caps, testedAt: new Date().toISOString() },
+      };
+      await this.#put(updated);
+      return { ok: true, detail: "caps fetched", categoryCount: caps.categories.length, searchModes: caps.searchModes, probedUrl: redactUrl(url) };
     } catch (err) {
-      return { ok: false, code: "unavailable", detail: String((err as Error).message ?? err), probedUrl: redactUrl(url) };
+      return {
+        ok: false,
+        code: err instanceof IndexerError && err.code === "parse_error" ? "parse_error" : "unavailable",
+        detail: String((err as Error).message ?? err),
+        probedUrl: redactUrl(url),
+      };
     }
+  }
+
+  async hasEnabled(): Promise<boolean> {
+    return (await this.#listRaw()).some((record) => record.enabled);
+  }
+
+  async search(input: unknown): Promise<IndexerSearchResult> {
+    const query = validateIndexerQuery(input);
+    const requestedTags = new Set(query.tags ?? []);
+    const requestedGroups = new Set((query.categories ?? []).map((value) => Math.floor(value / 1000)));
+    const records = (await this.#listRaw())
+      .filter((record) => record.enabled)
+      .filter((record) => query.mode === "interactive" ? record.interactiveSearch : record.automaticSearch)
+      .filter((record) => requestedTags.size === 0 || record.tags.some((tag) => requestedTags.has(tag)))
+      .filter((record) => requestedGroups.size === 0 || record.categories.length === 0 || record.categories.some((value) => requestedGroups.has(Math.floor(value / 1000))))
+      .sort((a, b) => a.priority - b.priority);
+    if (records.length === 0) throw new IndexerSettingsError("No enabled indexer accepts this search.", 409);
+
+    const raw = input as Record<string, unknown>;
+    const settled = await Promise.allSettled(records.map(async (record) => {
+      this.#admit(record);
+      if (!record.apiKey) throw new IndexerError("auth_failed", `${record.name} has no API key`);
+      let mode: "search" | "tv-search" | "movie-search" = query.categories?.includes(2000)
+        ? "tv-search"
+        : query.categories?.includes(1000)
+          ? "movie-search"
+          : "search";
+      if (mode !== "search" && record.capabilities && !record.capabilities.searchModes.includes(mode)) mode = "search";
+      const categories = record.categories.length > 0 ? record.categories : query.categories;
+      const url = buildQueryUrl({
+        baseUrl: record.baseUrl,
+        protocol: record.protocol,
+        apiKey: record.apiKey,
+        mode,
+        query: query.query,
+        ...(categories ? { categories } : {}),
+        ...(query.limit ? { limit: query.limit } : {}),
+        ...(typeof raw.season === "number" ? { season: Math.trunc(raw.season) } : {}),
+        ...(typeof raw.episode === "number" ? { episode: Math.trunc(raw.episode) } : {}),
+      });
+      const response = await this.#transport(url);
+      if (response.status === 401 || response.status === 403) throw new IndexerError("auth_failed", `${record.name} rejected its API key`);
+      if (response.status === 429) throw new IndexerError("rate_limited", `${record.name} is rate limited`);
+      if (response.status >= 400) throw new IndexerError("unavailable", `${record.name} returned HTTP ${response.status}`);
+      const releases = parseResults(response.body, record.protocol === "newznab" ? "nzb" : "torrent")
+        .filter((release) => query.mode !== "automatic" || record.retentionDays === 0 || (Date.now() - Date.parse(release.publishedAt)) / 86_400_000 <= record.retentionDays)
+        .map((release) => validateIndexedRelease({ ...release, indexerId: record.id }));
+      return { releases, hasMore: query.limit !== undefined && releases.length >= query.limit };
+    }));
+    const releases: IndexedRelease[] = [];
+    let hasMore = false;
+    let firstError: unknown;
+    for (const result of settled) {
+      if (result.status === "fulfilled") {
+        releases.push(...result.value.releases);
+        hasMore ||= result.value.hasMore;
+      } else {
+        firstError ??= result.reason;
+      }
+    }
+    if (releases.length === 0 && firstError) throw firstError;
+    return { releases, hasMore, remainingInWindow: null };
+  }
+
+  async #listRaw(): Promise<IndexerSettingsRecord[]> {
+    const rows = await this.#db.selectFrom("plugin_documents").select(["docKey", "doc"]).where("pluginId", "=", OWNER).execute();
+    return rows.flatMap((row) => {
+      const doc = typeof row.doc === "string" ? JSON.parse(row.doc) as unknown : row.doc;
+      const record = this.#parse(doc);
+      return record && record.id === row.docKey ? [record] : [];
+    });
+  }
+
+  #admit(record: IndexerSettingsRecord): void {
+    if (record.maxSearchesPerWindow === 0) return;
+    const now = Date.now();
+    const recent = (this.#searchWindows.get(record.id) ?? []).filter((time) => now - time < record.windowMs);
+    if (recent.length >= record.maxSearchesPerWindow) throw new IndexerError("rate_limited", `${record.name} reached its search limit`);
+    recent.push(now);
+    this.#searchWindows.set(record.id, recent);
   }
 }

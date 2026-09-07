@@ -20,7 +20,7 @@ import { EventBus } from "@tantalar/server/dist/events.js";
 import { ServiceContainer } from "@tantalar/server/dist/container.js";
 import { Scheduler } from "@tantalar/server/dist/scheduler.js";
 import { Supervisor } from "@tantalar/server/dist/supervisor.js";
-import { migrate, openDatabase, type Db } from "@tantalar/db";
+import { migrate, openDatabase, PluginDocumentStore, type Db } from "@tantalar/db";
 import type { Kysely } from "kysely";
 
 export interface ConformanceOptions {
@@ -116,10 +116,19 @@ export async function runConformanceSuite(opts: ConformanceOptions): Promise<Con
     capability: "dev.tantalar.capability.auth.introspection",
     invoke: async () => ({ valid: false, identity: "", scopes: [] }),
   });
+  for (const capability of manifest.requires) {
+    if (container.hasProviders(capability)) continue;
+    container.register({
+      pluginId: "core",
+      capability,
+      invoke: async () => ({ ok: true }),
+    });
+  }
   const supervisor = new Supervisor({
     bus,
     container,
     scheduler,
+    documents: new PluginDocumentStore(db),
     restartPolicy: {
       initialBackoffMs: 100,
       maxBackoffMs: 500,

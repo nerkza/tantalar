@@ -22,6 +22,7 @@
     { "path": "packages/db" },
     { "path": "packages/plugin-sdk" },
     { "path": "packages/testkit" },
+    { "path": "apps/metadata-gateway" },
     { "path": "apps/server" },
     { "path": "plugins/hello-world" },
     { "path": "plugins/fixture-indexer" },
@@ -30,12 +31,16 @@
     { "path": "plugins/fixture-tracker" },
     { "path": "plugins/qbittorrent" },
     { "path": "plugins/torrent-native" },
+    { "path": "plugins/usenet-native" },
     { "path": "plugins/sabnzbd" },
     { "path": "plugins/vpn-manager" },
     { "path": "plugins/webhook" },
     { "path": "plugins/mcp-server" },
     { "path": "plugins/library" },
-    { "path": "plugins/metadata-tmdb-tvdb" }
+    { "path": "plugins/metadata-tmdb-tvdb" },
+    { "path": "plugins/movies" },
+    { "path": "plugins/series" },
+    { "path": "plugins/serving" }
   ],
   "files": []
 }

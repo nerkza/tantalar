@@ -1,6 +1,6 @@
 /**
- * Wave 6 tests (TAN-044 + TAN-045): real VPN lifecycle + fail-closed kill
- * switch in both embedded download paths.
+ * VPN lifecycle seam, strict configuration, durable intent and fail-closed
+ * dispatch tests. Real-host namespace/leak acceptance remains a separate gate.
  *
  * Proves, with recording runners only (no real interfaces, no network):
  *  - validated profile configuration (bad ids/directives rejected);
@@ -14,21 +14,20 @@
  *    fail-closed for degraded/down/never-reported;
  *  - restart recovery re-blocks clients whose tunnel cannot prove healthy;
  *  - audit state records bind/unbind/block/health/rotate/recover;
- *  - leak checks (mandatory per card): IPv4 endpoint probe binds to the
- *    approved interface only; reconnect and restart paths never leave a
- *    bound client dispatchable while unhealthy; DNS/route teardown commands
- *    are issued on every block path.
+ *  - the IPv4 endpoint probe names the approved interface; this does not
+ *    replace the pending real-host IPv4/IPv6/DNS leak suite.
  *
- * All fixtures are synthetic (.invalid hosts). Controlled local namespaces
- * only — the SpawnPrivilegedRunner is never constructed in these tests.
+ * All fixtures are synthetic (.invalid hosts). SpawnPrivilegedRunner is never
+ * constructed in these tests.
  */
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, existsSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   validateProfileConfig,
   writeProfileFile,
+  inspectWireguardHost,
   WireguardAdapter,
   OpenVpnAdapter,
   type PrivilegedRunner,
@@ -58,29 +57,117 @@ function makeRunner(
 }
 
 const ok = { code: 0, stdout: "", stderr: "" };
+const WG_PRIVATE_KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+const WG_CONFIG = [
+  "[Interface]",
+  `PrivateKey = ${WG_PRIVATE_KEY}`,
+  "Address = 10.8.0.2/32",
+  "DNS = 10.8.0.1",
+  "[Peer]",
+  "PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+  "AllowedIPs = 0.0.0.0/0, ::/0",
+  "Endpoint = vpn.fixture.invalid:51820",
+].join("\n");
 
 function capOf(h: ReturnType<typeof createVpnHandlers>): (operation: string, payload: Record<string, unknown>) => Promise<unknown> {
   return h.handlers["dev.tantalar.capability.vpn-binding"];
 }
 
+function memoryStorage() {
+  const docs = new Map<string, unknown>();
+  return {
+    docs,
+    async get(key: string) {
+      return docs.has(key) ? { doc: structuredClone(docs.get(key)) } : null;
+    },
+    async put(key: string, doc: unknown) {
+      docs.set(key, structuredClone(doc));
+    },
+  };
+}
+
 describe("Wave 6: VPN profile validation and safe files", () => {
-  it("rejects invalid profile ids, empty configs, bad devices, unknown protocols", () => {
-    expect(() => validateProfileConfig({ profileId: "bad id!", protocol: "wireguard", configText: "[Interface]" })).toThrow(/invalid vpn profile id/);
+  it("rejects invalid ids, hooks, unknown directives, OpenVPN Apply and unknown protocols", () => {
+    expect(() => validateProfileConfig({ profileId: "bad id!", protocol: "wireguard", configText: WG_CONFIG })).toThrow(/invalid vpn profile id/);
     expect(() => validateProfileConfig({ profileId: "wg1", protocol: "wireguard", configText: "" })).toThrow(/configText required/);
-    expect(() => validateProfileConfig({ profileId: "wg1", protocol: "wireguard", configText: "no section" })).toThrow(/\[Interface\]/);
-    expect(() => validateProfileConfig({ profileId: "ov1", protocol: "openvpn", configText: "client", device: "tun0 x" })).toThrow(/invalid openvpn device/);
+    expect(() => validateProfileConfig({ profileId: "wg1", protocol: "wireguard", configText: "no section" })).toThrow(/before section/);
+    expect(() => validateProfileConfig({ profileId: "wg1", protocol: "wireguard", configText: `${WG_CONFIG}\nPostUp = touch /tmp/pwned` })).toThrow(/command hook PostUp is forbidden/);
+    expect(() => validateProfileConfig({ profileId: "wg1", protocol: "wireguard", configText: WG_CONFIG.replace("DNS =", "SaveConfig =") })).toThrow(/SaveConfig is not supported/);
+    expect(() => validateProfileConfig({ profileId: "wg1", protocol: "wireguard", configText: WG_CONFIG.replace("AllowedIPs =", "UnknownPeerSetting =") })).toThrow(/UnknownPeerSetting is not supported/);
+    expect(() => validateProfileConfig({ profileId: "ov1", protocol: "openvpn", configText: "client", device: "tun0" })).toThrow(/openvpn apply is disabled/);
     expect(() => validateProfileConfig({ profileId: "x1", protocol: "shadowsocks", configText: "c" })).toThrow(/unsupported vpn protocol/);
   });
 
   it("writes profile files 0600 inside a 0700 managed state dir and never leaks content", () => {
     const dir = mkdtempSync(join(tmpdir(), "tantalar-wave6-"));
-    const wg = validateProfileConfig({ profileId: "wgmain", protocol: "wireguard", configText: "[Interface]\nPrivateKey = REDACTED" });
+    const wg = validateProfileConfig({ profileId: "wgmain", protocol: "wireguard", configText: WG_CONFIG });
     const path = writeProfileFile(dir, wg);
     expect(existsSync(path)).toBe(true);
     expect(statSync(path).mode & 0o777).toBe(0o600);
     expect(statSync(dir).mode & 0o777).toBeLessThanOrEqual(0o700);
-    const ovpn = validateProfileConfig({ profileId: "ovbackup", protocol: "openvpn", configText: "client\ndev tun9", device: "tun9" });
-    expect(writeProfileFile(dir, ovpn)).toMatch(/ovbackup\.ovpn$/);
+    expect(path).toMatch(/wgmain\.conf$/);
+  });
+
+  it("refuses to overwrite a symlinked profile target", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tantalar-wave6-link-"));
+    const outside = join(dir, "outside.txt");
+    writeFileSync(outside, "leave-me-alone");
+    symlinkSync(outside, join(dir, "wgmain.conf"));
+    const wg = validateProfileConfig({ profileId: "wgmain", protocol: "wireguard", configText: WG_CONFIG });
+    expect(() => writeProfileFile(dir, wg)).toThrow();
+    expect(readFileSync(outside, "utf8")).toBe("leave-me-alone");
+  });
+});
+
+describe("Wave 6: trusted host preflight and durable fail-closed intent", () => {
+  it("reports exact missing WireGuard boundary prerequisites from trusted probes", async () => {
+    const runner = makeRunner((argv) => {
+      if (argv[0] === "cat") return { code: 0, stdout: "CapEff:\t0000000000000000\n", stderr: "" };
+      if (argv[0] === "test") return { code: 1, stdout: "", stderr: "missing" };
+      if (argv[0] === "wg" || argv[0] === "nft") return { code: 127, stdout: "", stderr: "not found" };
+      return ok;
+    });
+    const preflight = await inspectWireguardHost(runner, "linux");
+    expect(preflight.supported).toBe(false);
+    expect(preflight.missing).toEqual(expect.arrayContaining(["wg", "nftables", "/dev/net/tun", "CAP_NET_ADMIN"]));
+
+    const h = createVpnHandlers({ runner, platform: "linux" });
+    const status = (await capOf(h)("status", { supported: true, health: "healthy" })) as {
+      enforcementReady: boolean;
+      host: { missing: string[] };
+    };
+    expect(status.enforcementReady).toBe(false);
+    expect(status.host.missing).toContain("CAP_NET_ADMIN");
+  });
+
+  it("reports host support only when every trusted prerequisite is present", async () => {
+    const runner = makeRunner((argv) => argv[0] === "cat"
+      ? { code: 0, stdout: "CapEff:\t0000000000001000\n", stderr: "" }
+      : ok);
+    const preflight = await inspectWireguardHost(runner, "linux");
+    expect(preflight).toMatchObject({ supported: true, tunDevice: true, netAdmin: true, missing: [] });
+    expect(runner.calls.map((argv) => argv[0])).toEqual(expect.arrayContaining(["wg", "wg-quick", "ip", "nft", "resolvconf"]));
+  });
+
+  it("restores redacted profile and binding intent as blocked after restart", async () => {
+    const storage = memoryStorage();
+    const first = createVpnHandlers({ storage });
+    first.loadProfiles([{ profileId: "wg-main", protocol: "wireguard", endpointHost: "vpn.fixture.invalid", configText: WG_CONFIG }]);
+    const result = (await capOf(first)("set-binding", { clientId: "client-restart", profileId: "wg-main" })) as {
+      applied: boolean;
+      blocked: boolean;
+    };
+    expect(result).toMatchObject({ applied: false, blocked: true });
+    expect(JSON.stringify(storage.docs.get("vpn-state-v1"))).not.toContain(WG_PRIVATE_KEY);
+
+    const second = createVpnHandlers({ storage });
+    await second.restore();
+    const profiles = await capOf(second)("profiles", {});
+    expect(profiles).toEqual({ profiles: [{ profileId: "wg-main", protocol: "wireguard", endpointHost: "vpn.fixture.invalid" }] });
+    const bindings = await capOf(second)("bindings", {});
+    expect(bindings).toEqual({ bindings: [{ clientId: "client-restart", profileId: "wg-main" }] });
+    const gate = (await capOf(second)("pre-dispatch-check", { clientId: "client-restart" })) as { allowDispatch: boolean };
+    expect(gate.allowDispatch).toBe(false);
   });
 });
 
@@ -100,6 +187,7 @@ describe("Wave 6: tunnel lifecycle adapters over the privileged seam", () => {
     hasRoute = false;
     await expect(adapter.up("/state/wgmain.conf")).rejects.toThrow(/no route pinned/);
     expect(torn).toBe(true); // route loss closed it BEFORE anything could retry
+    expect(runner.argvStrings()).toContain("wg-quick down /state/wgmain.conf");
 
     // Healthy bring-up: route present at pin-check time.
     hasRoute = true;
@@ -169,8 +257,8 @@ describe("Wave 6: tunnel lifecycle adapters over the privileged seam", () => {
     };
     const audits: Array<Record<string, unknown>> = [];
     const control = new LifecycleNetControl(runnerA, new Map([
-      ["wg-old", { config: validateProfileConfig({ profileId: "wg-old", protocol: "wireguard", configText: "[Interface]" }), adapter: adapterA, path: "/s/wg-old.conf" }],
-      ["ov-new", { config: validateProfileConfig({ profileId: "ov-new", protocol: "openvpn", configText: "client", device: "tun9" }), adapter: adapterB, path: "/s/ov-new.ovpn" }],
+      ["wg-old", { config: validateProfileConfig({ profileId: "wg-old", protocol: "wireguard", configText: WG_CONFIG }), adapter: adapterA, path: "/s/wg-old.conf" }],
+      ["ov-new", { config: { profileId: "ov-new", protocol: "openvpn" as const, configText: "client", device: "tun9" }, adapter: adapterB, path: "/s/ov-new.ovpn" }],
     ]), async (e) => { audits.push(e); });
 
     await control.bind("client-a", "wg-old");
@@ -189,8 +277,8 @@ describe("Wave 6: kill switch + recovery + audit over handler surface", () => {
       emit: async (type, payload) => { emitted.push({ type, ...payload }); },
     });
     h.loadProfiles([
-      { profileId: "wg-main", protocol: "wireguard", endpointHost: "vpn1.fixture.invalid", configText: "[Interface]" },
-      { profileId: "ov-backup", protocol: "openvpn", endpointHost: "vpn2.fixture.invalid", configText: "client", device: "tun9" },
+      { profileId: "wg-main", protocol: "wireguard", endpointHost: "vpn1.fixture.invalid", configText: WG_CONFIG },
+      { profileId: "wg-backup", protocol: "wireguard", endpointHost: "vpn2.fixture.invalid", configText: WG_CONFIG },
     ]);
     return { h, emitted };
   }
@@ -204,13 +292,22 @@ describe("Wave 6: kill switch + recovery + audit over handler surface", () => {
     };
     const { h, emitted } = harness(netControl);
     await capOf(h)("set-binding", { clientId: "dev.tantalar.plugin.torrent-native", profileId: "wg-main" });
-    await capOf(h)("health-report", { profileId: "wg-main", health: "degraded" });
+    await h.trustedHealthReport("wg-main", "degraded");
     expect(order).toContain("block:dev.tantalar.plugin.torrent-native");
-    // Binding dropped AND blocked: pre-dispatch is fail-closed.
+    // Desired binding is retained and blocked: it cannot become implicit direct traffic.
     const gate = (await capOf(h)("pre-dispatch-check", { clientId: "dev.tantalar.plugin.torrent-native" })) as { allowDispatch: boolean };
     expect(gate.allowDispatch).toBe(false);
     expect(emitted.some((e) => e["killSwitchEngaged"] === true)).toBe(true);
     expect(h.auditEntries().some((a) => a.action === "block")).toBe(true);
+  });
+
+  it("rejects client-submitted health truth", async () => {
+    const { h } = harness({ bind: async () => {}, unbind: async () => {}, block: async () => {} });
+    await expect(capOf(h)("health-report", { profileId: "wg-main", health: "healthy" }))
+      .rejects.toThrow(/runtime-internal/);
+    await capOf(h)("set-binding", { clientId: "client-forged", profileId: "wg-main" });
+    const gate = (await capOf(h)("pre-dispatch-check", { clientId: "client-forged" })) as { allowDispatch: boolean };
+    expect(gate.allowDispatch).toBe(false);
   });
 
   it("pre-dispatch fails closed when health was never reported", async () => {
@@ -231,13 +328,13 @@ describe("Wave 6: kill switch + recovery + audit over handler surface", () => {
     });
     const cap = capOf(h);
     await cap("set-binding", { clientId: "client-x", profileId: "wg-main" });
-    await cap("health-report", { profileId: "wg-main", health: "healthy" });
-    // Simulate a restart where health state is lost (still healthy in this map,
-    // but an unhealthy tunnel must stay blocked):
-    await cap("health-report", { profileId: "wg-main", health: "down" });
+    await h.trustedHealthReport("wg-main", "healthy");
+    await h.trustedHealthReport("wg-main", "down");
     const recovered = await h.recover();
-    // client binding was already dropped by kill switch; recovery finds nothing dispatchable.
     expect(recovered).toBe(0);
+    const gate = (await cap("pre-dispatch-check", { clientId: "client-x" })) as { allowDispatch: boolean };
+    expect(gate.allowDispatch).toBe(false);
+    expect(blocked).toContain("client-x");
   });
 
   it("rotate-tunnel goes through block-then-bind and records audit", async () => {
@@ -249,9 +346,9 @@ describe("Wave 6: kill switch + recovery + audit over handler surface", () => {
     });
     const cap = capOf(h);
     await cap("set-binding", { clientId: "client-r", profileId: "wg-main" });
-    const out = (await cap("rotate-tunnel", { clientId: "client-r", fromProfileId: "wg-main", toProfileId: "ov-backup" })) as Record<string, unknown>;
-    expect(out["profileId"]).toBe("ov-backup");
-    expect(order.indexOf("bind:ov-backup")).toBeGreaterThan(order.indexOf("block:client-r"));
+    const out = (await cap("rotate-tunnel", { clientId: "client-r", fromProfileId: "wg-main", toProfileId: "wg-backup" })) as Record<string, unknown>;
+    expect(out["profileId"]).toBe("wg-backup");
+    expect(order.indexOf("bind:wg-backup")).toBeGreaterThan(order.indexOf("block:client-r"));
     expect(h.auditEntries().some((a) => a.action === "rotate")).toBe(true);
   });
 
@@ -281,11 +378,11 @@ describe("Wave 6: leak checks in embedded download paths (TAN-045)", () => {
       invoke: async () => { throw new Error("capability crashed"); },
     };
     await expect(assertKillSwitchOpen(brokenGate, "dev.tantalar.plugin.torrent-native")).rejects.toThrow(/binding gate unavailable/);
-    // Absent VPN subsystem allows direct traffic.
+    // The manifest now requires the VPN gate; absence also fails closed.
     const absentGate = {
       invoke: async () => { throw new Error("no provider registered"); },
     };
-    await expect(assertKillSwitchOpen(absentGate, "dev.tantalar.plugin.torrent-native")).resolves.toBeUndefined();
+    await expect(assertKillSwitchOpen(absentGate, "dev.tantalar.plugin.torrent-native")).rejects.toThrow(/binding gate unavailable/);
     // Healthy tunnel allows dispatch.
     const healthyGate = {
       invoke: async () => ({ allowDispatch: true, profileId: "wg-main", health: "healthy" }),
@@ -305,18 +402,12 @@ describe("Wave 6: leak checks in embedded download paths (TAN-045)", () => {
     await expect(assertKillSwitchOpen(healthyGate, "dev.tantalar.plugin.usenet-native")).resolves.toBeUndefined();
   });
 
-  /**
-   * Reconnect/restart/DNS leak checks over controlled local namespaces.
-   * The namespace tool itself stays behind the same privileged seam; here we
-   * assert the command sequences that implement IPv4/IPv6/DNS teardown are
-   * issued exactly on the block path and never skipped.
-   */
-  it("block path issues full route+DNS teardown sequence (IPv4/IPv6/DNS)", async () => {
+  it("logical block retains a fail-closed client state", async () => {
     const runner = makeRunner(() => ok);
     const audits: Array<Record<string, unknown>> = [];
     const profiles = new Map([
       ["wg-main", {
-        config: validateProfileConfig({ profileId: "wg-main", protocol: "wireguard", configText: "[Interface]" }),
+        config: validateProfileConfig({ profileId: "wg-main", protocol: "wireguard", configText: WG_CONFIG }),
         adapter: {
           protocol: "wireguard" as const,
           up: async () => {},

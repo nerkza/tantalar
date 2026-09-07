@@ -13,7 +13,7 @@ import { migrate, openDatabase, type Db } from "@tantalar/db";
 import { EventBus } from "../apps/server/src/events.js";
 import { ServiceContainer } from "../apps/server/src/container.js";
 import { Scheduler } from "../apps/server/src/scheduler.js";
-import { Supervisor, type RestartPolicy } from "../apps/server/src/supervisor.js";
+import { Supervisor, type PluginRuntime, type RestartPolicy } from "../apps/server/src/supervisor.js";
 import { PluginLifecycleManager } from "../apps/server/src/lifecycle.js";
 import { runConformanceSuite } from "@tantalar/testkit";
 import type { PluginManifest } from "@tantalar/contracts";
@@ -50,7 +50,7 @@ beforeAll(async () => {
     pluginId: "core",
     capability: "dev.tantalar.capability.auth.introspection",
     invoke: async (_op, payload) => {
-      const valid = payload.apiKey === "tantalar_testkey123";
+      const valid = payload.api_key === "tantalar_testkey123";
       return { valid, identity: valid ? "key-1" : "", scopes: valid ? ["events.read"] : [] };
     },
   });
@@ -76,6 +76,58 @@ afterAll(async () => {
 });
 
 describe("config-driven lifecycle (story 24)", () => {
+  it("mounts desired capability providers before consumers regardless of config order", async () => {
+    const providerPath = join(dir, "dependency-provider.json");
+    const consumerPath = join(dir, "dependency-consumer.json");
+    writeFileSync(providerPath, JSON.stringify({
+      id: "dev.tantalar.plugin.dependency-provider",
+      version: "0.1.0",
+      protocolVersion: 1,
+      provides: ["dev.tantalar.capability.test-dependency"],
+      requires: [],
+      subscriptions: [],
+      entry: { command: HELLO_ENTRY },
+    }));
+    writeFileSync(consumerPath, JSON.stringify({
+      id: "dev.tantalar.plugin.dependency-consumer",
+      version: "0.1.0",
+      protocolVersion: 1,
+      provides: ["dev.tantalar.capability.test-consumer"],
+      requires: ["dev.tantalar.capability.test-dependency"],
+      subscriptions: [],
+      entry: { command: HELLO_ENTRY },
+    }));
+
+    const mounted = new Map<string, PluginRuntime>();
+    const order: string[] = [];
+    const fakeSupervisor = {
+      list: () => [...mounted.values()],
+      get: (id: string) => mounted.get(id),
+      mount: async (manifest: PluginManifest) => {
+        const provided = new Set([...mounted.values()].flatMap((runtime) => runtime.manifest.provides));
+        const missing = manifest.requires.find((capability) => !provided.has(capability));
+        if (missing) throw new Error(`no provider for capability ${missing}`);
+        const runtime: PluginRuntime = { manifest, state: "healthy", restartCount: 0 };
+        mounted.set(manifest.id, runtime);
+        order.push(manifest.id);
+        return runtime;
+      },
+      unmount: async (id: string) => { mounted.delete(id); },
+    } as unknown as Supervisor;
+    const dependencyLifecycle = new PluginLifecycleManager({ supervisor: fakeSupervisor, basePath: dir });
+
+    const result = await dependencyLifecycle.apply({
+      "dev.tantalar.plugin.dependency-consumer": { enabled: true, manifestPath: consumerPath },
+      "dev.tantalar.plugin.dependency-provider": { enabled: true, manifestPath: providerPath },
+    });
+
+    expect(result.failed).toEqual([]);
+    expect(order).toEqual([
+      "dev.tantalar.plugin.dependency-provider",
+      "dev.tantalar.plugin.dependency-consumer",
+    ]);
+  });
+
   it("mounts an enabled plugin from a manifest path in config", async () => {
     const manifestPath = join(dir, "hello-manifest.json");
     writeFileSync(
@@ -236,7 +288,7 @@ describe("conformance testkit (public product artifact)", () => {
 
   it("passes against the first-party MCP server plugin", async () => {
     const report = await runConformanceSuite({ packageDir: resolve("plugins/mcp-server") });
-    expect(report.failed).toBe(0);
+    expect(report.failed, JSON.stringify(report.cases.filter((testCase) => !testCase.passed), null, 2)).toBe(0);
     expect(report.pluginId).toBe("dev.tantalar.plugin.mcp");
   }, 60_000);
 });

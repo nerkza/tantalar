@@ -32,6 +32,13 @@ beforeAll(async () => {
     capability: "dev.tantalar.capability.event.emit",
     invoke: async () => ({ ok: true }),
   });
+  for (const pluginId of ["provider-a", "provider-b"]) {
+    container.register({
+      pluginId,
+      capability: "dev.tantalar.capability.shared-test",
+      invoke: async () => ({ pluginId }),
+    });
+  }
   const supervisor = {
     list: () => [],
   } as unknown as Supervisor;
@@ -41,6 +48,7 @@ beforeAll(async () => {
     ? `http://127.0.0.1:${(app.server.address() as { port: number }).port}`
     : `http://127.0.0.1:${(app.server.address() as { port: number }).port}`;
   await auth.createUser("admin", "password-admin-1", "admin");
+  await auth.createUser("viewer", "password-viewer-1", "viewer");
 });
 
 afterAll(async () => {
@@ -58,10 +66,19 @@ async function post(path: string, body?: unknown, headers: Record<string, string
 
 describe("HTTP auth boundaries", () => {
   it("health endpoints respond without auth", async () => {
-    expect((await fetch(`${address}/healthz`)).status).toBe(200);
+    const health = await fetch(`${address}/healthz`);
+    expect(health.status).toBe(200);
+    expect(await health.json()).toMatchObject({
+      ok: true,
+      version: { version: "0.0.1-alpha.0", label: "0.0.1 Alpha", channel: "alpha" },
+    });
     const ready = await fetch(`${address}/readyz`);
     expect(ready.status).toBe(200);
     expect(((await ready.json()) as { ok: boolean }).ok).toBe(true);
+
+    const version = await fetch(`${address}/api/v1/version`);
+    expect(version.status).toBe(200);
+    expect(await version.json()).toMatchObject({ version: "0.0.1-alpha.0", label: "0.0.1 Alpha" });
   });
 
   it("login sets opaque session + CSRF cookies; wrong password rejected", async () => {
@@ -141,6 +158,30 @@ describe("HTTP auth boundaries", () => {
     );
     expect(res.status).toBe(200);
     expect(((await res.json()) as { result: { ok: boolean } }).result.ok).toBe(true);
+  });
+
+  it("routes an intentionally shared capability to the plugin named in the URL", async () => {
+    const { key } = await auth.createApiKey("provider-invoker", ["plugins.invoke"]);
+    const res = await post(
+      "/api/v1/plugins/provider-b/capabilities/dev.tantalar.capability.shared-test/status",
+      {},
+      { authorization: `Bearer ${key}` },
+    );
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { result: { pluginId: string } }).result.pluginId).toBe("provider-b");
+  });
+
+  it("viewer sessions cannot invoke plugin capabilities", async () => {
+    const login = await post("/api/v1/auth/login", { username: "viewer", password: "password-viewer-1" });
+    const setCookie = login.headers.getSetCookie?.() ?? [];
+    const cookies = setCookie.map((c) => c.split(";")[0]).join("; ");
+    const csrf = ((await login.json()) as { csrfToken: string }).csrfToken;
+    const res = await post(
+      "/api/v1/plugins/core/capabilities/dev.tantalar.capability.event.emit/emit",
+      {},
+      { cookie: cookies, "x-csrf-token": csrf },
+    );
+    expect(res.status).toBe(403);
   });
 
   it("events.read-only key cannot list plugins (403); plugins.read key cannot read events (403)", async () => {
@@ -233,9 +274,13 @@ describe("events REST API", () => {
   it("openapi.json is served and lists the API surface", async () => {
     const doc = (await (await fetch(`${address}/openapi.json`)).json()) as {
       openapi: string;
+      info: { version: string; "x-tantalar-release-label": string };
       paths: Record<string, unknown>;
     };
     expect(doc.openapi.startsWith("3.")).toBe(true);
+    expect(doc.info.version).toBe("0.0.1-alpha.0");
+    expect(doc.info["x-tantalar-release-label"]).toBe("0.0.1 Alpha");
     expect(Object.keys(doc.paths)).toContain("/api/v1/auth/login");
+    expect(Object.keys(doc.paths)).toContain("/api/v1/version");
   });
 });

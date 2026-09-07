@@ -16,19 +16,26 @@ import {
   EventTypes,
   DownloadClientError,
   validateDownloadRequest,
+  validateDownloadStatus,
   type CandidateRelease,
   type ComparisonVerdict,
   type DownloadRequest,
   type DownloadStatus,
   type QualityProfile,
+  type ReleaseKind,
 } from "@tantalar/contracts";
+import { createHash } from "node:crypto";
+import type { DownloadJobStore } from "@tantalar/db";
 import type { EventBus } from "../events.js";
 import type { ServiceContainer } from "../container.js";
-import { compareReleases, toCandidate } from "./comparer.js";
+import { compareReleases, releaseFingerprint, toCandidate } from "./comparer.js";
 
 export interface GrabPipelineOptions {
   readonly bus: EventBus;
   readonly container: ServiceContainer;
+  /** Optional compatibility-adapter selection; native engines are preferred. */
+  readonly providerPluginIds?: Partial<Record<ReleaseKind, string>>;
+  readonly jobs?: DownloadJobStore;
 }
 
 export interface DecideInput {
@@ -58,6 +65,10 @@ export interface DispatchResult {
 const DOWNLOAD_CLIENT_CAP = "dev.tantalar.capability.download-client";
 const TRACKER_RULES_CAP = "dev.tantalar.capability.tracker.rules";
 const VPN_BINDING_CAP = "dev.tantalar.capability.vpn-binding";
+const NATIVE_PROVIDER: Record<ReleaseKind, string> = {
+  torrent: "dev.tantalar.plugin.torrent-native",
+  nzb: "dev.tantalar.plugin.usenet-native",
+};
 
 export class GrabPipeline {
   readonly #opts: GrabPipelineOptions;
@@ -92,11 +103,30 @@ export class GrabPipeline {
       profile: input.profile,
       blacklistedGuids: [...new Set([...(input.blacklistedGuids ?? []), ...this.#blacklist])],
     });
+    const candidateByGuid = new Map(input.candidates.map((candidate) => [candidate.release.guid, candidate]));
+    const eventId = (guid: string): string => releaseFingerprint(candidateByGuid.get(guid)!);
     await emit(EventTypes.ComparisonVerdict, {
       itemKey: input.itemKey,
-      winnerGuid: verdict.winnerGuid,
-      rankedGuids: verdict.rankedGuids,
-      rejected: verdict.rejected,
+      winnerGuid: verdict.winnerGuid ? eventId(verdict.winnerGuid) : null,
+      rankedGuids: verdict.rankedGuids.map(eventId),
+      reasons: verdict.reasons,
+      rejected: verdict.rejected.map((rejection) => ({ guid: eventId(rejection.guid), reason: rejection.reason })),
+      assessments: (verdict.assessments ?? []).map((assessment) => ({
+        guid: eventId(assessment.guid),
+        accepted: assessment.accepted,
+        reasons: assessment.reasons,
+      })),
+      candidates: input.candidates.map((candidate) => ({
+        guid: releaseFingerprint(candidate),
+        title: candidate.release.title,
+        kind: candidate.release.kind,
+        indexerId: candidate.release.indexerId,
+        quality: candidate.quality,
+        sizeBytes: candidate.release.sizeBytes,
+        seeders: candidate.release.seeders ?? null,
+        language: candidate.release.language ?? null,
+        properOrRepack: candidate.properOrRepack,
+      })),
     });
 
     let chosenGuid: string | null;
@@ -135,9 +165,14 @@ export class GrabPipeline {
       }
     }
 
-    await emit(EventTypes.GrabDecision, { itemKey: input.itemKey, decided: true, guid: chosenGuid, mode: input.mode });
+    await emit(EventTypes.GrabDecision, {
+      itemKey: input.itemKey,
+      decided: true,
+      releaseId: releaseFingerprint(chosen),
+      mode: input.mode,
+    });
 
-    const status = await this.#dispatch(chosen, emit, input.correlationId);
+    const status = await this.#dispatch(chosen, input.itemKey, emit, input.correlationId);
     return { grabbed: true, verdict, ...(status ? { download: status } : {}) };
   }
 
@@ -166,14 +201,19 @@ export class GrabPipeline {
    */
   async #dispatch(
     candidate: CandidateRelease,
+    itemKey: string,
     emit: (type: string, payload: Record<string, unknown>) => Promise<void>,
     correlationId?: string,
   ): Promise<DownloadStatus> {
     let clientProvider;
     try {
-      clientProvider = this.#opts.container.resolve(DOWNLOAD_CLIENT_CAP);
+      const providers = this.#opts.container.providers(DOWNLOAD_CLIENT_CAP);
+      const selectedId = this.#opts.providerPluginIds?.[candidate.release.kind] ?? NATIVE_PROVIDER[candidate.release.kind];
+      clientProvider = providers.some((provider) => provider.pluginId === selectedId)
+        ? this.#opts.container.resolveProvider(DOWNLOAD_CLIENT_CAP, selectedId)
+        : this.#opts.container.resolve(DOWNLOAD_CLIENT_CAP);
     } catch {
-      await emit(EventTypes.GrabDecision, { itemKey: candidate.release.guid, decided: false, reason: "no_download_client" });
+      await emit(EventTypes.GrabDecision, { itemKey, decided: false, reason: "no_download_client" });
       throw new DownloadClientError("unavailable", "no provider for dev.tantalar.capability.download-client");
     }
 
@@ -187,6 +227,12 @@ export class GrabPipeline {
       const check = (await vpn.invoke("pre-dispatch-check", {
         clientId,
       })) as { allowDispatch?: boolean; health?: string; profileId?: string | null };
+      await emit(EventTypes.DispatchGateChecked, {
+        clientId,
+        profileId: check?.profileId ?? null,
+        health: check?.health ?? "down",
+        allowed: check?.allowDispatch === true,
+      });
       if (!check?.allowDispatch) {
         await emit(EventTypes.TunnelHealthChanged, {
           clientId,
@@ -199,10 +245,17 @@ export class GrabPipeline {
           `kill switch: dispatch blocked, tunnel ${String(check?.profileId ?? "?")} health=${String(check?.health ?? "down")}`,
         );
       }
+    } else {
+      await emit(EventTypes.DispatchGateChecked, {
+        clientId: clientProvider.pluginId,
+        profileId: null,
+        health: "not_configured",
+        allowed: true,
+      });
     }
 
     const request: DownloadRequest = validateDownloadRequest({
-      itemKey: candidate.release.guid,
+      itemKey,
       title: candidate.release.title,
       kind: candidate.release.kind,
       sourceUrl: candidate.release.downloadUrl,
@@ -210,7 +263,53 @@ export class GrabPipeline {
       correlationId,
     });
 
-    const status = (await clientProvider.invoke("add", request as unknown as Record<string, unknown>)) as DownloadStatus;
+    let status = validateDownloadStatus(
+      await clientProvider.invoke("add", request as unknown as Record<string, unknown>),
+      { itemKey: request.itemKey },
+    );
+    if (this.#opts.jobs) {
+      const sourceRef = `sha256:${createHash("sha256").update(request.sourceUrl).digest("hex")}`;
+      let createdRecordId: string | null = null;
+      try {
+        const { record, created } = await this.#opts.jobs.create({
+          itemKey: request.itemKey,
+          title: request.title,
+          source: request.kind === "nzb" ? "usenet" : "torrent",
+          providerPluginId: clientProvider.pluginId,
+          providerJobId: status.downloadId,
+          sourceRef,
+          sizeBytes: status.sizeBytes,
+          correlationId,
+        });
+        if (!created) {
+          if (record.providerJobId !== status.downloadId) {
+            await clientProvider.invoke("remove", { downloadId: status.downloadId, keepFiles: true }).catch(() => undefined);
+          }
+          if (!record.providerJobId) throw new DownloadClientError("unavailable", "existing job has no provider identity");
+          status = {
+            downloadId: record.providerJobId,
+            itemKey: record.itemKey,
+            state: record.state,
+            progressPercent: record.progressPercent,
+            sizeBytes: record.sizeBytes,
+          };
+        } else {
+          createdRecordId = record.jobId;
+          await this.#opts.jobs.updateProgress(record.jobId, {
+            state: status.state,
+            progressPercent: status.progressPercent,
+            sizeBytes: status.sizeBytes,
+          });
+        }
+      } catch (error) {
+        if (createdRecordId) await this.#opts.jobs.remove(createdRecordId).catch(() => undefined);
+        const existing = await this.#opts.jobs.findByProvider(clientProvider.pluginId, status.downloadId).catch(() => null);
+        if (!existing || existing.jobId === createdRecordId) {
+          await clientProvider.invoke("remove", { downloadId: status.downloadId, keepFiles: true }).catch(() => undefined);
+        }
+        throw error;
+      }
+    }
     await emit(EventTypes.ClientDispatch, {
       itemKey: request.itemKey,
       clientId: clientProvider.pluginId,
@@ -230,7 +329,7 @@ export class GrabPipeline {
     await this.#opts.bus.publish({
       type: EventTypes.BlacklistAdded,
       producer: "core",
-      payload: { itemKey, guid },
+      payload: { itemKey, candidateId: createHash("sha256").update(guid).digest("hex") },
     });
     return { blacklisted: true };
   }

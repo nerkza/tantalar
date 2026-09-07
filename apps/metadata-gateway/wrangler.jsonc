@@ -1,0 +1,58 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "tantalar-metadata",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-31",
+  "compatibility_flags": ["nodejs_compat"],
+  "account_id": "8a7e656cee230b4e541ab2caa3ff382e",
+  "workers_dev": false,
+  "routes": [
+    {
+      "pattern": "metadata.tantalar.app",
+      "custom_domain": true
+    }
+  ],
+  "secrets": {
+    "required": ["TMDB_API_TOKEN"]
+  },
+  "ratelimits": [
+    {
+      "name": "RATE_LIMITER",
+      "namespace_id": "2026083101",
+      "simple": {
+        "limit": 120,
+        "period": 60
+      }
+    }
+  ],
+  "env": {
+    "staging": {
+      "name": "tantalar-metadata-staging",
+      "workers_dev": false,
+      "preview_urls": false,
+      "routes": [
+        { "pattern": "metadata-staging.tantalar.app", "custom_domain": true }
+      ],
+      "secrets": {
+        "required": ["TMDB_API_TOKEN"]
+      },
+      "ratelimits": [
+        {
+          "name": "RATE_LIMITER",
+          "namespace_id": "2026090701",
+          "simple": { "limit": 120, "period": 60 }
+        }
+      ]
+    }
+  },
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.01
+    }
+  }
+}

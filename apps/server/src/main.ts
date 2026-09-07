@@ -1,4 +1,5 @@
 import { boot, dumpConfig } from "./kernel.js";
+import { formatStartupBanner } from "./version.js";
 
 const args = process.argv.slice(2);
 const dumpIdx = args.indexOf("--dump-config");
@@ -16,7 +17,7 @@ const kernel = await boot(
     : {},
 );
 const addr = await kernel.listen();
-process.stdout.write(`tantalar listening on ${addr}\n`);
+process.stdout.write(formatStartupBanner(addr));
 
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {

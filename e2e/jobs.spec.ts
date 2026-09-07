@@ -1,0 +1,110 @@
+import { expect, test } from "@playwright/test";
+import { fillSafely, signIn } from "./helpers";
+import { BUILT_IN_THEMES } from "../apps/web/src/theme/tokens";
+
+test("Jobs controls operate through the API and remain usable at desktop and phone widths", async ({ page }) => {
+  let scheme = "dark";
+  await page.route("**/api/v1/users/*/ui-preferences", route => route.fulfill({ json: { preferences: { colorScheme: scheme === "light" ? "light" : "dark", tokenOverrides: scheme === "graphite" ? BUILT_IN_THEMES.find(p => p.id === "graphite")!.tokens : {} } } }));
+  await signIn(page);
+  await page.goto("/#/admin/jobs");
+  await expect(page.getByRole("heading", { name: "Jobs", exact: true })).toBeVisible();
+  const scan = page.getByRole("row").filter({ hasText: "Library scan" });
+  await expect(scan).toBeVisible();
+  await scan.getByRole("button", { name: "Edit", exact: true }).click();
+  await fillSafely(page.getByRole("textbox", { name: "Every", exact: true }), "8");
+  await page.getByRole("button", { name: "Save schedule" }).click();
+  await expect(scan).toContainText("Every 8h");
+  await scan.getByRole("button", { name: "Disable", exact: true }).click();
+  await expect(scan.getByRole("button", { name: "Enable", exact: true })).toBeVisible();
+  await page.reload();
+  await expect(scan.getByRole("button", { name: "Enable", exact: true })).toBeVisible();
+  await scan.getByRole("button", { name: "Run now", exact: true }).click();
+  await scan.getByRole("button", { name: "History", exact: true }).click();
+  await expect(page.getByTestId("jobs-runs")).toContainText("3 files checked, 1 added.");
+  await page.getByRole("button", { name: "Details", exact: true }).first().click();
+  await expect(page.getByRole("dialog")).toContainText("Checked: 3");
+  await page.getByRole("dialog").getByRole("button", { name: "Close" }).click();
+  await page.getByRole("link", { name: "Open Trace" }).first().click();
+  await expect(page).toHaveURL(/audit\/trace\?correlationId=/);
+  for (const theme of ["dark", "light", "graphite"]) {
+    scheme = theme;
+    await page.goto("/#/admin/jobs"); await page.reload();
+    await expect(page.getByTestId("jobs-schedules")).toBeVisible();
+    for (const width of [1440, 390]) {
+      await page.setViewportSize({ width, height: 1000 });
+      expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
+      await page.screenshot({ path: `../artifacts/jobs-${theme}-${width}.png`, fullPage: true, animations: "disabled" });
+    }
+    await page.goto("/#/admin/acquisition/quality");
+    await expect(page.getByRole("heading", { name: "Quality management", exact: true })).toBeVisible();
+    await page.getByRole("tab", { name: "Profiles", exact: true }).click();
+    for (const width of [1440, 390]) {
+      await page.setViewportSize({ width, height: 1000 });
+      expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
+      await expect(page.getByRole("table", { name: "Quality profiles" }).getByRole("row")).toHaveCount(4);
+      await page.screenshot({ path: `../artifacts/profiles-${theme}-${width}.png`, fullPage: true, animations: "disabled" });
+    }
+    await page.getByRole("button", { name: "Edit HD profile", exact: true }).click();
+    const editor = page.getByRole("dialog");
+    const order = editor.getByRole("list", { name: "Allowed qualities" });
+    const source = await editor.getByRole("button", { name: "Reorder 720p", exact: true }).boundingBox();
+    const target = await editor.getByRole("button", { name: "Reorder 1080p", exact: true }).boundingBox();
+    await page.mouse.move(source!.x + 20, source!.y + source!.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(target!.x + 20, target!.y + target!.height / 2, { steps: 8 });
+    await page.mouse.up();
+    await expect(order.getByRole("listitem").first()).toContainText("720p");
+    await editor.getByRole("button", { name: "Reorder 720p", exact: true }).press("ArrowDown");
+    await expect(order.getByRole("listitem").first()).toContainText("1080p");
+    await expect(editor.getByRole("button", { name: "Disallow 1080p", exact: true })).toBeDisabled();
+    await editor.getByRole("checkbox", { name: "Allow upgrades" }).uncheck();
+    await expect(editor.getByRole("textbox", { name: "Upgrade until" })).toBeDisabled();
+    await editor.getByRole("button", { name: "Cancel", exact: true }).click();
+    await page.getByRole("button", { name: "Edit HD profile", exact: true }).click();
+    await expect(editor.getByRole("checkbox", { name: "Allow upgrades" })).toBeChecked();
+    await editor.getByRole("checkbox", { name: "Prefer proper / repack releases" }).uncheck();
+    const touchSource = await editor.getByRole("button", { name: "Reorder 720p", exact: true }).boundingBox();
+    const touchTarget = await editor.getByRole("button", { name: "Reorder 1080p", exact: true }).boundingBox();
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: touchSource!.x + 20, y: touchSource!.y + touchSource!.height / 2 }] });
+    await cdp.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: touchTarget!.x + 20, y: touchTarget!.y + touchTarget!.height / 2 }] });
+    await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    await cdp.detach();
+    await expect(order.getByRole("listitem").first()).toContainText("720p");
+    await editor.getByRole("button", { name: "Save changes", exact: true }).click();
+    await expect(editor).not.toBeVisible();
+    await page.reload();
+    await page.getByRole("button", { name: "Edit HD profile", exact: true }).click();
+    await expect(editor.getByRole("checkbox", { name: "Prefer proper / repack releases" })).not.toBeChecked();
+    await expect(order.getByRole("listitem").first()).toContainText("720p");
+    await editor.getByRole("button", { name: "Reorder 720p", exact: true }).press("ArrowDown");
+    await editor.getByRole("checkbox", { name: "Prefer proper / repack releases" }).check();
+    await page.screenshot({ path: `../artifacts/profile-editor-${theme}-390.png`, animations: "disabled" });
+    await editor.getByRole("button", { name: "Save changes", exact: true }).click();
+    await expect(editor).not.toBeVisible();
+    await page.getByRole("tab", { name: "Quality definitions" }).click();
+    await expect(page.getByRole("slider", { name: "series 1080p min", exact: true })).toHaveAttribute("aria-valuetext", "0.19 GB");
+    for (const width of [1440, 390]) {
+      await page.setViewportSize({ width, height: 1000 });
+      expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
+      await page.screenshot({ path: `../artifacts/quality-${theme}-${width}.png`, fullPage: true, animations: "disabled" });
+    }
+  }
+  const preferred = page.getByRole("slider", { name: "movie 1080p preferred", exact: true });
+  await preferred.press("ArrowLeft");
+  await expect(preferred).toHaveAttribute("aria-valuetext", "10 GB");
+  const saved = page.waitForRequest(r => r.method() === "PUT" && r.url().endsWith("/api/v1/quality"));
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  const configuration = (await saved).postDataJSON();
+  expect(configuration.sizes.movie["1080p"].preferred).toBeCloseTo(10_000_000_000 / (120 * 1048576), 8);
+  expect(configuration.sizes.series["1080p"].min).toBe(4);
+  await expect(page.getByRole("button", { name: "Save changes", exact: true })).not.toBeVisible();
+  await page.reload();
+  await page.getByRole("tab", { name: "Quality definitions", exact: true }).click();
+  await expect(preferred).toHaveAttribute("aria-valuetext", "10 GB");
+  const maximum = page.getByRole("slider", { name: "movie 1080p max", exact: true });
+  await maximum.press("End");
+  await expect(maximum).toHaveAttribute("aria-valuetext", "Unlimited");
+  await page.getByRole("button", { name: "Discard changes", exact: true }).click();
+  await expect(maximum).toHaveAttribute("aria-valuetext", "12.58 GB");
+});

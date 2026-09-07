@@ -12,10 +12,14 @@
  *    against declared media roots, so a range can never escape them.
  */
 import type { FastifyInstance } from "fastify";
-import { createReadStream, statSync, existsSync } from "node:fs";
+import { collectionPage, collectionFacets, mediaCollectionFields } from "./collection-page.js";
+import { createReadStream, statSync, existsSync, realpathSync } from "node:fs";
 import { resolve as pathResolve, sep } from "node:path";
+import type { createMovieMetadataService } from "./movie-metadata.js";
 
 export interface ServingDeps {
+  enrichItems?: ReturnType<typeof createMovieMetadataService>["enrichItems"];
+  artwork?: (fileId: string, variant: "poster" | "backdrop") => Promise<{ body: Buffer; contentType: string }>;
   /** Invoke the dev.tantalar.capability.serving provider. */
   invoke: (operation: string, payload: Record<string, unknown>) => Promise<unknown>;
   /**
@@ -32,16 +36,18 @@ export interface ServingDeps {
    * core so the plugin never handles filesystem paths; core re-checks
    * containment against mediaRoots after resolution.
    */
-  resolvePath: (fileId: string) => string | null;
-  mediaRoots: readonly string[];
+  resolvePath: (fileId: string) => string | null | Promise<string | null>;
+  mediaRoots: readonly string[] | (() => readonly string[] | Promise<readonly string[]>);
+  /** Resolve current durable grants before each serving operation. */
+  resolveLibraryAccess?: (userId: string, isAdmin: boolean) => Promise<readonly string[]>;
   /**
-   * Resolve a transcode session's segment to its on-disk path. Returns null
-   * when the server has no segments dir configured (synthetic fallback).
+   * Resolve a transcode session's HLS output file to its on-disk path.
    */
   resolveSegmentPath?: (sessionId: string, segment: string) => string | null;
+  /** Root that contains all resolved HLS output files. */
+  hlsRoot?: string;
   /**
-   * Optional HLS segment payload provider (e2e/testing hook). When absent the
-   * synthetic sync-byte filler is served — production always transcodes.
+   * Optional valid HLS segment payload provider for isolated tests.
    */
   segmentPayload?: () => Buffer;
 }
@@ -76,9 +82,31 @@ function isInside(root: string, child: string): boolean {
 function assertContained(p: string | null): string {
   const status404 = Object.assign(new Error("not found"), { statusCode: 404 });
   if (!p) throw status404;
-  const real = pathResolve(p);
-  if (!existsSync(real)) throw status404;
-  return real;
+  try {
+    const real = realpathSync(pathResolve(p));
+    if (!statSync(real).isFile()) throw status404;
+    return real;
+  } catch {
+    throw status404;
+  }
+}
+
+function isLocalAddress(value: unknown): boolean {
+  const ip = String(value ?? "").replace(/^::ffff:/, "");
+  if (ip === "::1" || ip.startsWith("fc") || ip.startsWith("fd") || ip.startsWith("fe80:")) return true;
+  const parts = ip.split(".").map(Number);
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
+  return parts[0] === 10
+    || (parts[0] === 172 && (parts[1] ?? 0) >= 16 && (parts[1] ?? 0) <= 31)
+    || (parts[0] === 192 && parts[1] === 168)
+    || parts[0] === 127;
+}
+
+function playbackClient(request: any) {
+  const userAgent = String(request.headers?.["user-agent"] ?? "Unknown web client")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .slice(0, 160);
+  return { client: userAgent, network: isLocalAddress(request.ip) ? "local" : "remote" } as const;
 }
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -118,7 +146,45 @@ export function registerServingRoutes(app: FastifyInstance, deps: ServingDeps): 
       await reply.code(400).send({ error: "viewerId required for api-key access" });
       return null;
     }
+    if (deps.resolveLibraryAccess) {
+      const isAdmin = auth.kind === "session" && auth.role === "admin" &&
+        (!namedExplicitly || userId === auth.userId);
+      const libraryIds = await deps.resolveLibraryAccess(userId, isAdmin);
+      await deps.invoke("set-viewer", { userId, libraries: [...libraryIds] });
+    }
     return { userId };
+  };
+
+  const mediaRoots = async (): Promise<readonly string[]> =>
+    typeof deps.mediaRoots === "function" ? await deps.mediaRoots() : deps.mediaRoots;
+
+  const isInMediaRoot = async (filePath: string): Promise<boolean> => {
+    for (const root of await mediaRoots()) {
+      try {
+        if (isInside(realpathSync(pathResolve(root)), filePath)) return true;
+      } catch {
+        // Missing or unreadable roots cannot authorize a path.
+      }
+    }
+    return false;
+  };
+
+  const isInHlsRoot = (filePath: string): boolean => {
+    if (!deps.hlsRoot) return false;
+    try {
+      return isInside(realpathSync(pathResolve(deps.hlsRoot)), filePath);
+    } catch {
+      return false;
+    }
+  };
+
+  const waitForHlsFile = async (filePath: string, timeoutMs = 12_000): Promise<boolean> => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (existsSync(filePath) && statSync(filePath).size > 0) return true;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return false;
   };
 
   const errStatus = (err: unknown): number => {
@@ -190,7 +256,34 @@ export function registerServingRoutes(app: FastifyInstance, deps: ServingDeps): 
   app.get("/api/v1/library", async (request: any, reply: any) => {
     const viewer = await actingViewer(request, reply, "serving.read");
     if (!viewer) return;
-    return guard(() => deps.invoke("browse", { userId: viewer.userId }), reply);
+    return guard(async () => {
+      const result = await deps.invoke("browse", { userId: viewer.userId }) as { items: Array<{ fileId: string; itemKey: string; kind: string }> };
+      const enriched = deps.enrichItems ? { ...result, items: await deps.enrichItems(result.items) } : result;
+      if (request.query?.explorer !== "1") return enriched;
+      // ponytail: providers enumerate authorized records; push paging into browse when the provider contract supports it.
+      const page = collectionPage(enriched.items as Array<Record<string, unknown>>, request.query, {
+        ...mediaCollectionFields, libraryId: item => item.libraryId,
+      });
+      return { ...page, facets: collectionFacets(enriched.items as Array<Record<string, unknown>>, mediaCollectionFields), collections: [], continueWatching: [] };
+    }, reply);
+  });
+
+  app.get("/api/v1/library/:fileId/artwork/:variant", async (request: any, reply: any) => {
+    const viewer = await actingViewer(request, reply, "serving.read");
+    if (!viewer) return;
+    const { fileId, variant } = request.params;
+    if (variant !== "poster" && variant !== "backdrop") return reply.code(400).send({ error: "invalid artwork variant" });
+    return guard(async () => {
+      await deps.invoke("authorize", { userId: viewer.userId, fileId });
+      try {
+        if (!deps.artwork) throw new Error("artwork unavailable");
+        const image = await deps.artwork(fileId, variant);
+        // Recheck grants on every request, including after access is revoked.
+        return reply.header("content-type", image.contentType).header("cache-control", "private, no-store").send(image.body);
+      } catch {
+        return reply.code(404).send({ error: "artwork unavailable" });
+      }
+    }, reply);
   });
 
   app.post("/api/v1/library/:fileId/resume", async (request: any, reply: any) => {
@@ -235,6 +328,7 @@ export function registerServingRoutes(app: FastifyInstance, deps: ServingDeps): 
         userId: viewer.userId,
         fileId: request.params.fileId,
         capabilities: request.body,
+        ...playbackClient(request),
       })) as Record<string, unknown>;
       return out;
     }, reply);
@@ -246,11 +340,19 @@ export function registerServingRoutes(app: FastifyInstance, deps: ServingDeps): 
     const viewer = await actingViewer(request, reply, "serving.read");
     if (!viewer) return;
     try {
+      const sessionId = typeof request.query?.sessionId === "string" ? request.query.sessionId : null;
+      if (sessionId) {
+        const state = (await deps.invoke("session-state", { sessionId })) as Record<string, unknown>;
+        if (state.closed || state.userId !== viewer.userId || state.fileId !== request.params.fileId) {
+          return reply.code(403).send({ error: "playback session is not valid for this stream" });
+        }
+        await deps.invoke("session-touch", { sessionId });
+      }
       // Authorization choke point BEFORE any byte is read.
       await deps.invoke("authorize", { userId: viewer.userId, fileId: request.params.fileId });
-      const real = assertContained(deps.resolvePath(String(request.params.fileId)));
+      const real = assertContained(await deps.resolvePath(String(request.params.fileId)));
       // Defense in depth: containment against declared roots, again.
-      const contained = deps.mediaRoots.some((root) => isInside(pathResolve(root), real));
+      const contained = await isInMediaRoot(real);
       if (!contained) return reply.code(403).send({ error: "path escapes declared media roots" });
       return await serveFileBytes(request, reply, real);
     } catch (err) {
@@ -318,15 +420,10 @@ export function registerServingRoutes(app: FastifyInstance, deps: ServingDeps): 
           fileId: body.fileId,
           qualities: body.qualities,
           reason: body.reason,
+          ...playbackClient(request),
         }),
       reply,
     );
-  });
-
-  app.delete("/api/v1/transcode-session/:sessionId", async (request: any, reply: any) => {
-    const viewer = await actingViewer(request, reply, "serving.write");
-    if (!viewer) return;
-    return guard(() => deps.invoke("cancel-session", { sessionId: request.params.sessionId }), reply);
   });
 
   /**
@@ -350,10 +447,58 @@ export function registerServingRoutes(app: FastifyInstance, deps: ServingDeps): 
     return state;
   };
 
+  const closeOwnedSession = async (request: any, reply: any) => {
+    const state = await authorizedSession(request, reply);
+    if (!state) return;
+    return guard(() => deps.invoke("close-session", {
+      sessionId: request.params.sessionId,
+      reason: "client_close",
+    }), reply);
+  };
+
+  app.delete("/api/v1/transcode-session/:sessionId", closeOwnedSession);
+  app.delete("/api/v1/playback-session/:sessionId", closeOwnedSession);
+
+  app.post("/api/v1/playback-session/:sessionId/touch", async (request: any, reply: any) => {
+    const state = await authorizedSession(request, reply);
+    if (!state) return;
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    return guard(() => deps.invoke("session-touch", {
+      sessionId: request.params.sessionId,
+      positionMs: body.positionMs,
+      durationMs: body.durationMs,
+    }), reply);
+  });
+
   app.post("/api/v1/hls/:sessionId/start", async (request: any, reply: any) => {
     const state = await authorizedSession(request, reply);
     if (!state) return;
-    return guard(() => deps.invoke("start-worker", { sessionId: request.params.sessionId }), reply);
+    return guard(async () => {
+      if (!deps.resolveSegmentPath || !deps.hlsRoot) {
+        return reply.code(503).send({ error: "HLS transcoding is not configured on this server" });
+      }
+      const source = await deps.resolvePath(String(state.fileId ?? ""));
+      const realSource = source && existsSync(source) ? realpathSync(pathResolve(source)) : null;
+      if (!realSource || !(await isInMediaRoot(realSource))) {
+        return reply.code(404).send({ error: "media source is not available" });
+      }
+      const sessionId = String(request.params.sessionId);
+      const playlistPath = deps.resolveSegmentPath(sessionId, "playlist.m3u8");
+      if (!playlistPath || !isInside(pathResolve(deps.hlsRoot), pathResolve(playlistPath))) {
+        return reply.code(503).send({ error: "HLS output path is not configured safely" });
+      }
+      const started = await deps.invoke("start-worker", { sessionId, inputPath: realSource });
+      if (!(await waitForHlsFile(playlistPath))) {
+        await deps.invoke("cancel-session", { sessionId }).catch(() => undefined);
+        return reply.code(503).send({ error: "FFmpeg did not produce a playable HLS stream within 12 seconds" });
+      }
+      const realPlaylist = realpathSync(pathResolve(playlistPath));
+      if (!isInHlsRoot(realPlaylist)) {
+        await deps.invoke("cancel-session", { sessionId }).catch(() => undefined);
+        return reply.code(503).send({ error: "FFmpeg produced output outside the configured HLS directory" });
+      }
+      return { ...(started as Record<string, unknown>), ready: true };
+    }, reply);
   });
 
   app.get("/api/v1/hls/:sessionId/manifest.m3u8", async (request: any, reply: any) => {
@@ -377,6 +522,18 @@ export function registerServingRoutes(app: FastifyInstance, deps: ServingDeps): 
     if (!state) return;
     return guard(async () => {
       await deps.invoke("session-touch", { sessionId: request.params.sessionId });
+      const playlistPath = deps.resolveSegmentPath?.(String(request.params.sessionId), "playlist.m3u8") ?? null;
+      if (playlistPath) {
+        const real = existsSync(playlistPath) ? realpathSync(pathResolve(playlistPath)) : null;
+        if (real && isInHlsRoot(real)) {
+          reply
+            .code(200)
+            .header("Content-Type", "application/vnd.apple.mpegurl")
+            .header("Content-Length", String(statSync(real).size));
+          return reply.send(createReadStream(real));
+        }
+        return reply.code(503).send({ error: "HLS playlist is not ready; start the transcode session first" });
+      }
       const lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:3",
@@ -397,31 +554,30 @@ export function registerServingRoutes(app: FastifyInstance, deps: ServingDeps): 
     if (!state) return;
     return guard(async () => {
       await deps.invoke("session-touch", { sessionId: request.params.sessionId });
-      // Real segment bytes: when a transcode worker (real ffmpeg) has
-      // produced the segment file under the configured segments dir, serve
-      // it from disk. Only the synthetic fallback remains for fixture
-      // configs without segmentsDir.
+      // Serve only a real worker output or an explicitly supplied valid test
+      // payload. Never report filler bytes as playable MPEG-TS.
       const segmentName = String(request.params.segment);
       if (!/^[A-Za-z0-9._-]+$/.test(segmentName)) {
         return reply.code(400).send({ error: "invalid segment name" });
       }
       const filePath = deps.resolveSegmentPath?.(String(request.params.sessionId), segmentName) ?? null;
       if (filePath) {
-        const contained = deps.mediaRoots.some(
-          (root) => isInside(pathResolve(root), pathResolve(filePath)),
-        );
-        if (contained && existsSync(filePath)) {
+        const real = existsSync(filePath) ? realpathSync(pathResolve(filePath)) : null;
+        const contained = real ? isInHlsRoot(real) : false;
+        if (contained && real) {
           reply
             .code(200)
             .header("Content-Type", "video/mp2t")
-            .header("Content-Length", String(statSync(filePath).size));
-          return reply.send(createReadStream(filePath));
+            .header("Content-Length", String(statSync(real).size));
+          return reply.send(createReadStream(real));
         }
         return reply.code(404).send({ error: "segment not yet available" });
       }
-      // Synthetic segment payload — no copyrighted media ever served here.
-      reply.header("Content-Type", "video/mp2t");
-      return deps.segmentPayload ? deps.segmentPayload() : Buffer.alloc(188 * 7, 0x47);
+      if (deps.segmentPayload) {
+        reply.header("Content-Type", "video/mp2t");
+        return deps.segmentPayload();
+      }
+      return reply.code(503).send({ error: "HLS transcoding is not configured on this server" });
     }, reply);
   });
 }

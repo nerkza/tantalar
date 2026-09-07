@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Button, Center, Paper, PasswordInput, Stack, TextInput, Title } from "@mantine/core";
 import { api } from "../api";
+import { BrandLogo } from "../components/BrandLogo";
 
 export function SignInPage({ onSignedIn }: { onSignedIn: () => void }) {
   const [username, setUsername] = useState("");
@@ -9,8 +10,8 @@ export function SignInPage({ onSignedIn }: { onSignedIn: () => void }) {
   const [busy, setBusy] = useState(false);
 
   return (
-    <Center mih="100vh">
-      <Paper shadow="sm" radius="md" p="xl" w={380}>
+    <Center mih="100vh" p="md">
+      <Paper shadow="sm" radius="md" p="xl" w={380} maw="100%">
         <form
           onSubmit={(e) => {
             e.preventDefault();
@@ -24,6 +25,7 @@ export function SignInPage({ onSignedIn }: { onSignedIn: () => void }) {
           }}
         >
           <Stack gap="sm">
+            <BrandLogo />
             <Title order={3}>Sign in</Title>
             <TextInput
               label="Username"

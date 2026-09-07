@@ -54,16 +54,26 @@ export interface EngineTorrent {
 /** Operations the engine must support for the plugin's capability surface. */
 export interface TorrentEngine {
   /** Add from raw .torrent bytes or a magnet URI; returns the live torrent. */
-  add(input: { source: string; sourceKind: "file" | "magnet"; downloadPath: string; fileSelection?: string[] }): Promise<EngineTorrent>;
+  add(input: {
+    source: string;
+    sourceKind: "file" | "magnet";
+    downloadPath: string;
+    fileSelection?: string[];
+    /** Recovery may reuse verified partial files. New jobs reject collisions. */
+    allowExisting?: boolean;
+  }): Promise<EngineTorrent>;
   get(infoHash: string): EngineTorrent | undefined;
   list(): EngineTorrent[];
   pause(infoHash: string): void;
   resume(infoHash: string): void;
+  selectFiles?(infoHash: string, paths: readonly string[]): void;
   remove(infoHash: string, opts?: { keepFiles?: boolean }): Promise<void>;
   /** Verify every selected piece by hashing; repairs counters after crash. */
   verify(infoHash: string): Promise<{ verifiedPieces: number; totalPieces: number; corruptedFiles: string[] }>;
   /** Drive one deterministic transfer step; real engines tick on IO. */
   advance?(infoHash: string): Promise<void>;
+  /** Release listeners and sockets owned by this engine. */
+  destroy?(): Promise<void>;
 }
 
 // ---- Bencode / torrent parsing -------------------------------------------------
@@ -74,19 +84,56 @@ export interface TorrentEngine {
 
 type BencodeValue = number | Uint8Array | BencodeValue[] | { [k: string]: BencodeValue };
 
-function bdecode(buf: Uint8Array, pos = 0): { value: BencodeValue; end: number } {
+export interface TorrentInputLimits {
+  readonly maxMetadataBytes: number;
+  readonly maxFiles: number;
+  readonly maxPathBytes: number;
+  readonly maxPathDepth: number;
+  readonly maxPayloadBytes: number;
+  readonly maxPieces: number;
+}
+
+export const DEFAULT_TORRENT_LIMITS: TorrentInputLimits = Object.freeze({
+  maxMetadataBytes: 2 * 1024 * 1024,
+  maxFiles: 10_000,
+  maxPathBytes: 1024,
+  maxPathDepth: 32,
+  maxPayloadBytes: 8 * 1024 ** 4,
+  maxPieces: 1_000_000,
+});
+
+interface DecodeState {
+  nodes: number;
+  readonly maxNodes: number;
+  readonly maxDepth: number;
+}
+
+function bdecode(
+  buf: Uint8Array,
+  pos = 0,
+  state: DecodeState = { nodes: 0, maxNodes: 200_000, maxDepth: 64 },
+  depth = 0,
+): { value: BencodeValue; end: number } {
+  state.nodes += 1;
+  if (state.nodes > state.maxNodes) throw new Error("bencode: node limit exceeded");
+  if (depth > state.maxDepth) throw new Error("bencode: nesting limit exceeded");
   const c = buf[pos];
   if (c === undefined) throw new Error("bencode: unexpected end");
   if (c === 0x69 /* i */) {
     const e = buf.indexOf(0x65 /* e */, pos);
     if (e < 0) throw new Error("bencode: unterminated integer");
-    return { value: Number(Buffer.from(buf.slice(pos + 1, e)).toString("ascii")), end: e + 1 };
+    const raw = Buffer.from(buf.slice(pos + 1, e)).toString("ascii");
+    if (!/^(?:0|-?[1-9][0-9]*)$/.test(raw) || raw === "-0") throw new Error("bencode: invalid integer");
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value)) throw new Error("bencode: integer out of range");
+    return { value, end: e + 1 };
   }
   if (c === 0x6c /* l */) {
     const out: BencodeValue[] = [];
     let p = pos + 1;
     while (buf[p] !== 0x65 /* e */) {
-      const r = bdecode(buf, p);
+      if (buf[p] === undefined) throw new Error("bencode: unterminated list");
+      const r = bdecode(buf, p, state, depth + 1);
       out.push(r.value);
       p = r.end;
     }
@@ -96,9 +143,13 @@ function bdecode(buf: Uint8Array, pos = 0): { value: BencodeValue; end: number }
     const out: { [k: string]: BencodeValue } = {};
     let p = pos + 1;
     while (buf[p] !== 0x65 /* e */) {
-      const key = bdecode(buf, p);
-      const val = bdecode(buf, key.end);
-      out[Buffer.from(key.value as Uint8Array).toString("utf8")] = val.value;
+      if (buf[p] === undefined) throw new Error("bencode: unterminated dictionary");
+      const key = bdecode(buf, p, state, depth + 1);
+      if (!(key.value instanceof Uint8Array)) throw new Error("bencode: dictionary key must be bytes");
+      const keyText = Buffer.from(key.value).toString("utf8");
+      if (Object.hasOwn(out, keyText)) throw new Error(`bencode: duplicate key ${keyText}`);
+      const val = bdecode(buf, key.end, state, depth + 1);
+      out[keyText] = val.value;
       p = val.end;
     }
     return { value: out, end: p + 1 };
@@ -106,8 +157,12 @@ function bdecode(buf: Uint8Array, pos = 0): { value: BencodeValue; end: number }
   // Byte string: <len>:<bytes>
   const colon = buf.indexOf(0x3a /* : */, pos);
   if (colon < 0 || colon - pos > 12) throw new Error("bencode: bad string prefix");
-  const len = Number(Buffer.from(buf.slice(pos, colon)).toString("ascii"));
-  return { value: buf.slice(colon + 1, colon + 1 + len), end: colon + 1 + len };
+  const rawLength = Buffer.from(buf.slice(pos, colon)).toString("ascii");
+  if (!/^(?:0|[1-9][0-9]*)$/.test(rawLength)) throw new Error("bencode: invalid string length");
+  const len = Number(rawLength);
+  const end = colon + 1 + len;
+  if (!Number.isSafeInteger(len) || end > buf.length) throw new Error("bencode: string exceeds input");
+  return { value: buf.slice(colon + 1, end), end };
 }
 
 function utf8(v: BencodeValue | undefined): string {
@@ -118,41 +173,124 @@ function utf8(v: BencodeValue | undefined): string {
  * Parse .torrent metainfo into engine fields. The info-hash is computed
  * over the exact bencoded `info` slice (the canonical BitTorrent identity).
  */
-export function parseTorrentFile(bytes: Uint8Array): {
+function integer(v: BencodeValue | undefined, field: string): number {
+  if (typeof v !== "number" || !Number.isSafeInteger(v)) throw new Error(`torrent: invalid ${field}`);
+  return v;
+}
+
+function bytesValue(v: BencodeValue | undefined, field: string): Uint8Array {
+  if (!(v instanceof Uint8Array)) throw new Error(`torrent: invalid ${field}`);
+  return v;
+}
+
+export function validateTorrentPathSegment(segment: string): string {
+  if (
+    segment.length === 0 ||
+    segment === "." ||
+    segment === ".." ||
+    segment.includes("/") ||
+    segment.includes("\\") ||
+    segment.includes("\0") ||
+    /^[A-Za-z]:/.test(segment) ||
+    /[\u0000-\u001f\u007f]/.test(segment)
+  ) {
+    throw new Error("torrent: unsafe path segment");
+  }
+  return segment;
+}
+
+function validateRelativePath(segments: readonly string[], limits: TorrentInputLimits): string {
+  if (segments.length === 0 || segments.length > limits.maxPathDepth) throw new Error("torrent: invalid path depth");
+  const safe = segments.map(validateTorrentPathSegment);
+  const joined = safe.join("/");
+  if (Buffer.byteLength(joined, "utf8") > limits.maxPathBytes) throw new Error("torrent: path exceeds limit");
+  return joined;
+}
+
+function findInfoSlice(bytes: Uint8Array): { start: number; end: number } {
+  if (bytes[0] !== 0x64) throw new Error("torrent: root must be a dictionary");
+  const state: DecodeState = { nodes: 0, maxNodes: 200_000, maxDepth: 64 };
+  let pos = 1;
+  let found: { start: number; end: number } | null = null;
+  while (bytes[pos] !== 0x65) {
+    if (bytes[pos] === undefined) throw new Error("torrent: unterminated root dictionary");
+    const key = bdecode(bytes, pos, state, 1);
+    if (!(key.value instanceof Uint8Array)) throw new Error("torrent: root key must be bytes");
+    const valueStart = key.end;
+    const value = bdecode(bytes, valueStart, state, 1);
+    if (Buffer.from(key.value).toString("utf8") === "info") {
+      if (found) throw new Error("torrent: duplicate info dictionary");
+      found = { start: valueStart, end: value.end };
+    }
+    pos = value.end;
+  }
+  if (!found) throw new Error("torrent: missing info dictionary");
+  return found;
+}
+
+export function parseTorrentFile(
+  bytes: Uint8Array,
+  overrides: Partial<TorrentInputLimits> = {},
+): {
   infoHash: string;
   name: string;
   pieceLength: number;
   piecesTotal: number;
+  pieceHashes: string[];
   announceUrls: string[];
   files: Array<{ path: string; lengthBytes: number }>;
+  multiFile: boolean;
 } {
-  const decoded = bdecode(bytes).value as { [k: string]: BencodeValue };
+  const limits = { ...DEFAULT_TORRENT_LIMITS, ...overrides };
+  if (bytes.length === 0 || bytes.length > limits.maxMetadataBytes) throw new Error("torrent: metadata exceeds limit");
+  const decodedResult = bdecode(bytes);
+  if (decodedResult.end !== bytes.length) throw new Error("torrent: trailing metainfo bytes");
+  const decoded = decodedResult.value as { [k: string]: BencodeValue };
   const info = decoded["info"] as { [k: string]: BencodeValue } | undefined;
-  if (!info) throw new Error("torrent: missing info dictionary");
-  // Locate the raw `info` slice by finding "4:info" then decoding one value.
-  const marker = Buffer.from("4:info", "ascii");
-  let idx = Buffer.from(bytes).indexOf(marker);
-  if (idx < 0) throw new Error("torrent: missing info dictionary");
-  const infoSlice = bdecode(bytes, idx + marker.length);
-  const sha = createHash("sha1").update(Buffer.from(bytes.slice(idx + marker.length, infoSlice.end))).digest("hex");
+  if (!info || Array.isArray(info) || info instanceof Uint8Array) throw new Error("torrent: missing info dictionary");
+  const infoSlice = findInfoSlice(bytes);
+  const sha = createHash("sha1").update(Buffer.from(bytes.slice(infoSlice.start, infoSlice.end))).digest("hex");
 
-  const name = utf8(info["name"]);
-  const pieceLength = Number(info["piece length"] ?? 0);
-  const pieces = info["pieces"] as Uint8Array | undefined;
-  const piecesTotal = pieces ? Math.floor(pieces.length / 20) : 0;
+  const name = validateTorrentPathSegment(utf8(bytesValue(info["name"], "name")));
+  const pieceLength = integer(info["piece length"], "piece length");
+  if (pieceLength < 4 * 1024 || pieceLength > 16 * 1024 * 1024) throw new Error("torrent: piece length outside limits");
+  const pieces = bytesValue(info["pieces"], "pieces");
+  if (pieces.length === 0 || pieces.length % 20 !== 0) throw new Error("torrent: invalid piece hashes");
+  const piecesTotal = pieces.length / 20;
+  if (piecesTotal > limits.maxPieces) throw new Error("torrent: piece count exceeds limit");
+  const pieceHashes: string[] = [];
+  for (let offset = 0; offset < pieces.length; offset += 20) {
+    pieceHashes.push(Buffer.from(pieces.slice(offset, offset + 20)).toString("hex"));
+  }
 
   const files: Array<{ path: string; lengthBytes: number }> = [];
+  const seenPaths = new Set<string>();
   const fileList = info["files"];
+  const multiFile = Array.isArray(fileList);
   if (Array.isArray(fileList)) {
+    if (fileList.length === 0 || fileList.length > limits.maxFiles) throw new Error("torrent: file count exceeds limit");
     for (const f of fileList) {
       const fd = f as { [k: string]: BencodeValue };
-      const segs = (fd["path"] as BencodeValue[]) ?? [];
-      const rel = segs.map((s) => utf8(s)).join("/");
-      files.push({ path: rel, lengthBytes: Number(fd["length"] ?? 0) });
+      const rawSegments = fd["path"];
+      if (!Array.isArray(rawSegments)) throw new Error("torrent: invalid file path");
+      const rel = validateRelativePath(rawSegments.map((s) => utf8(bytesValue(s, "path segment"))), limits);
+      if (seenPaths.has(rel)) throw new Error("torrent: duplicate file path");
+      seenPaths.add(rel);
+      const lengthBytes = integer(fd["length"], "file length");
+      if (lengthBytes < 0) throw new Error("torrent: negative file length");
+      files.push({ path: rel, lengthBytes });
     }
   } else {
-    files.push({ path: name, lengthBytes: Number(info["length"] ?? 0) });
+    const lengthBytes = integer(info["length"], "file length");
+    if (lengthBytes < 0) throw new Error("torrent: negative file length");
+    files.push({ path: name, lengthBytes });
   }
+
+  const sizeBytes = files.reduce((total, file) => total + file.lengthBytes, 0);
+  if (!Number.isSafeInteger(sizeBytes) || sizeBytes <= 0 || sizeBytes > limits.maxPayloadBytes) {
+    throw new Error("torrent: payload size outside limits");
+  }
+  if (Math.ceil(sizeBytes / pieceLength) !== piecesTotal) throw new Error("torrent: piece hash count does not match payload");
 
   const announce = typeof decoded["announce"] === "object" && !(decoded["announce"] instanceof Uint8Array)
     ? []
@@ -162,25 +300,65 @@ export function parseTorrentFile(bytes: Uint8Array): {
         Array.isArray(tier) ? tier.map((t) => utf8(t)) : [],
       )
     : [];
+  const announceUrls = [...new Set([...announce, ...announceList])].map(validateTrackerUrl);
+  if (announceUrls.length > 64) throw new Error("torrent: tracker count exceeds limit");
   return {
     infoHash: sha,
     name,
     pieceLength,
     piecesTotal,
-    announceUrls: [...new Set([...announce, ...announceList])],
+    pieceHashes,
+    announceUrls,
     files,
+    multiFile,
   };
 }
 
-/** Extract the btih info-hash from a magnet URI (hex form). */
+function decodeBase32InfoHash(value: string): string {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = 0;
+  let accumulator = 0;
+  const out: number[] = [];
+  for (const char of value.toUpperCase()) {
+    const index = alphabet.indexOf(char);
+    if (index < 0) throw new Error("magnet: unsupported btih encoding");
+    accumulator = (accumulator << 5) | index;
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push((accumulator >>> bits) & 0xff);
+    }
+  }
+  if (out.length !== 20) throw new Error("magnet: unsupported btih encoding");
+  return Buffer.from(out).toString("hex");
+}
+
+function validateTrackerUrl(value: string): string {
+  if (Buffer.byteLength(value, "utf8") > 2048) throw new Error("torrent: tracker URL exceeds limit");
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("torrent: invalid tracker URL");
+  }
+  if (!new Set(["http:", "https:", "udp:", "ws:", "wss:"]).has(parsed.protocol)) {
+    throw new Error("torrent: unsupported tracker protocol");
+  }
+  if (parsed.username || parsed.password || !parsed.hostname) throw new Error("torrent: invalid tracker URL");
+  return value;
+}
+
+/** Extract the v1 btih info-hash from a bounded magnet URI. */
 export function parseMagnet(magnetUri: string): { infoHash: string; displayNames: string[]; trackers: string[] } {
+  if (Buffer.byteLength(magnetUri, "utf8") > 16 * 1024) throw new Error("magnet: URI exceeds limit");
   if (!magnetUri.startsWith("magnet:?xt=urn:btih:")) throw new Error("magnet: unsupported uri");
   const url = new URL(magnetUri.replace("magnet:?", "http://magnet/?"));
   const xt = url.searchParams.get("xt") ?? "";
-  const btih = xt.slice("urn:btih:".length).toLowerCase();
-  if (!/^[0-9a-f]{40}$/.test(btih)) throw new Error("magnet: unsupported btih encoding");
-  const names = url.searchParams.getAll("dn");
-  const trackers = [...url.searchParams.getAll("tr").map(decodeURIComponent)];
+  const encoded = xt.slice("urn:btih:".length);
+  const btih = /^[0-9a-fA-F]{40}$/.test(encoded) ? encoded.toLowerCase() : decodeBase32InfoHash(encoded);
+  const names = url.searchParams.getAll("dn").map(validateTorrentPathSegment);
+  const trackers = [...new Set(url.searchParams.getAll("tr").map(validateTrackerUrl))];
+  if (trackers.length > 64) throw new Error("magnet: tracker count exceeds limit");
   return { infoHash: btih, displayNames: names, trackers };
 }
 
@@ -327,6 +505,13 @@ export class MemoryTorrentEngine implements TorrentEngine {
   resume(infoHash: string): void {
     const t = this.#torrents.get(infoHash);
     if (t) t.paused = false;
+  }
+
+  selectFiles(infoHash: string, paths: readonly string[]): void {
+    const t = this.#torrents.get(infoHash);
+    if (!t) return;
+    const wanted = new Set(paths);
+    for (const file of t.files) file.selected = wanted.has(file.path);
   }
 
   async remove(infoHash: string): Promise<void> {

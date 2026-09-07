@@ -96,6 +96,15 @@ describe("Wave 7 wire adapters (TAN-014)", () => {
     });
   });
 
+  it("decodes XML entities once in release URLs and titles, preserving CDATA", async () => {
+    const { parseResults } = await import("../plugins/indexer-torznab-newznab/dist/wire.js");
+    const releases = parseResults(`<rss><item><guid>one</guid><title>Minions &amp; Monsters &#40;2026&#x29;</title><enclosure url="https://indexer.invalid/api?t=get&amp;id=one&amp;apikey=key" /></item><item><guid>two</guid><title><![CDATA[A &amp; B]]></title><link><![CDATA[https://indexer.invalid/api?t=get&id=two]]></link></item></rss>`, "nzb");
+    expect(releases.map(({ title, downloadUrl }) => ({ title, downloadUrl }))).toEqual([
+      { title: "Minions & Monsters (2026)", downloadUrl: "https://indexer.invalid/api?t=get&id=one&apikey=key" },
+      { title: "A &amp; B", downloadUrl: "https://indexer.invalid/api?t=get&id=two" },
+    ]);
+  });
+
   it("builds query URLs with mode mapping and never exposes the apikey unredacted", async () => {
     const { buildQueryUrl } = await import("../plugins/indexer-torznab-newznab/dist/wire.js");
     const url = buildQueryUrl({ baseUrl: "https://indexer.invalid", protocol: "torznab", apiKey: "sekret123", mode: "tv-search", query: "legal test", season: 1, episode: 2 });

@@ -63,6 +63,18 @@ describe("config layering (ADR-0010)", () => {
     expect(warnings.some((w) => w.message.includes("server.bogusKey"))).toBe(true);
   });
 
+  it("recognizes the documented opt-in MCP section without enabling it by default", () => {
+    const mcp = {
+      http: { enabled: false, bind: "127.0.0.1", port: 8642, tlsViaProxy: false },
+      mutatingToolsEnabled: false,
+      limits: { timeoutMs: 30_000, maxResultBytes: 1_048_576, rateLimitPerMinute: 120 },
+    };
+    const loaded = loadConfig({ cliOverrides: { mcp }, env: {} });
+    expect(loaded.warnings).toEqual([]);
+    expect(loaded.config.mcp).toEqual(mcp);
+    expect(DEFAULT_CONFIG).not.toHaveProperty("mcp");
+  });
+
   it("dumpConfig redacts secrets and output is a valid input layer", () => {
     const cfg = deepMerge(DEFAULT_CONFIG, {
       database: { postgres: { url: "postgres://user:pw123@h/db" } },

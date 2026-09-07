@@ -1,0 +1,77 @@
+.tantalar-shell-navbar {
+  display: flex;
+  flex-direction: column;
+  transition: width 180ms ease;
+}
+
+.tantalar-navigation {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.tantalar-nav-header {
+  min-height: 52px;
+  display: flex;
+  flex: 0 0 52px;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 8px;
+}
+
+.tantalar-nav-header[data-collapsed] {
+  justify-content: center;
+}
+
+.tantalar-nav-header .tantalar-nav-label {
+  min-width: 0;
+  padding: 0;
+}
+
+.tantalar-nav-header .tantalar-nav-label[data-hidden] {
+  display: none;
+}
+
+.tantalar-nav-collapse {
+  flex: 0 0 auto;
+  margin: 0;
+  color: var(--tantalar-color-text-dimmed, #9aa0b4);
+}
+
+.tantalar-nav-collapse:hover {
+  color: var(--tantalar-color-text, #eef0f6);
+  background: var(--tantalar-color-surface-raised, #222634);
+}
+
+.tantalar-nav-link--rail {
+  width: 44px;
+  min-width: 44px;
+  height: 42px;
+  padding-inline: 0;
+  margin-inline: auto;
+}
+
+.tantalar-nav-link--rail :where(.mantine-NavLink-section) {
+  margin-inline: auto;
+}
+
+@media (max-width: 47.99em) {
+  .tantalar-shell-navbar {
+    transition: transform 180ms ease;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tantalar-shell-navbar {
+    transition: none;
+  }
+}
+.tantalar-account-footer { margin-top: auto; padding: calc(var(--tantalar-space-unit, 4px) * 2); display: flex; align-items: center; gap: var(--tantalar-space-unit, 4px); border-top: 1px solid var(--tantalar-color-border, #2c3143); }
+.tantalar-account-footer__profile { display: flex; align-items: center; gap: calc(var(--tantalar-space-unit, 4px) * 2); flex: 1; min-width: 0; min-height: 44px; border: 0; background: transparent; padding: var(--tantalar-space-unit, 4px); color: var(--tantalar-color-text, #eef0f6); font: inherit; text-align: left; cursor: pointer; border-radius: var(--tantalar-radius-md, 8px); }
+.tantalar-account-footer__profile:hover { background: var(--tantalar-color-surface-raised, #222634); }
+.tantalar-account-footer__profile:focus-visible { outline: 2px solid var(--tantalar-color-primary, #4d8df6); }
+.tantalar-account-footer__avatar { width: calc(var(--tantalar-space-unit, 4px) * 8); flex-shrink: 0; }
+.tantalar-account-footer__name { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: calc(var(--tantalar-font-size-base, 15px) * .85); }
+.tantalar-account-footer > button:not(.tantalar-account-footer__profile) { flex-shrink: 0; min-width: 44px; min-height: 44px; color: var(--tantalar-color-text-dimmed, #9aa0b4); }
+.tantalar-account-footer[data-collapsed="true"] { flex-direction: column; }
+.tantalar-account-footer[data-collapsed="true"] .tantalar-account-footer__profile { flex: none; justify-content: center; width: 44px; }

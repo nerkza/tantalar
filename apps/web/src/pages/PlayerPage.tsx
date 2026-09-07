@@ -9,18 +9,26 @@ import { Button, Group, NativeSelect, Paper, Slider, Stack, Text, Title } from "
 import { api, type PlaybackDecision, type SubtitleTrack } from "../api";
 import { attachPlayback, BROWSER_RENDERABLE_SUBTITLE_FORMATS, srtToVtt } from "../player/engine";
 import { ProgressReporter } from "../player/progress";
+import { MovieDetails, movieSummary } from "../components/MovieMetadata";
 
 interface Quality {
   index: number;
   label: string;
 }
 
+export async function ensurePlaybackReady(decision: PlaybackDecision): Promise<void> {
+  if (decision.mode === "hls") await api.startTranscodeSession(decision.sessionId);
+}
+
 export function PlayerPage({ fileId }: { fileId: string }) {
+  const library = useQuery({ queryKey: ["library"], queryFn: () => api.browse() });
+  const item = library.data?.items.find((entry) => entry.fileId === fileId);
   const videoRef = useRef<HTMLVideoElement>(null);
   const engineRef = useRef<ReturnType<typeof attachPlayback> | null>(null);
   const reporterRef = useRef<ProgressReporter | null>(null);
   const seekWasUserRef = useRef(false);
   const pendingResumeMsRef = useRef<number | null>(null);
+  const defaultSubtitleSessionRef = useRef<string | null>(null);
 
   const [qualities, setQualities] = useState<readonly Quality[]>([]);
   const [quality, setQuality] = useState<string>("-1");
@@ -40,23 +48,79 @@ export function PlayerPage({ fileId }: { fileId: string }) {
   });
 
   const decision: PlaybackDecision | undefined = negotiate.data?.decision;
+  const tracks: readonly SubtitleTrack[] = subtitles.data?.tracks ?? [];
+
+  useEffect(() => {
+    const trackId = decision?.subtitleTrackId;
+    if (!decision || !trackId || defaultSubtitleSessionRef.current === decision.sessionId) return;
+    const track = tracks.find((item) => item.trackId === trackId);
+    if (!track || !BROWSER_RENDERABLE_SUBTITLE_FORMATS.has(track.format)) return;
+    defaultSubtitleSessionRef.current = decision.sessionId;
+    setSelectedTrackId(trackId);
+    selectTrack(videoRef.current, tracks, trackId, (message) => {
+      setError(message);
+      if (message) setSelectedTrackId("");
+    });
+  }, [decision, tracks]);
 
   // Attach playback once negotiation resolves.
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !decision) return;
     setError(null);
-    const engine = attachPlayback(video, decision, {
-      onQualities: (qs: readonly Quality[]) => setQualities(qs),
-      onError: (msg: string) => setError(msg),
-    });
-    engineRef.current = engine;
-
     const reporter = new ProgressReporter(fileId);
     reporterRef.current = reporter;
+    let cancelled = false;
+    let engine: ReturnType<typeof attachPlayback> | null = null;
+    let sessionClosed = false;
+    const closeSession = (keepalive = false) => {
+      if (sessionClosed) return;
+      sessionClosed = true;
+      void api.closePlaybackSession(decision.sessionId, keepalive).catch(() => undefined);
+    };
+    const touchSession = () => {
+      void api.touchPlaybackSession(
+        decision.sessionId,
+        Math.max(0, Math.round(video.currentTime * 1000)),
+        Number.isFinite(video.duration) ? Math.max(0, Math.round(video.duration * 1000)) : 0,
+      ).catch((cause: unknown) => {
+        if (cancelled || (cause as { status?: number })?.status !== 404) return;
+        cancelled = true;
+        sessionClosed = true;
+        window.clearInterval(heartbeat);
+        reporter.stop();
+        engine?.destroy();
+        engine = null;
+        engineRef.current = null;
+        video.pause();
+        video.removeAttribute("src");
+        video.load();
+        setError("Playback session ended on the server.");
+      });
+    };
+    const heartbeat = window.setInterval(touchSession, 10_000);
+    const onPageHide = () => closeSession(true);
+    window.addEventListener("pagehide", onPageHide);
+
+    void (async () => {
+      try {
+        await ensurePlaybackReady(decision);
+        if (cancelled) return;
+        engine = attachPlayback(video, decision, {
+          onQualities: (qs: readonly Quality[]) => setQualities(qs),
+          onError: (msg: string) => setError(msg),
+        });
+        engineRef.current = engine;
+        reporter.start(video);
+      } catch (cause) {
+        if (!cancelled) {
+          const detail = cause instanceof Error ? cause.message : "unknown transcoder error";
+          setError(`Could not start playback: ${detail}`);
+        }
+      }
+    })();
 
     // Resume: fetch the stored point and start there once metadata is known.
-    let cancelled = false;
     void api
       .resumePoint(fileId)
       .then(({ resumePoint }) => {
@@ -76,16 +140,14 @@ export function PlayerPage({ fileId }: { fileId: string }) {
       clearSelectedTrack(video);
       reporter.stop();
       reporter.tick(video, false);
-      engine.destroy();
+      engine?.destroy();
+      window.clearInterval(heartbeat);
+      window.removeEventListener("pagehide", onPageHide);
+      closeSession();
       engineRef.current = null;
       reporterRef.current = null;
     };
   }, [decision, fileId]);
-
-  useEffect(() => {
-    if (reporterRef.current) reporterRef.current.start(videoRef.current!);
-    return () => reporterRef.current?.stop();
-  }, [decision]);
 
   // Autoplay next episode when this one ends.
   const nextFileId = useNextEpisode(fileId);
@@ -152,10 +214,11 @@ export function PlayerPage({ fileId }: { fileId: string }) {
     );
   }
 
-  const tracks: readonly SubtitleTrack[] = subtitles.data?.tracks ?? [];
   return (
     <Stack gap="sm" data-testid="player-page" data-mode={decision?.mode ?? ""}>
-      <Title order={4}>Now playing</Title>
+      <Title order={4}>{item?.title ?? "Now playing"}</Title>
+      {item?.episode ? <Text>{item.episode.episodeKey} · {item.episode.title}</Text> : null}
+      {item && (item.kind === "movie" || item.episode) ? <Text size="sm">{movieSummary(item)}</Text> : null}
       <Text size="xs" c="var(--tantalar-color-text-dimmed)">
         Keyboard: space or K play/pause · J/L or arrows seek 10s · M mute · F fullscreen
       </Text>
@@ -264,6 +327,7 @@ export function PlayerPage({ fileId }: { fileId: string }) {
           <div role="alert" style={{ color: "var(--mantine-color-red-6)" }}>{error}</div>
         ) : null}
       </Paper>
+      {item ? <details><summary>{item.kind === "series" ? "Series details" : "Movie details"}</summary><MovieDetails item={item} /></details> : null}
     </Stack>
   );
 }

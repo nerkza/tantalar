@@ -43,6 +43,19 @@ export class ServiceContainer {
     return list[0] as CapabilityProvider;
   }
 
+  /** Resolve one declared provider when a capability intentionally has peers. */
+  resolveProvider(capability: string, pluginId: string): CapabilityProvider {
+    const provider = (this.#providers.get(capability) ?? []).find((candidate) => candidate.pluginId === pluginId);
+    if (!provider) {
+      throw new CapabilityResolutionError(`no provider ${pluginId} for capability ${capability}`);
+    }
+    return provider;
+  }
+
+  providers(capability: string): readonly CapabilityProvider[] {
+    return [...(this.#providers.get(capability) ?? [])];
+  }
+
   hasProviders(capability: string): boolean {
     return (this.#providers.get(capability)?.length ?? 0) > 0;
   }

@@ -82,4 +82,22 @@ describe("scheduler persistence and idempotency", () => {
       .execute();
     expect(rows.length).toBe(0);
   });
+
+  it("reports interval failures instead of creating an unhandled rejection", async () => {
+    const intervalScheduler = new Scheduler(db, 5);
+    const errors: unknown[] = [];
+    await intervalScheduler.declareJob("dev.tantalar.plugin.failure", "fails", "every 1h", () => {
+      throw new Error("expected scheduler failure");
+    });
+    await db
+      .updateTable("scheduler_jobs")
+      .set({ next_run_at: new Date(Date.now() - 1000).toISOString() } as never)
+      .where("job_key", "=", "dev.tantalar.plugin.failure::fails")
+      .execute();
+    intervalScheduler.start((error) => errors.push(error));
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    intervalScheduler.stop();
+    expect(errors).toHaveLength(1);
+    expect(String((errors[0] as Error).message)).toContain("expected scheduler failure");
+  });
 });

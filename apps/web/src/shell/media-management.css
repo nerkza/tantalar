@@ -1,0 +1,30 @@
+.release-page { width: min(100%, 72rem); min-width: 0; }
+.media-back { color: var(--tantalar-color-text-dimmed); font-size: 0.8rem; text-decoration: none; width: fit-content; }
+.media-back:hover { color: var(--tantalar-color-text); text-decoration: underline; }
+.release-heading { display: grid; grid-template-columns: 7rem minmax(0, 1fr); gap: 1.25rem; align-items: start; max-width: 54rem; }
+.release-heading h1 { font-size: 1.65rem; letter-spacing: -0.025em; overflow-wrap: anywhere; }
+.release-heading img { width: 100%; height: auto; }
+.release-search-controls > :first-child { flex: 1; min-width: 14rem; }
+.release-search-controls { max-width: 56rem; }
+.release-filters { max-width: 48rem; }
+.release-filters > * { flex: 1; min-width: 8rem; }
+.release-results { min-width: 0; }
+.release-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 1.5rem; align-items: center; padding: 1rem 0; border-top: 1px solid var(--tantalar-color-border); }
+.release-row h3 { margin: 0; font-size: 0.9rem; font-weight: 600; overflow-wrap: anywhere; line-height: 1.45; }
+.release-row p { margin: 0.35rem 0; font-size: 0.78rem; color: var(--tantalar-color-text-dimmed); }
+.release-row details { font-size: 0.78rem; }
+.release-row details ul { margin-bottom: 0; padding-left: 1rem; color: var(--tantalar-color-text-dimmed); }
+.media-tags { margin-top: 0.7rem; font-size: 0.8rem; max-width: 34rem; }
+.media-tags summary, .release-row summary { cursor: pointer; width: fit-content; }
+.media-tags summary:focus-visible, .release-row summary:focus-visible { outline: 2px solid var(--tantalar-color-primary); outline-offset: 3px; }
+.media-tags ul { list-style: none; padding: 0; margin-block: 0.5rem; }
+.media-tags li { display: flex; align-items: center; justify-content: space-between; gap: 1rem; border-bottom: 1px solid var(--tantalar-color-border); padding-block: 0.25rem; }
+.local-files { max-width: 60rem; min-width: 0; }
+.local-file-row { border-top: 1px solid var(--tantalar-color-border); padding-block: 0.8rem; }
+.local-file-path { overflow-wrap: anywhere; font-size: 0.8rem; color: var(--tantalar-color-text-dimmed); }
+.local-file-identify { padding-block: 1rem; max-width: 48rem; }
+@media (max-width: 40em) {
+  .release-heading { grid-template-columns: 4.5rem minmax(0, 1fr); gap: 0.75rem; }
+  .release-heading h1 { font-size: 1.35rem; }
+  .release-row { gap: 0.75rem; }
+}

@@ -1,20 +1,6 @@
-/**
- * Wave 2 web tests: SetupPage bootstrap + guided onboarding wizard.
- * Covers: first-run admin creation, step progression with optional skips,
- * required-step skip refusal surfacing a product-facing message, and the
- * finished state calling back into the app.
- */
-import { describe, expect, it, vi, beforeEach, beforeAll } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MantineProvider } from "@mantine/core";
-import React from "react";
-
-/** Mantine's PasswordInput nests a second input; select the real one by name. */
-function fillPassword(value: string) {
-  const el = document.querySelector('input[name="password"]') as HTMLInputElement | null;
-  if (!el) throw new Error("password input not found");
-  fireEvent.change(el, { target: { value } });
-}
 import { SetupPage } from "../src/pages/SetupPage";
 import { api } from "../src/api";
 
@@ -24,40 +10,75 @@ vi.mock("../src/api", () => ({
     bootstrapAdmin: vi.fn(),
     onboarding: vi.fn(),
     onboardStep: vi.fn(),
+    diagnostics: vi.fn(),
+    libraries: vi.fn(),
+    createLibrary: vi.fn(),
+    validateLibrary: vi.fn(),
+    rescanLibrary: vi.fn(),
+    removeLibrary: vi.fn(),
   },
 }));
 
 const mockApi = vi.mocked(api, true);
 
-function renderSetup(onFinished = vi.fn()) {
-  const onFinishedFn = onFinished;
-  render(
-    <MantineProvider>
-      <SetupPage onFinished={onFinishedFn} />
-    </MantineProvider>,
-  );
-  return onFinishedFn;
-}
+const ids = [
+  "administrator",
+  "storage",
+  "libraries",
+  "download-engines",
+  "indexers",
+  "metadata",
+  "vpn-policy",
+  "final-health",
+] as const;
 
 const allPending = {
-  steps: Object.fromEntries(
-    [
-      "administrator",
-      "storage",
-      "libraries",
-      "download-engines",
-      "indexers",
-      "metadata",
-      "vpn-policy",
-      "final-health",
-    ].map((id) => [id, { status: "pending" }]),
-  ),
+  steps: Object.fromEntries(ids.map((id) => [id, { status: "pending" as const }])),
   complete: false,
 };
 
+const existingLibrary = {
+  id: "lib-1",
+  name: "Movies",
+  rootPath: "/media/movies",
+  kind: "movie" as const,
+  enabled: true,
+  createdAt: "2026-08-24T00:00:00.000Z",
+};
+
+function renderSetup(options: { bootstrapRequired?: boolean; onFinished?: () => void } = {}) {
+  const onFinished = options.onFinished ?? vi.fn();
+  render(
+    <MantineProvider>
+      <SetupPage onFinished={onFinished} bootstrapRequired={options.bootstrapRequired} />
+    </MantineProvider>,
+  );
+  return onFinished;
+}
+
+function fillPassword(value: string) {
+  const input = document.querySelector('input[name="password"]') as HTMLInputElement;
+  fireEvent.change(input, { target: { value } });
+}
+
+function installProgressingOnboarding() {
+  let current = structuredClone(allPending);
+  mockApi.onboarding.mockResolvedValue(current);
+  mockApi.onboardStep.mockImplementation(async (stepId, action) => {
+    current = {
+      steps: {
+        ...current.steps,
+        [stepId]: { status: action === "skip" ? "skipped" : "done" },
+      },
+      complete: false,
+    };
+    current.complete = ids.every((id) => current.steps[id]?.status !== "pending");
+    return current;
+  });
+}
+
 describe("SetupPage", () => {
   beforeAll(() => {
-    // jsdom lacks matchMedia; Mantine's color-scheme hook needs it.
     window.matchMedia =
       window.matchMedia ??
       ((query: string) =>
@@ -74,117 +95,113 @@ describe("SetupPage", () => {
   });
 
   beforeEach(() => {
+    cleanup();
     vi.clearAllMocks();
-    // testing-library auto-cleanup requires globals; run it explicitly.
-    document.body.innerHTML = "";
+    mockApi.login.mockResolvedValue({ ok: true });
+    mockApi.libraries.mockResolvedValue({ libraries: [] });
+    mockApi.diagnostics.mockResolvedValue({
+      versions: { node: "24", platform: "darwin", arch: "arm64" },
+      ready: true,
+      plugins: [],
+      eventCount: 0,
+      missingCapabilities: [],
+      transcoder: { ffmpegAvailable: true },
+      network: { vpnCapabilityMounted: false },
+    });
   });
 
-  it("creates the one-time administrator account", async () => {
+  it("creates the administrator and opens real library configuration", async () => {
     mockApi.bootstrapAdmin.mockResolvedValue({ ok: true });
-    mockApi.onboarding.mockResolvedValue(allPending);
+    installProgressingOnboarding();
     renderSetup();
 
-    fireEvent.change(screen.getByLabelText(/username/i), {
-      target: { value: "admin" },
-    });
     fillPassword("password-admin-1");
     fireEvent.click(screen.getByTestId("setup-create-admin"));
 
-    await waitFor(() => {
-      expect(mockApi.bootstrapAdmin).toHaveBeenCalledWith("admin", "password-admin-1");
-    });
-    await waitFor(() => {
-      expect(screen.getByText("Guided setup")).toBeTruthy();
-    });
+    await waitFor(() => expect(mockApi.bootstrapAdmin).toHaveBeenCalledWith("admin", "password-admin-1"));
+    await screen.findByRole("heading", { name: "Storage and libraries" });
+    expect(screen.getByRole("form", { name: /add a media library/i })).toBeTruthy();
+    expect(mockApi.onboardStep).toHaveBeenCalledWith("administrator", "complete");
   });
 
   it("surfaces a product-facing error when bootstrap is closed", async () => {
     mockApi.bootstrapAdmin.mockRejectedValue(
-      Object.assign(new Error("Setup is already complete. Sign in with your administrator account."), {
-        status: 403,
-      }),
+      Object.assign(new Error("Setup is already complete. Sign in with your administrator account."), { status: 403 }),
     );
     renderSetup();
 
     fillPassword("password-admin-1");
     fireEvent.click(screen.getByTestId("setup-create-admin"));
 
-    await waitFor(() => {
-      expect(screen.getByRole("alert").textContent).toMatch(/already complete/);
-    });
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toMatch(/already complete/i));
   });
 
-  it("walks steps, allows skipping optional ones, and finishes", async () => {
-    mockApi.bootstrapAdmin.mockResolvedValue({ ok: true });
-    const done = (id: string, status: "done" | "skipped" = "done") => ({
-      ...allPending,
-      steps: {
-        ...allPending.steps,
-        [id]: { status },
-      },
+  it("resumes with a configured library, records optional steps as skipped, and runs health", async () => {
+    installProgressingOnboarding();
+    mockApi.libraries.mockResolvedValue({ libraries: [existingLibrary] });
+    mockApi.validateLibrary.mockResolvedValue({
+      results: [{ library: existingLibrary, ok: true, issues: [] }],
     });
-    // Track cumulative progress so earlier steps stay finished across calls.
-    let cumulative = allPending;
-    mockApi.onboarding.mockResolvedValue(allPending);
-    mockApi.onboardStep.mockImplementation((stepId, action) => {
-      const status = action === "skip" ? "skipped" : "done";
-      cumulative = {
-        ...cumulative,
-        steps: { ...cumulative.steps, [stepId]: { status } },
-      };
-      return Promise.resolve(cumulative);
-    });
+    const onFinished = renderSetup({ bootstrapRequired: false });
 
-    // Start past the admin form.
-    mockApi.bootstrapAdmin.mockResolvedValueOnce({ ok: true });
-    const onFinished = renderSetup();
-    fillPassword("password-admin-1");
-    fireEvent.click(screen.getByTestId("setup-create-admin"));
-    await waitFor(() => screen.getByText("Guided setup"));
-    // The wizard's refresh() runs in an effect after bootstrap; wait for the
-    // first action button to appear before interacting.
-    await waitFor(() => screen.getByTestId("setup-done-administrator"));
+    await screen.findByRole("heading", { name: "Storage and libraries" });
+    await screen.findByText("/media/movies", { exact: false });
+    fireEvent.click(screen.getByRole("button", { name: /test path/i }));
+    await screen.findByText(/path is ready/i);
+    fireEvent.click(screen.getByRole("button", { name: /continue with this library/i }));
 
-    // Complete the administrator step.
-    fireEvent.click(screen.getByTestId("setup-done-administrator"));
-    await waitFor(() => {
-      expect(screen.getByTestId("setup-step-administrator").textContent).toMatch(/Done/);
-    });
-    // Wait for the storage step's action button (next pending required step).
-    await waitFor(() => screen.getByTestId("setup-done-storage"));
+    for (const step of ["download-engines", "indexers", "metadata", "vpn-policy"]) {
+      await waitFor(() => expect(screen.getByTestId(`setup-step-${step}`)).toBeTruthy());
+      fireEvent.click(screen.getByRole("button", { name: /skip for now/i }));
+    }
 
-    // Skip an optional step: walk to download-engines by completing the
-    // intervening steps through the API mock, then verify the skip path.
-    fireEvent.click(screen.getByTestId("setup-done-storage"));
-    await waitFor(() => {
-      expect(screen.getByTestId("setup-step-storage").textContent).toMatch(/Done/);
-    });
-    await waitFor(() => screen.getByTestId("setup-done-libraries"));
-    fireEvent.click(screen.getByTestId("setup-done-libraries"));
-    await waitFor(() => screen.getByRole("button", { name: /skip for now/i }));
-    fireEvent.click(screen.getByRole("button", { name: /skip for now/i }));
-    await waitFor(() => {
-      expect(screen.getByTestId("setup-step-download-engines").textContent).toMatch(/Skipped/);
-    });
+    await waitFor(() => expect(screen.getByTestId("setup-step-final-health")).toBeTruthy());
+    await screen.findByText(/core services are ready/i);
+    fireEvent.click(screen.getByRole("button", { name: /finish setup/i }));
+
+    await waitFor(() => expect(onFinished).toHaveBeenCalledTimes(1));
+    expect(mockApi.onboardStep).toHaveBeenCalledWith("storage", "complete");
+    expect(mockApi.onboardStep).toHaveBeenCalledWith("libraries", "complete");
     expect(mockApi.onboardStep).toHaveBeenCalledWith("download-engines", "skip");
+    expect(mockApi.diagnostics).toHaveBeenCalled();
   });
 
-  it("shows a recovery message when a step update fails", async () => {
-    mockApi.bootstrapAdmin.mockResolvedValue({ ok: true });
-    mockApi.onboarding.mockResolvedValue(allPending);
-    mockApi.onboardStep.mockRejectedValue(
-      Object.assign(new Error("VPN policy is required and cannot be skipped."), { status: 400 }),
-    );
-    renderSetup();
-    fillPassword("password-admin-1");
-    fireEvent.click(screen.getByTestId("setup-create-admin"));
-    await waitFor(() => screen.getByText("Guided setup"));
-    await waitFor(() => screen.getByTestId("setup-done-administrator"));
-
-    // First visible action button belongs to the pending administrator step.
-    fireEvent.click(screen.getByTestId("setup-done-administrator"));
-    await waitFor(() => {
-      expect(screen.getByRole("alert").textContent).toMatch(/cannot be skipped|earlier setup steps/);
+  it("does not complete library setup until a current path validation succeeds", async () => {
+    installProgressingOnboarding();
+    mockApi.libraries.mockResolvedValue({ libraries: [existingLibrary] });
+    mockApi.validateLibrary.mockResolvedValue({
+      results: [{
+        library: existingLibrary,
+        ok: false,
+        issues: [{ code: "root_missing", detail: "The saved root no longer exists." }],
+      }],
     });
+    renderSetup({ bootstrapRequired: false });
+
+    await screen.findByText("/media/movies", { exact: false });
+    const continueButton = screen.getByRole("button", { name: /continue with this library/i });
+    expect((continueButton as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/test at least one saved library path successfully/i)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /test path/i }));
+    await screen.findByText(/saved root no longer exists/i);
+    expect((continueButton as HTMLButtonElement).disabled).toBe(true);
+    expect(mockApi.onboardStep).not.toHaveBeenCalledWith("storage", "complete");
+    expect(mockApi.onboardStep).not.toHaveBeenCalledWith("libraries", "complete");
+  });
+
+  it("explains that optional capability setup is skipped, not configured", async () => {
+    const state = structuredClone(allPending);
+    state.steps.administrator.status = "done";
+    state.steps.storage.status = "done";
+    state.steps.libraries.status = "done";
+    mockApi.onboarding.mockResolvedValue(state);
+    mockApi.onboardStep.mockRejectedValue(new Error("Download engine state could not be saved."));
+    renderSetup({ bootstrapRequired: false });
+
+    await screen.findByTestId("setup-step-download-engines");
+    expect(screen.getByText(/records it as skipped, not configured/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /skip for now/i }));
+    await waitFor(() => expect(screen.getByText(/download engine state could not be saved/i)).toBeTruthy());
   });
 });

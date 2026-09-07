@@ -4,12 +4,13 @@
  * per-user UI preferences + the themes table. Preview state is separate from
  * saved state so "revert" is always possible without a reload.
  */
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { useMantineColorScheme } from "@mantine/core";
 import {
   applyTokens,
+  resolveThemeTokens,
   sanitizeTokenOverrides,
-  LIGHT_TOKENS,
+  TOKEN_PREFIX,
   type ThemeScheme,
   type TokenMap,
 } from "./tokens";
@@ -35,6 +36,10 @@ interface ThemeContextValue {
   clearPreview: () => void;
   /** Persist preview (or explicit tokens) as the user's theme + preference. */
   save: (name: string, tokens: TokenMap) => Promise<void>;
+  /** Activate an existing saved theme for the current user. */
+  activate: (themeId: string) => Promise<void>;
+  /** Apply a built-in complete palette without creating a saved-theme record. */
+  activatePreset: (scheme: ThemeScheme, tokens: TokenMap) => Promise<void>;
   /** Drop preview and re-apply the last saved state. */
   revert: () => void;
 }
@@ -55,9 +60,6 @@ export function ThemeEngineProvider({ children, adminId }: { children: React.Rea
   // Wave 8: built-in light/dark scheme. Dark stays the product default.
   const [scheme, setSchemeState] = useState<ThemeScheme>("dark");
   const { setColorScheme } = useMantineColorScheme();
-  // Latest known grid prefs, so a theme save can merge instead of clobbering
-  // them with hardcoded defaults (review finding on parent t_89f131b7).
-  const gridPrefsRef = useRef<{ gridDensity?: string; hiddenColumns?: string[] }>({});
 
   // Load saved preferences + theme catalogue once.
   useEffect(() => {
@@ -68,11 +70,10 @@ export function ThemeEngineProvider({ children, adminId }: { children: React.Rea
         : {};
       const catalogue = await api.themes().then((r) => r.themes).catch(() => []);
       if (cancelled) return;
-      setThemes(catalogue);
-      gridPrefsRef.current = {
-        gridDensity: typeof prefs.gridDensity === "string" ? prefs.gridDensity : undefined,
-        hiddenColumns: Array.isArray(prefs.hiddenColumns) ? (prefs.hiddenColumns as string[]) : undefined,
-      };
+      setThemes(catalogue.flatMap((theme) => {
+        const checked = sanitizeTokenOverrides(theme.tokens);
+        return checked.ok ? [{ ...theme, tokens: checked.tokens }] : [];
+      }));
       const themeId = typeof prefs.themeId === "string" ? prefs.themeId : null;
       const overrides = (prefs.tokenOverrides && typeof prefs.tokenOverrides === "object")
         ? (prefs.tokenOverrides as TokenMap)
@@ -92,8 +93,7 @@ export function ThemeEngineProvider({ children, adminId }: { children: React.Rea
   // Apply saved + preview to :root whenever either changes. The scheme is a
   // base palette: light swaps in the light token set under any overrides.
   useEffect(() => {
-    const base: TokenMap = scheme === "light" ? { ...LIGHT_TOKENS } : {};
-    applyTokens(document.documentElement, { ...base, ...(saved ?? {}), ...(preview ?? {}) });
+    applyTokens(document.documentElement, resolveThemeTokens(scheme, saved, preview));
   }, [saved, preview, scheme]);
 
   /** Switch the built-in scheme and persist the choice per user. */
@@ -101,10 +101,16 @@ export function ThemeEngineProvider({ children, adminId }: { children: React.Rea
     (next: ThemeScheme) => {
       setSchemeState(next);
       setColorScheme(next);
+      setSaved({});
+      setPreview(null);
+      setActiveThemeId(null);
       if (adminId) {
         void api
-          .uiPreferences(adminId)
-          .then((r) => api.saveUiPreferences(adminId, { ...r.preferences, colorScheme: next }))
+          .saveUiPreferences(adminId, {
+            colorScheme: next,
+            themeId: null,
+            tokenOverrides: {},
+          })
           .catch(() => undefined);
       }
     },
@@ -122,39 +128,80 @@ export function ThemeEngineProvider({ children, adminId }: { children: React.Rea
 
   const revert = useCallback(() => {
     setPreview(null);
-    applyTokens(document.documentElement, saved ?? {});
-  }, [saved]);
+    applyTokens(document.documentElement, resolveThemeTokens(scheme, saved));
+  }, [saved, scheme]);
 
   const save = useCallback(
     async (name: string, tokens: TokenMap) => {
       const merged: TokenMap = { ...(saved ?? {}), ...tokens };
       // Persist as a named theme, then point the user's preference at it and
       // store the raw overrides so the tokens survive theme deletion.
-      const created = await api.saveTheme(null, name, merged as Record<string, string>);
+      const created = await api.saveTheme(
+        null,
+        name,
+        Object.fromEntries(Object.entries(merged).map(([key, value]) => [`${TOKEN_PREFIX}${key}`, value])),
+      );
       const themeId = (created as { theme?: { id?: string } }).theme?.id ?? null;
       if (adminId) {
-        // Merge with the latest known grid prefs — never overwrite them
-        // with hardcoded defaults (review defect: density reset on save).
-        const grid = gridPrefsRef.current;
         await api.saveUiPreferences(adminId, {
           themeId,
           tokenOverrides: merged,
-          ...(grid.gridDensity !== undefined ? { gridDensity: grid.gridDensity } : {}),
-          ...(grid.hiddenColumns !== undefined ? { hiddenColumns: [...grid.hiddenColumns] } : {}),
+          colorScheme: scheme,
         });
       }
       setSaved(merged);
       setPreview(null);
       setActiveThemeId(themeId);
       const catalogue = await api.themes().then((r) => r.themes).catch(() => []);
-      setThemes(catalogue);
+      setThemes(catalogue.flatMap((theme) => {
+        const checked = sanitizeTokenOverrides(theme.tokens);
+        return checked.ok ? [{ ...theme, tokens: checked.tokens }] : [];
+      }));
     },
-    [adminId, saved],
+    [adminId, saved, scheme],
+  );
+
+  const activate = useCallback(
+    async (themeId: string) => {
+      const selected = themes.find((theme) => theme.id === themeId);
+      if (!selected) throw new Error("Saved theme not found.");
+      if (adminId) {
+        await api.saveUiPreferences(adminId, {
+          themeId,
+          tokenOverrides: selected.tokens,
+          colorScheme: scheme,
+        });
+      }
+      setSaved(selected.tokens);
+      setPreview(null);
+      setActiveThemeId(themeId);
+    },
+    [adminId, scheme, themes],
+  );
+
+  const activatePreset = useCallback(
+    async (nextScheme: ThemeScheme, tokens: TokenMap) => {
+      const checked = sanitizeTokenOverrides(tokens as Record<string, string>);
+      if (!checked.ok) throw new Error(checked.errors.join(" "));
+      if (adminId) {
+        await api.saveUiPreferences(adminId, {
+          colorScheme: nextScheme,
+          themeId: null,
+          tokenOverrides: checked.tokens,
+        });
+      }
+      setSchemeState(nextScheme);
+      setColorScheme(nextScheme);
+      setSaved(checked.tokens);
+      setPreview(null);
+      setActiveThemeId(null);
+    },
+    [adminId, setColorScheme],
   );
 
   const value = useMemo<ThemeContextValue>(
-    () => ({ saved, preview, themes, activeThemeId, scheme, setScheme, applyPreview, clearPreview, save, revert }),
-    [saved, preview, themes, activeThemeId, scheme, setScheme, applyPreview, clearPreview, save, revert],
+    () => ({ saved, preview, themes, activeThemeId, scheme, setScheme, applyPreview, clearPreview, save, activate, activatePreset, revert }),
+    [saved, preview, themes, activeThemeId, scheme, setScheme, applyPreview, clearPreview, save, activate, activatePreset, revert],
   );
 
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;

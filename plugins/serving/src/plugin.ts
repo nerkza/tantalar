@@ -28,11 +28,12 @@ import {
   type LibraryEntry,
   type BrowserCapabilities,
   type PlaybackDecision,
+  type PlaybackPolicy,
   type ResumePoint,
 } from "@tantalar/contracts";
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 
 const SERVING_CAPABILITY = "dev.tantalar.capability.serving";
 const PLUGIN_ID = "dev.tantalar.plugin.serving";
@@ -65,6 +66,20 @@ const externalSubtitleContent = new Map<string, { fileId: string; content: strin
 /** Embedded subtitle content declared at registration: trackId -> content. */
 const embeddedSubtitleContent = new Map<string, { fileId: string; content: string }>();
 
+const DEFAULT_PLAYBACK_POLICY: PlaybackPolicy = {
+  preferDirectPlay: true,
+  localBitrateKbps: 40_000,
+  remoteBitrateKbps: 8_000,
+  maxConcurrentTranscodes: 2,
+  hardwareAcceleration: "auto",
+  defaultAudioLanguage: "und",
+  defaultSubtitleLanguage: "und",
+  subtitleMode: "manual",
+  transcodeCacheMaxBytes: 10 * 1024 * 1024 * 1024,
+  idleTimeoutMs: 60_000,
+};
+let playbackPolicy: PlaybackPolicy = { ...DEFAULT_PLAYBACK_POLICY };
+
 /**
  * Optional JSON snapshot file for catalog/viewer state. The plugin owns no
  * database (SDK rule), so a remount after a crash restores its catalog,
@@ -86,6 +101,7 @@ type StorageBridge = {
 };
 const STATE_DOC_KEY = "state";
 let storeBridge: StorageBridge | null = null;
+let startupPromise: Promise<void> | null = null;
 const buildSnapshot = () => ({
   entries: [...entries.values()],
   viewers: [...viewers].map(([userId, libs]) => ({ userId, libraries: [...libs] })),
@@ -95,6 +111,7 @@ const buildSnapshot = () => ({
   externalSubtitleContent: [...externalSubtitleContent].map(([trackId, v]) => ({ trackId, ...v })),
   embeddedSubtitleContent: [...embeddedSubtitleContent].map(([trackId, v]) => ({ trackId, ...v })),
   workers: [...durableWorkers].map(([sessionId, pid]) => ({ sessionId, pid })),
+  playbackPolicy,
 });
 
 function applySnapshot(snap: Record<string, unknown>): void {
@@ -107,6 +124,7 @@ function applySnapshot(snap: Record<string, unknown>): void {
     externalSubtitleContent?: Array<{ trackId: string; fileId: string; content: string }>;
     embeddedSubtitleContent?: Array<{ trackId: string; fileId: string; content: string }>;
     workers?: Array<{ sessionId: string; pid: number }>;
+    playbackPolicy?: PlaybackPolicy;
   };
   for (const e of s.entries ?? []) entries.set(e.fileId, e);
   for (const v of s.viewers ?? []) viewers.set(v.userId, new Set(v.libraries));
@@ -118,6 +136,7 @@ function applySnapshot(snap: Record<string, unknown>): void {
   // Worker records restore BEFORE cleanupOrphans runs at mount, so pids
   // recorded by a crashed instance are killed during startup.
   for (const w of s.workers ?? []) durableWorkers.set(w.sessionId, w.pid);
+  if (s.playbackPolicy) setPlaybackPolicy(s.playbackPolicy, false);
 }
 
 function persistState(): void {
@@ -132,16 +151,16 @@ function persistState(): void {
   void storeBridge?.put(STATE_DOC_KEY, snapshot).catch(() => undefined);
 }
 
-function restoreState(): void {
+async function restoreState(): Promise<void> {
   // Durable document store wins when present; fall back to the file.
   if (storeBridge) {
-    storeBridge
-      .get(STATE_DOC_KEY)
-      .then((hit) => {
-        if (hit && hit.doc && typeof hit.doc === "object") applySnapshot(hit.doc as Record<string, unknown>);
-        else if (stateFile) restoreFromFile();
-      })
-      .catch(() => restoreFromFile());
+    try {
+      const hit = await storeBridge.get(STATE_DOC_KEY);
+      if (hit && hit.doc && typeof hit.doc === "object") applySnapshot(hit.doc as Record<string, unknown>);
+      else restoreFromFile();
+    } catch {
+      restoreFromFile();
+    }
     return;
   }
   restoreFromFile();
@@ -183,7 +202,7 @@ interface TranscodeConfig {
   qualityLadder: readonly string[];
   /**
    * Directory where workers write their HLS output. When set together with
-   * ffmpegArgs containing "{{sessionId}}", a REAL ffmpeg process is spawned
+   * ffmpegArgs containing "{{sessionIdPlaceholder}}", a REAL ffmpeg process is spawned
    * per session and the HTTP surface serves its produced segment files.
    * {{sessionIdPlaceholder}} inside an arg expands to
    * <segmentsDir>/<sessionId>.
@@ -205,11 +224,22 @@ interface Session {
   readonly sessionId: string;
   readonly fileId: string;
   readonly userId: string;
+  readonly mode: "direct" | "hls";
+  readonly reason: string;
+  readonly client: string;
+  readonly network: "local" | "remote";
+  readonly maxBitrateKbps: number;
   readonly qualities: readonly string[];
+  readonly audioStreamIndex: number | null;
+  readonly audioLanguage: string | null;
+  readonly subtitleTrackId: string | null;
   createdAt: number;
   lastActivityAt: number;
+  positionMs: number;
+  durationMs: number;
   closed: boolean;
   closeReason?: string;
+  endedAt?: number;
 }
 
 const sessions = new Map<string, Session>();
@@ -237,22 +267,79 @@ function visibleEntries(userId: string): LibraryEntry[] {
 
 // ---- Negotiation ------------------------------------------------------------------
 
-function negotiate(entry: LibraryEntry, caps: BrowserCapabilities, userId: string): PlaybackDecision {
-  if (
+interface TrackSelection {
+  audioStreamIndex: number | null;
+  audioLanguage: string | null;
+  subtitleTrackId: string | null;
+}
+
+function selectTracks(entry: LibraryEntry, caps: BrowserCapabilities): TrackSelection {
+  const audioTracks = entry.audioTracks ?? [];
+  const defaultAudio = audioTracks.find((track) => track.default) ?? audioTracks[0];
+  const requestedAudio = playbackPolicy.defaultAudioLanguage.toLowerCase();
+  const audio = requestedAudio === "und"
+    ? defaultAudio
+    : audioTracks.find((track) => track.lang.toLowerCase() === requestedAudio) ?? defaultAudio;
+  const requestedSubtitle = playbackPolicy.defaultSubtitleLanguage.toLowerCase();
+  const directSubtitles = caps?.canDirectSubtitles ?? [];
+  const subtitle = playbackPolicy.subtitleMode === "always"
+    ? entry.subtitles.find((track) => track.lang.toLowerCase() === requestedSubtitle
+      && directSubtitles.includes(track.format))
+      ?? entry.subtitles.find((track) => track.default && directSubtitles.includes(track.format))
+    : undefined;
+  return {
+    audioStreamIndex: audio?.streamIndex ?? null,
+    audioLanguage: audio?.lang ?? null,
+    subtitleTrackId: subtitle?.trackId ?? null,
+  };
+}
+
+function directPlayEligible(entry: LibraryEntry, caps: BrowserCapabilities, selection: TrackSelection): boolean {
+  const defaultAudio = entry.audioTracks?.find((track) => track.default) ?? entry.audioTracks?.[0];
+  return Boolean(
     caps &&
     typeof caps === "object" &&
     Array.isArray(caps.canPlayContainers) &&
     isDirectPlayable(entry, caps)
-  ) {
-    return { mode: "direct", streamUrl: `/api/v1/stream/${entry.fileId}` };
+    && (selection.audioStreamIndex === null || selection.audioStreamIndex === defaultAudio?.streamIndex)
+  );
+}
+
+function playbackReason(entry: LibraryEntry, caps: BrowserCapabilities, mode: "direct" | "hls"): string {
+  if (mode === "direct") return "The browser supports the file container, video codec and audio codec.";
+  if (!playbackPolicy.preferDirectPlay) return "Playback policy prefers transcoding.";
+  if (!caps?.canPlayContainers?.includes(entry.container)) return `The browser does not support the ${entry.container} container.`;
+  if (!caps?.canPlayVideo?.includes(entry.videoCodec)) return `The browser does not support ${entry.videoCodec} video.`;
+  if (!caps?.canPlayAudio?.includes(entry.audioCodec)) return `The browser does not support ${entry.audioCodec} audio.`;
+  return "The file requires a browser-compatible HLS rendition.";
+}
+
+function negotiate(
+  entry: LibraryEntry,
+  caps: BrowserCapabilities,
+  userId: string,
+  client: string,
+  network: "local" | "remote",
+): PlaybackDecision {
+  const selection = selectTracks(entry, caps);
+  const direct = playbackPolicy.preferDirectPlay && directPlayEligible(entry, caps, selection);
+  const reason = playbackReason(entry, caps, direct ? "direct" : "hls");
+  if (direct) {
+    const session = openSession(entry.fileId, "direct", reason, [], userId, client, network, selection);
+    void emitFn?.(EventTypes.PlaybackStarted, {
+      sessionId: session.sessionId,
+      userId,
+      fileId: entry.fileId,
+      mode: "direct",
+    }, { correlationId: session.sessionId });
+    return session;
   }
-  // Unsupported combo → HLS session with selectable qualities.
-  return openSession(entry.fileId, "negotiate", config.qualityLadder, userId);
+  return openSession(entry.fileId, "hls", reason, config.qualityLadder, userId, client, network, selection);
 }
 
 // ---- Transcode lifecycle ------------------------------------------------------------
 
-function spawnWorker(session: Session): void {
+function spawnWorker(session: Session, inputPath?: string): void {
   if (workers.has(session.sessionId)) return;
   if (workers.size >= config.maxWorkers)
     throw new ServingError("session_limit", `worker cap reached (${config.maxWorkers})`);
@@ -264,13 +351,26 @@ function spawnWorker(session: Session): void {
       /* worker output will fail visibly if this cannot be created */
     }
   }
-  const args = config.ffmpegArgs.map((a) =>
-    dir && a.includes("{{sessionIdPlaceholder}}")
-      ? a.replaceAll("{{sessionIdPlaceholder}}", dir)
-      : a === "{{sessionId}}"
-        ? session.sessionId
-        : a,
-  );
+  if (config.ffmpegArgs.some((arg) => arg.includes("{{inputPath}}")) && !inputPath) {
+    throw new ServingError("no_worker", "transcoder input path was not supplied");
+  }
+  const args = config.ffmpegArgs.map((arg, index) => {
+    let resolved = arg;
+    if (dir) resolved = resolved.replaceAll("{{sessionIdPlaceholder}}", dir);
+    if (inputPath) resolved = resolved.replaceAll("{{inputPath}}", inputPath);
+    if (resolved === "0:a:0?" && session.audioStreamIndex !== null) resolved = `0:${session.audioStreamIndex}?`;
+    if (config.ffmpegArgs[index - 1] === "-maxrate") resolved = `${session.maxBitrateKbps}k`;
+    if (config.ffmpegArgs[index - 1] === "-bufsize") resolved = `${session.maxBitrateKbps * 2}k`;
+    return resolved === "{{sessionId}}" ? session.sessionId : resolved;
+  });
+  const inputIndex = args.indexOf("-i");
+  if (inputIndex >= 0 && playbackPolicy.hardwareAcceleration !== "software") {
+    args.splice(inputIndex, 0, "-hwaccel", playbackPolicy.hardwareAcceleration);
+  }
+  if (args.includes("hls")) {
+    const outputIndex = Math.max(0, args.length - 1);
+    args.splice(outputIndex, 0, "-fs", String(playbackPolicy.transcodeCacheMaxBytes));
+  }
   let child: ChildProcess;
   try {
     child = spawn(config.ffmpegCommand, args, { stdio: "ignore" });
@@ -294,36 +394,58 @@ function spawnWorker(session: Session): void {
 
 function openSession(
   fileId: string,
+  mode: "direct" | "hls",
   reason: string,
   qualities: readonly string[],
   userId: string,
-): { mode: "hls"; sessionId: string; manifestUrl: string; qualities: readonly string[] } & { reason: string } {
+  client = "Unknown web client",
+  network: "local" | "remote" = "remote",
+  selection: TrackSelection = { audioStreamIndex: null, audioLanguage: null, subtitleTrackId: null },
+): PlaybackDecision & { reason: string } {
   const sessionId = uuidv7();
   if (!userId) throw new ServingError("invalid_request", "userId required to open a session");
   const session: Session = {
     sessionId,
     fileId,
     userId,
+    mode,
+    reason,
+    client: client.slice(0, 160),
+    network,
+    maxBitrateKbps: network === "local" ? playbackPolicy.localBitrateKbps : playbackPolicy.remoteBitrateKbps,
     qualities,
+    audioStreamIndex: selection.audioStreamIndex,
+    audioLanguage: selection.audioLanguage,
+    subtitleTrackId: selection.subtitleTrackId,
     createdAt: Date.now(),
     lastActivityAt: Date.now(),
+    positionMs: 0,
+    durationMs: 0,
     closed: false,
   };
   sessions.set(sessionId, session);
-  void emitFn?.(EventTypes.TranscodeSessionOpened, {
-    sessionId,
-    fileId,
-    reason,
-    qualities: [...qualities],
-    activeSessions: countActiveSessions(),
-  });
+  if (mode === "hls") {
+    void emitFn?.(EventTypes.TranscodeSessionOpened, {
+      sessionId,
+      fileId,
+      reason,
+      qualities: [...qualities],
+      activeSessions: countActiveSessions(),
+    }, { correlationId: sessionId });
+  }
   ensureWatchdog();
+  const selected = {
+    ...(selection.audioLanguage ? { audioLanguage: selection.audioLanguage } : {}),
+    ...(selection.subtitleTrackId ? { subtitleTrackId: selection.subtitleTrackId } : {}),
+  };
+  if (mode === "direct") return { mode: "direct", sessionId, streamUrl: `/api/v1/stream/${fileId}?sessionId=${encodeURIComponent(sessionId)}`, reason, ...selected };
   return {
     mode: "hls",
     sessionId,
     manifestUrl: `/api/v1/hls/${sessionId}/manifest.m3u8`,
     qualities: [...qualities],
     reason,
+    ...selected,
   };
 }
 
@@ -351,23 +473,108 @@ async function closeSession(sessionId: string, reason: string): Promise<{ closed
   if (session.closed) return { closed: true };
   session.closed = true;
   session.closeReason = reason;
+  session.endedAt = Date.now();
+  session.lastActivityAt = session.endedAt;
   const worker = workers.get(sessionId);
+  const removeOutput = () => {
+    if (!config.segmentsDir) return;
+    try {
+      rmSync(`${config.segmentsDir}/${sessionId}`, { recursive: true, force: true });
+    } catch {
+      /* best-effort cleanup after the worker exits */
+    }
+  };
   if (worker) {
     workers.delete(sessionId);
-    try {
-      worker.child.kill("SIGKILL");
-    } catch {
-      /* already gone */
+    if (worker.child.exitCode !== null) {
+      removeOutput();
+    } else {
+      worker.child.once("exit", removeOutput);
+      try {
+        worker.child.kill("SIGKILL");
+      } catch {
+        /* already gone */
+        removeOutput();
+      }
     }
+  } else {
+    removeOutput();
   }
   forgetWorker(sessionId);
-  await emitFn?.(EventTypes.TranscodeSessionClosed, {
+  if (session.mode === "hls") {
+    await emitFn?.(EventTypes.TranscodeSessionClosed, {
+      sessionId,
+      fileId: session.fileId,
+      reason,
+      lifetimeMs: Date.now() - session.createdAt,
+    }, { correlationId: sessionId });
+  }
+  await emitFn?.(EventTypes.PlaybackEnded, {
     sessionId,
     fileId: session.fileId,
+    userId: session.userId,
+    mode: session.mode,
     reason,
-    lifetimeMs: Date.now() - session.createdAt,
-  });
+    positionMs: session.positionMs,
+    durationMs: session.durationMs,
+  }, { correlationId: sessionId });
   return { closed: true };
+}
+
+function assertPolicy(input: PlaybackPolicy): PlaybackPolicy {
+  const integer = (value: number, min: number, max: number, name: string) => {
+    if (!Number.isInteger(value) || value < min || value > max) throw new ServingError("invalid_request", `${name} is out of range`);
+    return value;
+  };
+  const language = (value: string, name: string) => {
+    if (!/^(?:und|[a-z]{2,3}(?:-[A-Z]{2})?)$/.test(value)) throw new ServingError("invalid_request", `${name} is invalid`);
+    return value;
+  };
+  if (!["manual", "always", "off"].includes(input.subtitleMode)) throw new ServingError("invalid_request", "subtitleMode is invalid");
+  if (!/^[a-z0-9_-]{2,32}$/i.test(input.hardwareAcceleration)) throw new ServingError("invalid_request", "hardwareAcceleration is invalid");
+  return {
+    preferDirectPlay: input.preferDirectPlay === true,
+    localBitrateKbps: integer(input.localBitrateKbps, 500, 200_000, "localBitrateKbps"),
+    remoteBitrateKbps: integer(input.remoteBitrateKbps, 500, 200_000, "remoteBitrateKbps"),
+    maxConcurrentTranscodes: integer(input.maxConcurrentTranscodes, 1, 32, "maxConcurrentTranscodes"),
+    hardwareAcceleration: input.hardwareAcceleration,
+    defaultAudioLanguage: language(input.defaultAudioLanguage, "defaultAudioLanguage"),
+    defaultSubtitleLanguage: language(input.defaultSubtitleLanguage, "defaultSubtitleLanguage"),
+    subtitleMode: input.subtitleMode,
+    transcodeCacheMaxBytes: integer(input.transcodeCacheMaxBytes, 256 * 1024 * 1024, 1024 * 1024 * 1024 * 1024, "transcodeCacheMaxBytes"),
+    idleTimeoutMs: integer(input.idleTimeoutMs, 10_000, 24 * 60 * 60 * 1000, "idleTimeoutMs"),
+  };
+}
+
+function setPlaybackPolicy(input: PlaybackPolicy, persist = true): PlaybackPolicy {
+  playbackPolicy = assertPolicy(input);
+  config.maxWorkers = playbackPolicy.maxConcurrentTranscodes;
+  config.idleTimeoutMs = playbackPolicy.idleTimeoutMs;
+  if (persist) persistState();
+  return playbackPolicy;
+}
+
+function sessionRecord(session: Session) {
+  const entry = entries.get(session.fileId);
+  return {
+    sessionId: session.sessionId,
+    fileId: session.fileId,
+    title: entry?.title ?? "Unknown title",
+    userId: session.userId,
+    client: session.client,
+    network: session.network,
+    mode: session.mode,
+    state: session.closed ? "ended" : workers.has(session.sessionId) ? "transcoding" : session.mode === "hls" ? "waiting" : "playing",
+    positionMs: session.positionMs,
+    durationMs: session.durationMs,
+    startedAt: new Date(session.createdAt).toISOString(),
+    endedAt: session.endedAt ? new Date(session.endedAt).toISOString() : null,
+    closeReason: session.closeReason ?? null,
+    workerAlive: workers.has(session.sessionId),
+    maxBitrateKbps: session.maxBitrateKbps,
+    audioLanguage: session.audioLanguage,
+    subtitleTrackId: session.subtitleTrackId,
+  };
 }
 
 /** Kill -9 recovery: at boot every recorded worker is presumed orphaned. */
@@ -452,11 +659,20 @@ const plugin: PluginDefinition = definePlugin({
     // Restore from the durable document store (preferred) or the legacy
     // snapshot file; orphan-worker cleanup runs AFTER restore so recorded
     // pids from a crashed instance are killed during startup.
-    restoreState();
-    const orphans = await cleanupOrphans();
-    ctx.log("info", `serving mounted; cleaned ${orphans} orphaned worker record(s)`);
+    const startup = (async () => {
+      await restoreState();
+      const orphans = await cleanupOrphans();
+      ctx.log("info", `serving mounted; cleaned ${orphans} orphaned worker record(s)`);
+    })();
+    startupPromise = startup;
+    try {
+      await startup;
+    } finally {
+      if (startupPromise === startup) startupPromise = null;
+    }
   },
   async unmount(ctx) {
+    await startupPromise;
     // Cancel every live session and worker on unmount.
     for (const s of [...sessions.values()]) {
       if (!s.closed) await closeSession(s.sessionId, "unmount");
@@ -487,6 +703,44 @@ const plugin: PluginDefinition = definePlugin({
           if (typeof c.segmentsDir === "string" && c.segmentsDir.length > 0) config.segmentsDir = c.segmentsDir;
           if (c.segmentsDir === null) config.segmentsDir = null;
           return { configured: true, maxWorkers: config.maxWorkers };
+        }
+        case "playback-policy":
+          return { policy: playbackPolicy };
+        case "set-playback-policy": {
+          const policy = setPlaybackPolicy(payload as unknown as PlaybackPolicy);
+          await emitFn?.(EventTypes.PlaybackPolicyUpdated, {
+            maxConcurrentTranscodes: policy.maxConcurrentTranscodes,
+            preferDirectPlay: policy.preferDirectPlay,
+            hardwareAcceleration: policy.hardwareAcceleration,
+          });
+          return { policy };
+        }
+        case "playback-sessions": {
+          const recentCutoff = Date.now() - 60 * 60 * 1000;
+          return {
+            sessions: [...sessions.values()]
+              .filter((session) => !session.closed || (session.endedAt ?? 0) >= recentCutoff)
+              .sort((a, b) => b.createdAt - a.createdAt)
+              .map(sessionRecord),
+          };
+        }
+        case "preview-decision": {
+          const entry = requireEntry(String(payload.fileId ?? ""));
+          const caps = payload.capabilities as BrowserCapabilities;
+          const network = payload.network === "local" ? "local" : "remote";
+          const selection = selectTracks(entry, caps);
+          const mode = playbackPolicy.preferDirectPlay && directPlayEligible(entry, caps, selection) ? "direct" : "hls";
+          return {
+            fileId: entry.fileId,
+            title: entry.title,
+            mode,
+            reason: playbackReason(entry, caps, mode),
+            video: mode === "direct" ? `${entry.videoCodec} passthrough` : `${entry.videoCodec} to H.264`,
+            audio: `${selection.audioLanguage ?? "default"} · ${mode === "direct" ? `${entry.audioCodec} passthrough` : `${entry.audioCodec} to AAC`}`,
+            subtitles: selection.subtitleTrackId ?? playbackPolicy.subtitleMode,
+            maxBitrateKbps: network === "local" ? playbackPolicy.localBitrateKbps : playbackPolicy.remoteBitrateKbps,
+            network,
+          };
         }
 
         // ---- Catalog registration (synthetic fixtures in tests) ----
@@ -569,14 +823,13 @@ const plugin: PluginDefinition = definePlugin({
           const entry = requireEntry(String(payload.fileId ?? ""));
           assertVisible(userId, entry.libraryId);
           const caps = payload.capabilities as BrowserCapabilities;
-          const decision = negotiate(entry, caps, userId);
-          if (decision.mode === "direct") {
-            await emitFn?.(EventTypes.PlaybackStarted, {
-              userId,
-              fileId: entry.fileId,
-              mode: "direct",
-            });
-          }
+          const decision = negotiate(
+            entry,
+            caps,
+            userId,
+            typeof payload.client === "string" ? payload.client : "Unknown web client",
+            payload.network === "local" ? "local" : "remote",
+          );
           return { decision };
         }
 
@@ -626,6 +879,13 @@ const plugin: PluginDefinition = definePlugin({
             updatedAt: new Date().toISOString(),
           };
           resumes.set(key, point);
+          for (const session of sessions.values()) {
+            if (!session.closed && session.userId === userId && session.fileId === fileId) {
+              session.positionMs = positionMs;
+              session.durationMs = durationMs;
+              session.lastActivityAt = Date.now();
+            }
+          }
           persistState();
           const completed = durationMs > 0 && positionMs >= durationMs * 0.95;
           const list = history.get(key) ?? [];
@@ -639,15 +899,32 @@ const plugin: PluginDefinition = definePlugin({
         }
         case "history": {
           const userId = String(payload.userId ?? "");
+          if (!userId) throw new ServingError("invalid_request", "userId required");
           const fileId = payload.fileId !== undefined ? String(payload.fileId) : null;
-          const out: Array<Record<string, unknown>> = [];
-          for (const [key, list] of history) {
-            if (!key.startsWith(`${userId}:`)) continue;
-            const fid = key.split(":").slice(1).join(":");
-            if (fileId !== null && fid !== fileId) continue;
-            for (const h of list)
-              out.push({ userId, fileId: fid, startedAt: h.startedAt, positionMs: h.positionMs, completed: h.completed });
-          }
+          const visible = new Map(visibleEntries(userId).map((entry) => [entry.fileId, entry]));
+          const out = [...resumes.values()]
+            .filter((point) => {
+              if (point.userId !== userId || !visible.has(point.fileId)) return false;
+              return fileId === null || point.fileId === fileId;
+            })
+            .sort(
+              (a, b) =>
+                b.updatedAt.localeCompare(a.updatedAt) || a.fileId.localeCompare(b.fileId),
+            )
+            .map((point) => {
+              const entry = visible.get(point.fileId)!;
+              return {
+                fileId: point.fileId,
+                title: entry.title,
+                kind: entry.kind,
+                positionMs: point.positionMs,
+                durationMs: point.durationMs,
+                completed:
+                  point.durationMs > 0 && point.positionMs >= point.durationMs * 0.95,
+                lastWatchedAt: point.updatedAt,
+                artworkUrl: null,
+              };
+            });
           return { history: out };
         }
 
@@ -700,7 +977,16 @@ const plugin: PluginDefinition = definePlugin({
           const qualities = Array.isArray(payload.qualities)
             ? (payload.qualities as unknown[]).map(String)
             : config.qualityLadder;
-          const out = openSession(entry.fileId, String(payload.reason ?? "manual"), qualities, userId);
+          const out = openSession(
+            entry.fileId,
+            "hls",
+            String(payload.reason ?? "manual"),
+            qualities,
+            userId,
+            typeof payload.client === "string" ? payload.client : "Unknown web client",
+            payload.network === "local" ? "local" : "remote",
+            selectTracks(entry, payload.capabilities as BrowserCapabilities),
+          );
           // Explicit sessions stay lazy like negotiation placeholders; both
           // claim their bounded worker at first client contact (manifest or
           // segment fetch) via start-worker/session-touch.
@@ -714,6 +1000,14 @@ const plugin: PluginDefinition = definePlugin({
           const s = sessions.get(sessionId);
           if (!s || s.closed) throw new ServingError("not_found", `session ${sessionId} not active`);
           s.lastActivityAt = Date.now();
+          if (payload.positionMs !== undefined) {
+            const positionMs = Number(payload.positionMs);
+            if (Number.isFinite(positionMs) && positionMs >= 0) s.positionMs = positionMs;
+          }
+          if (payload.durationMs !== undefined) {
+            const durationMs = Number(payload.durationMs);
+            if (Number.isFinite(durationMs) && durationMs >= 0) s.durationMs = durationMs;
+          }
           const w = workers.get(sessionId);
           if (w) w.lastProgressAt = Date.now();
           return { touched: sessionId };
@@ -732,7 +1026,17 @@ const plugin: PluginDefinition = definePlugin({
             if (live >= config.maxWorkers)
               throw new ServingError("session_limit", `worker cap reached (${config.maxWorkers})`);
           }
-          spawnWorker(s);
+          const inputPath = typeof payload.inputPath === "string" ? payload.inputPath : undefined;
+          const alreadyStarted = workers.has(sessionId);
+          spawnWorker(s, inputPath);
+          if (!alreadyStarted) {
+            await emitFn?.(EventTypes.PlaybackStarted, {
+              sessionId,
+              userId: s.userId,
+              fileId: s.fileId,
+              mode: "hls",
+            }, { correlationId: sessionId });
+          }
           return { started: sessionId, workers: workers.size };
         }
         case "cancel-session":
@@ -743,11 +1047,13 @@ const plugin: PluginDefinition = definePlugin({
           if (!s) throw new ServingError("not_found", `unknown session ${sessionId}`);
           return {
             sessionId,
+            fileId: s.fileId,
             closed: s.closed,
             closeReason: s.closeReason ?? null,
             workerAlive: workers.has(sessionId),
             qualities: s.qualities,
             userId: s.userId,
+            mode: s.mode,
           };
         }
 

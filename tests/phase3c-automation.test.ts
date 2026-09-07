@@ -321,7 +321,7 @@ describe("end-to-end fixture pipeline (stories 1–8)", () => {
       mode: "automatic",
       correlationId: "corr-retry-2",
       candidates: [bad, good],
-      profile: { name: "hd", preferredQualities: ["1080p"] },
+      profile: { name: "hd", preferredQualities: ["1080p", "720p"] },
     });
     expect(retry.grabbed).toBe(true);
     expect(retry.verdict.winnerGuid).toBe("bad-rel");
@@ -331,7 +331,7 @@ describe("end-to-end fixture pipeline (stories 1–8)", () => {
     void client;
   });
 
-  it("quality upgrades rank properly/repack and higher quality ahead of the held copy", async () => {
+  it("reports higher quality when quality, not proper/repack, decides the rank", async () => {
     const held = release({ guid: "held-720", title: "U S01E01 720p HDTV" });
     const better = release({ guid: "better-1080-proper", title: "U S01E01 1080p PROPER" });
     const out = await pipeline.decide({
@@ -343,7 +343,8 @@ describe("end-to-end fixture pipeline (stories 1–8)", () => {
     });
     expect(out.grabbed).toBe(true);
     expect(out.verdict.winnerGuid).toBe("better-1080-proper");
-    expect(out.verdict.reasons).toContain("proper_repack_upgrade");
+    expect(out.verdict.reasons).toContain("best_quality_available");
+    expect(out.verdict.reasons).not.toContain("proper_repack_upgrade");
   });
 
   it("is idempotent at the client: re-grabbing the same item does not duplicate jobs", async () => {

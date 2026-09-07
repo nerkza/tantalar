@@ -56,6 +56,16 @@ export const DEFAULT_CONFIG: Json = {
       "dev.tantalar.plugin.fixture-indexer": { enabled: true, manifestPath: "plugins/fixture-indexer/manifest.json" },
       "dev.tantalar.plugin.fixture-tracker": { enabled: true, manifestPath: "plugins/fixture-tracker/manifest.json" },
       "dev.tantalar.plugin.fixture-download-client": { enabled: true, manifestPath: "plugins/fixture-download-client/manifest.json" },
+      "dev.tantalar.plugin.usenet-native": {
+        enabled: true,
+        manifestPath: "plugins/usenet-native/manifest.json",
+        config: { downloadRoots: [] },
+      },
+      "dev.tantalar.plugin.torrent-native": {
+        enabled: true,
+        manifestPath: "plugins/torrent-native/manifest.json",
+        config: { downloadRoots: [], trackerMode: "disabled" },
+      },
       "dev.tantalar.plugin.library": { enabled: true, manifestPath: "plugins/library/manifest.json" },
       "dev.tantalar.plugin.metadata-tmdb-tvdb": { enabled: true, manifestPath: "plugins/metadata-tmdb-tvdb/manifest.json" },
       "dev.tantalar.plugin.movies": { enabled: true, manifestPath: "plugins/movies/manifest.json" },
@@ -82,6 +92,25 @@ export const DEFAULT_CONFIG: Json = {
   },
   scheduler: {
     tickMs: 1000,
+  },
+};
+
+// Documented opt-in sections are part of validation without becoming defaults.
+const OPTIONAL_CONFIG_SCHEMA: Json = {
+  mcp: {
+    http: {
+      enabled: true,
+      bind: "",
+      port: 0,
+      tlsViaProxy: false,
+      clientEndpoint: "",
+    },
+    mutatingToolsEnabled: false,
+    limits: {
+      timeoutMs: 0,
+      maxResultBytes: 0,
+      rateLimitPerMinute: 0,
+    },
   },
 };
 
@@ -196,14 +225,14 @@ export function loadConfig(options: LoadOptions = {}): LoadedConfig {
   for (const [layer, file] of layers) {
     if (!file) continue;
     const parsed = readLayer(file, layer, warnings);
-    for (const key of unknownKeys(parsed, config)) {
+    for (const key of unknownKeys(parsed, deepMerge(config, OPTIONAL_CONFIG_SCHEMA))) {
       warnings.push({ layer, message: `unknown config key: ${key}` });
     }
     config = deepMerge(config, parsed);
   }
 
   if (options.cliOverrides) {
-    for (const key of unknownKeys(options.cliOverrides, config)) {
+    for (const key of unknownKeys(options.cliOverrides, deepMerge(config, OPTIONAL_CONFIG_SCHEMA))) {
       warnings.push({ layer: "cli", message: `unknown config key: ${key}` });
     }
     config = deepMerge(config, options.cliOverrides);

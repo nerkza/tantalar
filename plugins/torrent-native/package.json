@@ -3,12 +3,20 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "bin": { "torrent-native-plugin": "./dist/plugin.js" },
+  "bin": {
+    "torrent-native-plugin": "./dist/plugin.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
+    "@tantalar/contracts": "workspace:*",
     "@tantalar/plugin-sdk": "workspace:*",
-    "@tantalar/contracts": "workspace:*"
+    "memory-chunk-store": "1.3.5",
+    "webtorrent": "1.9.7"
+  },
+  "devDependencies": {
+    "@types/webtorrent": "0.110.2",
+    "bittorrent-tracker": "11.2.3"
   }
 }

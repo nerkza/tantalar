@@ -15,6 +15,7 @@ import {
   type Migration,
   type MigrationProvider,
   type GeneratedAlways,
+  type Generated,
 } from "kysely";
 import Database from "better-sqlite3";
 import { Client } from "pg";
@@ -30,6 +31,7 @@ export interface UsersTable {
   // Wave 9 (TAN-032): soft deactivation. Deactivated users cannot sign in;
   // their durable rows (history, preferences) stay intact.
   active: number; // 0/1
+  avatar: Generated<string | null>;
 }
 
 /**
@@ -85,9 +87,26 @@ export interface SchedulerJobsTable {
   pluginId: string;
   jobKey: string; // idempotency key (pluginId + declared key)
   schedule: string;
+  defaultSchedule: string | null;
+  enabled: number;
   lastRunAt: string | null;
   nextRunAt: string | null;
   lockedAt: string | null;
+}
+
+export interface SchedulerRunsTable {
+  id: string;
+  pluginId: string;
+  jobKey: string;
+  startedAt: string;
+  finishedAt: string | null;
+  state: "running" | "succeeded" | "failed" | "blocked" | "skipped" | "partial" | "interrupted";
+  trigger: import("kysely").Generated<string>;
+  retryOf: import("kysely").Generated<string | null>;
+  details: import("kysely").Generated<string | null>;
+  outcome: string | null;
+  error: string | null;
+  durationMs: number | null;
 }
 
 export interface PluginStateTable {
@@ -99,6 +118,8 @@ export interface PluginStateTable {
   installedSource: string | null; // local path or tpk://<sha256>
   enabled: number; // 0/1 — config-declared desired state
   capabilitiesSnapshot: string | null; // JSON array from the manifest at mount
+  // SQLite returns TEXT. PostgreSQL parses JSONB into an object.
+  desiredConfig: string | Record<string, unknown> | null;
 }
 
 export interface OutboundWebhooksTable {
@@ -190,8 +211,8 @@ export interface MediaCatalogTable {
   itemKey: string;
   path: string; // absolute path inside the library root
   quality: string;
-  method: "hardlink" | "copy";
-  sourceHash: string; // sha256 at import time
+  method: "hardlink" | "copy" | "existing";
+  sourceHash: string; // sha256 content hash, or stable path identity for existing media
   importedAt: string;
   updatedAt: string;
 }
@@ -207,6 +228,7 @@ export interface DownloadJobsTable {
   title: string;
   source: "torrent" | "usenet";
   providerPluginId: string;
+  providerJobId: string | null;
   state: string; // DownloadState
   progressPercent: number; // 0..100 integer
   sizeBytes: number;
@@ -220,6 +242,7 @@ export interface DownloadJobsTable {
   /** Wave 9 (TAN-030): queue priority; higher runs first. */
   priority: number;
   importHandoffPath: string | null;
+  correlationId: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -230,6 +253,7 @@ export interface Db {
   api_keys: ApiKeysTable;
   events: EventsTable;
   scheduler_jobs: SchedulerJobsTable;
+  scheduler_runs: SchedulerRunsTable;
   plugin_state: PluginStateTable;
   outbound_webhooks: OutboundWebhooksTable;
   audit_log: AuditLogTable;
@@ -690,6 +714,125 @@ const MIGRATIONS: Array<{ name: string; sqlite: string[]; postgres: string[] }> 
       `ALTER TABLE outbound_webhooks ADD COLUMN IF NOT EXISTS last_detail TEXT`,
       `ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 0`,
       `CREATE INDEX IF NOT EXISTS idx_download_jobs_priority ON download_jobs(priority)`,
+    ],
+  },
+  {
+    name: "0010_existing_media_origin",
+    sqlite: [
+      `ALTER TABLE media_catalog RENAME TO media_catalog_before_existing_origin`,
+      `CREATE TABLE media_catalog (
+        file_id TEXT PRIMARY KEY,
+        library_id TEXT NOT NULL REFERENCES libraries(id),
+        item_key TEXT NOT NULL,
+        path TEXT NOT NULL,
+        quality TEXT NOT NULL,
+        method TEXT NOT NULL CHECK (method IN ('hardlink','copy','existing')),
+        source_hash TEXT NOT NULL,
+        imported_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+      `INSERT INTO media_catalog (file_id, library_id, item_key, path, quality, method, source_hash, imported_at, updated_at)
+       SELECT file_id, library_id, item_key, path, quality, method, source_hash, imported_at, updated_at
+       FROM media_catalog_before_existing_origin`,
+      `DROP TABLE media_catalog_before_existing_origin`,
+      `CREATE UNIQUE INDEX idx_media_import_identity ON media_catalog(source_hash, path)`,
+      `CREATE INDEX idx_media_library ON media_catalog(library_id)`,
+      `CREATE INDEX idx_media_item ON media_catalog(item_key)`,
+    ],
+    postgres: [
+      `ALTER TABLE media_catalog DROP CONSTRAINT IF EXISTS media_catalog_method_check`,
+      `ALTER TABLE media_catalog ADD CONSTRAINT media_catalog_method_check CHECK (method IN ('hardlink','copy','existing'))`,
+    ],
+  },
+  {
+    name: "0011_download_provider_job_identity",
+    sqlite: [
+      `ALTER TABLE download_jobs ADD COLUMN provider_job_id TEXT`,
+      `CREATE INDEX IF NOT EXISTS idx_download_jobs_provider_job ON download_jobs(provider_plugin_id, provider_job_id)`,
+    ],
+    postgres: [
+      `ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS provider_job_id TEXT`,
+      `CREATE INDEX IF NOT EXISTS idx_download_jobs_provider_job ON download_jobs(provider_plugin_id, provider_job_id)`,
+    ],
+  },
+  {
+    name: "0012_download_provider_job_integrity",
+    sqlite: [
+      `DROP INDEX IF EXISTS idx_download_jobs_provider_job`,
+      `CREATE UNIQUE INDEX idx_download_jobs_provider_job ON download_jobs(provider_plugin_id, provider_job_id) WHERE provider_job_id IS NOT NULL`,
+    ],
+    postgres: [
+      `DROP INDEX IF EXISTS idx_download_jobs_provider_job`,
+      `CREATE UNIQUE INDEX idx_download_jobs_provider_job ON download_jobs(provider_plugin_id, provider_job_id) WHERE provider_job_id IS NOT NULL`,
+    ],
+  },
+  {
+    name: "0013_scheduler_management",
+    sqlite: [
+      `ALTER TABLE scheduler_jobs ADD COLUMN default_schedule TEXT`,
+      `ALTER TABLE scheduler_jobs ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`,
+      `CREATE TABLE scheduler_runs (
+        id TEXT PRIMARY KEY,
+        plugin_id TEXT NOT NULL,
+        job_key TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        state TEXT NOT NULL,
+        outcome TEXT,
+        error TEXT,
+        duration_ms INTEGER
+      )`,
+      `CREATE INDEX idx_scheduler_runs_job_started ON scheduler_runs(job_key, started_at DESC)`,
+    ],
+    postgres: [
+      `ALTER TABLE scheduler_jobs ADD COLUMN IF NOT EXISTS default_schedule TEXT`,
+      `ALTER TABLE scheduler_jobs ADD COLUMN IF NOT EXISTS enabled INTEGER NOT NULL DEFAULT 1`,
+      `CREATE TABLE IF NOT EXISTS scheduler_runs (
+        id TEXT PRIMARY KEY,
+        plugin_id TEXT NOT NULL,
+        job_key TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        state TEXT NOT NULL,
+        outcome TEXT,
+        error TEXT,
+        duration_ms INTEGER
+      )`,
+      `CREATE INDEX IF NOT EXISTS idx_scheduler_runs_job_started ON scheduler_runs(job_key, started_at DESC)`,
+    ],
+  },
+  {
+    name: "0014_download_job_correlation",
+    sqlite: [`ALTER TABLE download_jobs ADD COLUMN correlation_id TEXT`],
+    postgres: [`ALTER TABLE download_jobs ADD COLUMN IF NOT EXISTS correlation_id TEXT`],
+  },
+  {
+    name: "0015_mcp_desired_configuration",
+    sqlite: [
+      `ALTER TABLE plugin_state ADD COLUMN desired_config TEXT`,
+    ],
+    postgres: [
+      `ALTER TABLE plugin_state ADD COLUMN IF NOT EXISTS desired_config JSONB`,
+    ],
+  },
+  {
+    name: "0016_user_avatars",
+    sqlite: [`ALTER TABLE users ADD COLUMN avatar TEXT`],
+    postgres: [`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT`],
+  },
+  {
+    name: "0017_job_run_context",
+    sqlite: [
+      `ALTER TABLE scheduler_runs ADD COLUMN trigger TEXT NOT NULL DEFAULT 'scheduled'`,
+      `ALTER TABLE scheduler_runs ADD COLUMN retry_of TEXT`,
+      `ALTER TABLE scheduler_runs ADD COLUMN details TEXT`,
+      `CREATE INDEX idx_scheduler_runs_started ON scheduler_runs(started_at DESC, id)`,
+    ],
+    postgres: [
+      `ALTER TABLE scheduler_runs ADD COLUMN trigger TEXT NOT NULL DEFAULT 'scheduled'`,
+      `ALTER TABLE scheduler_runs ADD COLUMN retry_of TEXT`,
+      `ALTER TABLE scheduler_runs ADD COLUMN details TEXT`,
+      `CREATE INDEX idx_scheduler_runs_started ON scheduler_runs(started_at DESC, id)`,
     ],
   },
 ];

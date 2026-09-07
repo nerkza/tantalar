@@ -41,6 +41,10 @@ export const CapabilityNames = {
   Log: "dev.tantalar.capability.log",
   /** Phase 2: narrow key validation for plugins (MCP contract §3). */
   AuthIntrospection: "dev.tantalar.capability.auth.introspection",
+  /** Phase 2 MCP read surfaces. Core keeps authorization in the MCP plugin. */
+  McpActivityRead: "dev.tantalar.capability.mcp.activity.read",
+  McpOperationRead: "dev.tantalar.capability.mcp.operation.read",
+  McpConfigRead: "dev.tantalar.capability.mcp.config.read",
   /**
    * Phase 3a/3b acquisition domain. The indexer and download-client
    * capabilities are provided by provider plugins (fixtures first-party);
@@ -90,6 +94,7 @@ export const EventTypes = {
    */
   ComparisonVerdict: "dev.tantalar.event.comparison.verdict",
   GrabDecision: "dev.tantalar.event.grab.decision",
+  DispatchGateChecked: "dev.tantalar.event.dispatch.gate.checked",
   ClientDispatch: "dev.tantalar.event.client.dispatch",
   DownloadQueued: "dev.tantalar.event.download.queued",
   DownloadProgress: "dev.tantalar.event.download.progress",
@@ -125,6 +130,8 @@ export const EventTypes = {
    */
   PlaybackStarted: "dev.tantalar.event.playback.started",
   PlaybackProgress: "dev.tantalar.event.playback.progress",
+  PlaybackEnded: "dev.tantalar.event.playback.ended",
+  PlaybackPolicyUpdated: "dev.tantalar.event.playback.policy.updated",
   TranscodeSessionOpened: "dev.tantalar.event.transcode.session.opened",
   TranscodeSessionClosed: "dev.tantalar.event.transcode.session.closed",
   /**
@@ -183,6 +190,8 @@ export interface IndexerQuery {
   readonly mode: IndexerQueryMode;
   readonly query: string;
   readonly categories?: readonly number[];
+  /** Optional operator-defined indexer groups. */
+  readonly tags?: readonly string[];
   readonly limit?: number;
   /** Correlation id propagated onto every emitted event for this search. */
   readonly correlationId?: string;
@@ -200,6 +209,8 @@ export interface IndexedRelease {
   readonly publishedAt: string; // ISO-8601 UTC
   readonly seeders?: number;
   readonly leechers?: number;
+  /** Provider-reported language code or name when available. */
+  readonly language?: string;
   readonly categories: readonly number[];
   readonly indexerId: string;
 }
@@ -240,12 +251,15 @@ export function validateIndexerQuery(input: unknown): IndexerQuery {
     throw new IndexerError("invalid_query", "query.query must be a non-empty string");
   if (q.categories !== undefined && (!Array.isArray(q.categories) || !q.categories.every((c) => Number.isInteger(c))))
     throw new IndexerError("invalid_query", "query.categories must be integers");
+  if (q.tags !== undefined && (!Array.isArray(q.tags) || !q.tags.every((tag) => typeof tag === "string" && tag.length <= 40)))
+    throw new IndexerError("invalid_query", "query.tags must be short strings");
   if (q.limit !== undefined && (!Number.isInteger(q.limit) || q.limit < 1))
     throw new IndexerError("invalid_query", "query.limit must be a positive integer");
   return {
     mode: q.mode,
     query: q.query,
     ...(q.categories !== undefined ? { categories: q.categories } : {}),
+    ...(q.tags !== undefined ? { tags: q.tags } : {}),
     ...(q.limit !== undefined ? { limit: q.limit } : {}),
     ...(q.correlationId !== undefined ? { correlationId: q.correlationId } : {}),
   };
@@ -269,6 +283,8 @@ export function validateIndexedRelease(input: unknown): IndexedRelease {
   if (!Array.isArray(r.categories)) throw new IndexerError("parse_error", "release.categories must be an array");
   if (typeof r.indexerId !== "string" || r.indexerId.length === 0)
     throw new IndexerError("parse_error", "release.indexerId required");
+  if (r.language !== undefined && (typeof r.language !== "string" || r.language.length > 40))
+    throw new IndexerError("parse_error", "release.language invalid");
   return r as IndexedRelease;
 }
 
@@ -414,8 +430,19 @@ export interface DownloadStatus {
   /** 0..100 */
   readonly progressPercent: number;
   readonly sizeBytes: number;
+  /** Exact transferred bytes, when supported by the provider. */
+  readonly receivedBytes?: number;
   readonly error?: string;
 }
+
+export const DOWNLOAD_JOB_STATES: ReadonlySet<DownloadState> = new Set([
+  "queued",
+  "downloading",
+  "paused",
+  "completed",
+  "failed",
+  "cancelled",
+]);
 
 export class DownloadClientError extends Error {
   readonly code: "invalid_request" | "unknown_download" | "unavailable" | "blocked";
@@ -444,6 +471,53 @@ export function validateDownloadRequest(input: unknown): DownloadRequest {
     sourceUrl: r.sourceUrl,
     ...(r.trackerId !== undefined ? { trackerId: r.trackerId } : {}),
     ...(r.correlationId !== undefined ? { correlationId: r.correlationId } : {}),
+  };
+}
+
+/** Validate untrusted state returned by an out-of-process download provider. */
+export function validateDownloadStatus(
+  input: unknown,
+  expected: { itemKey?: string; downloadId?: string } = {},
+): DownloadStatus {
+  const r = input as Partial<DownloadStatus>;
+  if (!r || typeof r !== "object" || Array.isArray(r)) {
+    throw new DownloadClientError("invalid_request", "download status must be an object");
+  }
+  if (typeof r.downloadId !== "string" || r.downloadId.length === 0) {
+    throw new DownloadClientError("invalid_request", "download status downloadId required");
+  }
+  if (typeof r.itemKey !== "string" || r.itemKey.length === 0) {
+    throw new DownloadClientError("invalid_request", "download status itemKey required");
+  }
+  if (expected.downloadId !== undefined && r.downloadId !== expected.downloadId) {
+    throw new DownloadClientError("invalid_request", "download status id mismatch");
+  }
+  if (expected.itemKey !== undefined && r.itemKey !== expected.itemKey) {
+    throw new DownloadClientError("invalid_request", "download status item mismatch");
+  }
+  if (!DOWNLOAD_JOB_STATES.has(r.state as DownloadState)) {
+    throw new DownloadClientError("invalid_request", "download status state invalid");
+  }
+  if (typeof r.progressPercent !== "number" || !Number.isFinite(r.progressPercent) || r.progressPercent < 0 || r.progressPercent > 100) {
+    throw new DownloadClientError("invalid_request", "download status progress must be between 0 and 100");
+  }
+  if (typeof r.sizeBytes !== "number" || !Number.isSafeInteger(r.sizeBytes) || r.sizeBytes < 0) {
+    throw new DownloadClientError("invalid_request", "download status size must be a non-negative safe integer");
+  }
+  if (r.error !== undefined && typeof r.error !== "string") {
+    throw new DownloadClientError("invalid_request", "download status error must be a string");
+  }
+  if (r.receivedBytes !== undefined && (!Number.isSafeInteger(r.receivedBytes) || r.receivedBytes < 0)) {
+    throw new DownloadClientError("invalid_request", "download status received bytes must be a non-negative safe integer");
+  }
+  return {
+    downloadId: r.downloadId,
+    itemKey: r.itemKey,
+    state: r.state as DownloadState,
+    progressPercent: r.progressPercent,
+    sizeBytes: r.sizeBytes,
+    ...(r.receivedBytes !== undefined ? { receivedBytes: r.receivedBytes } : {}),
+    ...(r.error !== undefined ? { error: r.error.slice(0, 512) } : {}),
   };
 }
 
@@ -603,11 +677,18 @@ export interface QualityProfile {
   readonly name: string;
   /** Preferred qualities in rank order, best first (free-form labels). */
   readonly preferredQualities: readonly string[];
+  readonly preferredLanguages?: readonly string[];
   readonly minSeeders?: number;
   /** Reject releases larger than this. */
   readonly maxSizeBytes?: number;
   /** Prefer proper/repack re-releases over the original. */
   readonly preferProperRepack?: boolean;
+  readonly upgradeAllowed?: boolean;
+  readonly cutoff?: string;
+  readonly sizeDefinitions?: Readonly<Record<string, { min: number; preferred: number | null; max: number | null }>>;
+  /** Effective runtime supplied by the managed-media context, not by a release. */
+  readonly runtimeMinutes?: number;
+  readonly installedQuality?: string;
 }
 
 /** A release enriched with parsed comparison attributes (quality label etc.). */
@@ -626,8 +707,24 @@ export type ComparisonReason =
   | "seeders_sufficient"
   | "no_qualifying_release"
   | "size_exceeds_limit"
+  | "size_below_minimum"
+  | "runtime_unknown"
+  | "not_quality_upgrade"
   | "seeders_below_minimum"
-  | "blacklisted_release";
+  | "seeders_not_reported"
+  | "blacklisted_release"
+  | "quality_below_profile"
+  | "availability_not_met"
+  | "language_not_allowed"
+  | "language_allowed"
+  | "language_not_reported"
+  | "eligible_lower_ranked";
+
+export interface CandidateAssessment {
+  readonly guid: string;
+  readonly accepted: boolean;
+  readonly reasons: readonly ComparisonReason[];
+}
 
 export interface ComparisonVerdict {
   /** guid of the winning candidate, or null when nothing qualifies. */
@@ -635,6 +732,7 @@ export interface ComparisonVerdict {
   readonly rankedGuids: readonly string[];
   readonly reasons: readonly ComparisonReason[];
   readonly rejected: ReadonlyArray<{ guid: string; reason: ComparisonReason }>;
+  readonly assessments?: readonly CandidateAssessment[];
 }
 
 export function parseQualityLabel(title: string): string {
@@ -701,14 +799,14 @@ export interface VpnProfile {
 // (built-in TMDB/TVDB fixture plugin; replaceable).
 
 /** How a file physically landed in the library. */
-export type ImportMethod = "hardlink" | "copy";
+export type ImportMethod = "hardlink" | "copy" | "existing";
 
 export interface RenameScheme {
   readonly name: string;
   /**
    * Template with placeholders. Episode templates accept {series},{season},
    * {episode},{seasonPad2},{episodePad2},{title},{year},{quality},{codec},
-   * {language},{edition}; movie templates the same minus the episode/season
+   * {language},{group},{edition}; movie templates the same minus the episode/season
    * placeholders. Validated to reject path traversal and absolute escapes.
    */
   readonly episodeTemplate: string;
@@ -716,7 +814,7 @@ export interface RenameScheme {
 }
 
 export class ImportError extends Error {
-  readonly code: "invalid_template" | "path_escape" | "outside_root" | "symlink_rejected" | "collision" | "io_error";
+  readonly code: "invalid_template" | "path_escape" | "outside_root" | "symlink_rejected" | "collision" | "io_error" | "invalid_mode" | "review_stale";
   constructor(code: ImportError["code"], message: string) {
     super(message);
     this.code = code;
@@ -730,7 +828,7 @@ export function validateRenameTemplate(template: string): string {
     throw new ImportError("invalid_template", "template must be a non-empty string");
   if (template.includes("..") || template.startsWith("/") || /^[a-zA-Z]:/.test(template))
     throw new ImportError("path_escape", "template must not traverse outside the library root");
-  const known = ["series", "season", "episode", "title", "year", "quality", "seasonPad2", "episodePad2", "codec", "language", "edition"];
+  const known = ["series", "season", "episode", "title", "year", "quality", "seasonPad2", "episodePad2", "codec", "language", "group", "edition"];
   for (const ph of template.match(/\{([^}]*)\}/g) ?? []) {
     if (!known.includes(ph.slice(1, -1)))
       throw new ImportError("invalid_template", `unknown placeholder ${ph}`);
@@ -738,11 +836,16 @@ export function validateRenameTemplate(template: string): string {
   return template;
 }
 
+/** Automatic prefers a hardlink and falls back to a copy. Copy never links. */
+export type ImportMode = "automatic" | "copy";
+
 export interface ImportRequest {
   /** Stable key of the wanted item this file serves (e.g. series:S01E01). */
   readonly itemKey: string;
   /** Absolute source path inside a configured import root. */
   readonly sourcePath: string;
+  /** Exact configured import root selected by the managed item's destination library. */
+  readonly destinationRoot?: string;
   /** Parsed quality label of the release (drives upgrade decisions). */
   readonly quality: string;
   readonly title: string;
@@ -754,14 +857,46 @@ export interface ImportRequest {
   readonly episode?: number;
   readonly year?: number;
   readonly scheme?: string;
+  readonly codec?: string;
+  readonly language?: string;
+  readonly releaseGroup?: string;
+  readonly edition?: string;
+  readonly mode?: ImportMode;
+  /** Optional fingerprint returned by `review-import`; execution revalidates it before mutation. */
+  readonly reviewFingerprint?: string;
   /** Correlation id propagated onto every emitted event. */
   readonly correlationId?: string;
+}
+
+export interface ImportPlan {
+  readonly itemKey: string;
+  readonly sourcePath: string;
+  readonly destinationPath: string;
+  readonly sourceHash: string;
+  readonly quality: string;
+  readonly title: string;
+  readonly kind: "series" | "movie";
+  readonly series?: string;
+  readonly season?: number;
+  readonly episode?: number;
+  readonly year?: number;
+  readonly scheme: string;
+  readonly codec?: string;
+  readonly language?: string;
+  readonly releaseGroup?: string;
+  readonly edition?: string;
+  readonly mode: ImportMode;
+  readonly action: "import" | "upgrade" | "deduplicate";
+  /** SHA-256 of the normalized plan and current source/destination state. */
+  readonly fingerprint: string;
 }
 
 export interface ImportResult {
   readonly itemKey: string;
   readonly destinationPath: string;
   readonly method: ImportMethod;
+  /** SHA-256 of the imported source, used by the durable media catalog. */
+  readonly sourceHash?: string;
   /** True when an existing file was replaced by a quality upgrade. */
   readonly upgraded: boolean;
   /** Previous destination path when upgraded, for history/rollback. */
@@ -787,6 +922,50 @@ export interface MediaMetadata {
   readonly airDate?: string;
   readonly artworkUrl?: string;
   readonly provider: string;
+}
+
+/** Current normalized provider facts for one movie or series identity. */
+export interface MediaMetadataSnapshot extends MediaMetadata {
+  readonly originalTitle: string | null;
+  readonly tagline: string | null;
+  readonly releaseDate: string | null;
+  readonly lastAirDate?: string | null;
+  readonly runtimeMinutes: number | null;
+  readonly genres: readonly string[];
+  readonly actors?: readonly string[];
+  readonly directors?: readonly string[];
+  readonly certification: string | null;
+  readonly status: string | null;
+  readonly originalLanguage: string | null;
+  readonly rating: number | null;
+  readonly voteCount: number;
+  readonly posterPath: string | null;
+  readonly backdropPath: string | null;
+  readonly externalIds: Readonly<Record<string, string>>;
+  readonly locale: string;
+  readonly fetchedAt: string;
+  readonly source: "hosted" | "direct" | "fixture";
+}
+
+export interface MovieMetadataSnapshot extends MediaMetadataSnapshot {
+  readonly kind: "movie";
+}
+
+export interface SeriesMetadataSnapshot extends MediaMetadataSnapshot {
+  readonly kind: "series";
+  readonly lastAirDate: string | null;
+}
+
+/** Provider facts for one numbered episode; unknown values remain absent. */
+export interface EpisodeMetadata {
+  readonly season: number;
+  readonly episode: number;
+  readonly title: string;
+  readonly externalId?: string;
+  readonly airDate?: string;
+  readonly overview?: string;
+  readonly runtimeMinutes?: number;
+  readonly stillPath?: string;
 }
 
 
@@ -816,11 +995,20 @@ export interface LibraryEntry {
   readonly kind: "series" | "movie";
   readonly libraryId: string;
   /** Synthetic probe metadata — never parsed from real copyrighted media. */
-  readonly container: "mkv" | "mp4" | "avi";
-  readonly videoCodec: "h264" | "hevc" | "av1";
-  readonly audioCodec: "aac" | "ac3" | "dts" | "truehd" | "atmos";
+  readonly container: "mkv" | "mp4" | "avi" | "unknown";
+  readonly videoCodec: "h264" | "hevc" | "av1" | "unknown";
+  readonly audioCodec: "aac" | "ac3" | "dts" | "truehd" | "atmos" | "unknown";
+  readonly audioTracks?: readonly AudioTrack[];
   readonly sizeBytes: number;
   readonly subtitles: readonly SubtitleTrack[];
+}
+
+export interface AudioTrack {
+  /** Absolute FFmpeg stream index reported by ffprobe. */
+  readonly streamIndex: number;
+  readonly lang: string;
+  readonly codec: LibraryEntry["audioCodec"];
+  readonly default?: boolean;
 }
 
 export type SubtitleSource = "embedded" | "external";
@@ -830,6 +1018,10 @@ export interface SubtitleTrack {
   readonly lang: string;
   readonly format: "srt" | "ass" | "pgs";
   readonly source: SubtitleSource;
+  /** Absolute FFmpeg stream index for embedded tracks. */
+  readonly streamIndex?: number;
+  readonly default?: boolean;
+  readonly forced?: boolean;
   /**
    * Optional inline content for browser-renderable tracks (SRT text).
    * Declared at registration so /api/v1/library/subtitles/:trackId can serve
@@ -874,13 +1066,36 @@ export interface BrowserCapabilities {
   readonly canDirectSubtitles: readonly string[]; // e.g. ["srt","vtt"]
 }
 
+export interface PlaybackPolicy {
+  readonly preferDirectPlay: boolean;
+  readonly localBitrateKbps: number;
+  readonly remoteBitrateKbps: number;
+  readonly maxConcurrentTranscodes: number;
+  readonly hardwareAcceleration: string;
+  readonly defaultAudioLanguage: string;
+  readonly defaultSubtitleLanguage: string;
+  readonly subtitleMode: "manual" | "always" | "off";
+  readonly transcodeCacheMaxBytes: number;
+  readonly idleTimeoutMs: number;
+}
+
 export type PlaybackDecision =
-  | { readonly mode: "direct"; readonly streamUrl: string }
+  | {
+      readonly mode: "direct";
+      readonly sessionId: string;
+      readonly streamUrl: string;
+      readonly reason: string;
+      readonly audioLanguage?: string;
+      readonly subtitleTrackId?: string;
+    }
   | {
       readonly mode: "hls";
       readonly sessionId: string;
       readonly manifestUrl: string;
       readonly qualities: readonly string[];
+      readonly reason: string;
+      readonly audioLanguage?: string;
+      readonly subtitleTrackId?: string;
     };
 
 /** Stable failure codes for negotiation and session lifecycle. */
@@ -960,6 +1175,9 @@ export interface DownloadJobRecord {
   readonly source: DownloadJobSource;
   /** Plugin id that executes the job (e.g. dev.tantalar.plugin.usenet-native). */
   readonly providerPluginId: string;
+  /** Provider-native job id used to route later engine actions. */
+  /** Null only for rows created before provider identities were persisted. */
+  readonly providerJobId: string | null;
   readonly state: DownloadState;
   /** 0..100 */
   readonly progressPercent: number;
@@ -971,7 +1189,7 @@ export interface DownloadJobRecord {
   /** Non-fatal notes (repair ran, CRC mismatch retried, …). */
   readonly warnings: readonly string[];
   readonly retryCount: number;
-  /** Provider-neutral source reference (magnet URI, .torrent path, NZB path). */
+  /** Redacted provider-neutral source fingerprint; never a credential-bearing URL. */
   readonly sourceRef: string;
   readonly failureReason: string | null;
   /** True once the user removed the job from the queue (history retained). */
@@ -980,18 +1198,11 @@ export interface DownloadJobRecord {
   readonly priority: number;
   /** Import handoff: set when the completed payload was handed to the importer. */
   readonly importHandoffPath: string | null;
+  /** Operation shared by search, transfer, verification, recovery, and import events. */
+  readonly correlationId: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
-
-export const DOWNLOAD_JOB_STATES: ReadonlySet<DownloadState> = new Set([
-  "queued",
-  "downloading",
-  "paused",
-  "completed",
-  "failed",
-  "cancelled",
-]);
 
 export class DownloadJobError extends Error {
   readonly code: "invalid_request" | "unknown_job";

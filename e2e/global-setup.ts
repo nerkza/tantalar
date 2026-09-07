@@ -1,7 +1,7 @@
 /**
  * Playwright global setup: boot a real Tantalar server with the serving
- * plugin mounted and synthetic media fixtures (no copyrighted content), then
- * expose its address + fixture ids to the tests via env/JSON.
+ * and MCP plugins mounted with synthetic media fixtures (no copyrighted
+ * content), then expose the fixture to the tests.
  *
  * The web app is served by the Playwright webServer (vite dev) which proxies
  * /api to this server.
@@ -18,10 +18,14 @@ import { Scheduler } from "../apps/server/src/scheduler.js";
 import { Supervisor } from "../apps/server/src/supervisor.js";
 import { AuthService } from "../apps/server/src/auth.js";
 import { buildServer } from "../apps/server/src/http.js";
+import { OnboardingService, ONBOARDING_STEPS } from "../apps/server/src/onboarding.js";
 
 const SERVING_ID = "dev.tantalar.plugin.serving";
 const SERVING_CAP = "dev.tantalar.capability.serving";
 const SERVING_ENTRY = "node " + resolve("plugins/serving/dist/plugin.js");
+const MCP_ID = "dev.tantalar.plugin.mcp";
+const MCP_ENTRY = "node " + resolve("plugins/mcp-server/dist/plugin.js");
+const MCP_PORT = Number(process.env.TANTALAR_E2E_MCP_PORT ?? 18_672);
 
 export const E2E_USER = "admin";
 export const E2E_PASS = "password-admin-1";
@@ -34,6 +38,9 @@ async function start() {
   const db: Kysely<Db> = await openDatabase({ dialect: "sqlite", sqlitePath: join(dir, "t.db") });
   await migrate(db);
   const bus = new EventBus(db);
+  const auth = new AuthService(db);
+  const onboarding = new OnboardingService(db);
+  for (const step of ONBOARDING_STEPS) await onboarding.setStep(step, "complete");
   const container = new ServiceContainer();
   container.register({ pluginId: "core", capability: "dev.tantalar.capability.event.emit", invoke: async () => ({ ok: true }) });
   container.register({ pluginId: "core", capability: "dev.tantalar.capability.log", invoke: async () => ({ ok: true }) });
@@ -60,6 +67,41 @@ async function start() {
     },
   });
 
+  let mcpConfig: Record<string, unknown> = {
+    http: { enabled: true, bind: "127.0.0.1", port: MCP_PORT, tlsViaProxy: false },
+    mutatingToolsEnabled: false,
+    limits: { timeoutMs: 5_000, maxResultBytes: 65_536, rateLimitPerMinute: 1_000 },
+  };
+  container.register({
+    pluginId: "core",
+    capability: "dev.tantalar.capability.auth.introspection",
+    invoke: async (_operation, payload) => {
+      const key = String(payload.api_key ?? payload.apiKey ?? "");
+      const record = key ? await auth.verifyApiKey(key) : null;
+      return { valid: record !== null, identity: record?.id ?? "", scopes: record?.scopes ?? [] };
+    },
+  });
+  container.register({
+    pluginId: "core",
+    capability: "dev.tantalar.capability.mcp.activity.read",
+    invoke: async (_operation, payload) => ({
+      events: await bus.read({
+        limit: Number(payload.limit ?? 50),
+        ...(typeof payload.afterEventId === "string" ? { afterEventId: payload.afterEventId } : {}),
+      }),
+    }),
+  });
+  container.register({
+    pluginId: "core",
+    capability: "dev.tantalar.capability.mcp.operation.read",
+    invoke: async () => ({ plugins: supervisor.list() }),
+  });
+  container.register({
+    pluginId: "core",
+    capability: "dev.tantalar.capability.mcp.config.read",
+    invoke: async () => ({ configuration: structuredClone(mcpConfig) }),
+  });
+
   const manifest = {
     id: SERVING_ID,
     version: "0.1.0",
@@ -77,6 +119,21 @@ async function start() {
     hangTimeoutMs: 120_000,
     stateFile: join(dir, "serving-state.json"),
   });
+  await supervisor.mount({
+    id: MCP_ID,
+    version: "0.1.0",
+    protocolVersion: 1,
+    provides: ["dev.tantalar.capability.mcp.status"],
+    requires: [
+      "dev.tantalar.capability.auth.introspection",
+      "dev.tantalar.capability.event.emit",
+      "dev.tantalar.capability.mcp.activity.read",
+      "dev.tantalar.capability.mcp.operation.read",
+      "dev.tantalar.capability.mcp.config.read",
+    ],
+    subscriptions: [],
+    entry: { command: MCP_ENTRY },
+  }, mcpConfig);
   const serving = (): { invoke(op: string, p?: Record<string, unknown>): Promise<unknown> } =>
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     container.resolve(SERVING_CAP) as any;
@@ -169,7 +226,9 @@ async function start() {
   await serving().invoke("set-viewer", { userId: "u-kids", libraries: ["lib-main"] });
   await serving().invoke("set-viewer", { userId: "u-none", libraries: [] });
 
-  const auth = new AuthService(db);
+  const jobScheduler = new Scheduler(db, 100_000, bus);
+  await jobScheduler.declareJob("fixture", "library-scan", "every 12h", () => ({ outcome: "3 files checked, 1 added.", counts: { checked: 3, added: 1 } }), { name: "Library scan", scope: "Movies" });
+  await jobScheduler.declareJob("fixture", "download-sync", "every 2s", () => ({ outcome: "Downloads reconciled." }), { name: "Download reconciliation", scope: "All downloads", protected: true });
   const app = await buildServer({
     auth,
     db,
@@ -178,6 +237,7 @@ async function start() {
     container,
     ready: () => true,
     ops: {
+      scheduler: jobScheduler,
       auth,
       db,
       bus,
@@ -186,6 +246,14 @@ async function start() {
       ready: () => true,
       sqlitePath: join(dir, "t.db"),
       dataDir: dir,
+      mcp: {
+        getDesiredConfig: () => structuredClone(mcpConfig),
+        applyDesiredConfig: async (config) => {
+          const runtime = await supervisor.reconfigure(MCP_ID, config);
+          mcpConfig = structuredClone(config);
+          return runtime;
+        },
+      },
     },
     serving: (invoke) => ({
       invoke,
@@ -230,4 +298,5 @@ export default async function globalSetup() {
   process.on("exit", () => void teardown());
   process.on("SIGINT", () => void teardown().then(() => process.exit(0)));
   process.on("SIGTERM", () => void teardown().then(() => process.exit(0)));
+  return teardown;
 }

@@ -93,16 +93,17 @@ export class EventBus {
     correlationId?: string;
     limit?: number;
     afterEventId?: string;
+    /** Return the most recently appended matching events first. */
+    newestFirst?: boolean;
   }): Promise<EventEnvelope[]> {
-    let q = this.#db
-      .selectFrom("events")
-      .selectAll()
-      // Insertion order is the authoritative tiebreaker: UUIDv7 random bits
-      // do not preserve append order within one occurredAt millisecond, so
-      // an eventId sort can invert a causal chain. SQLite rowid is strictly
-      // monotonic per insert and stable under concurrent writers.
-      .orderBy("occurredAt asc")
-      .orderBy(sql`rowid asc`);
+    // Insertion order is the authoritative tiebreaker: UUIDv7 random bits do
+    // not preserve append order within one occurredAt millisecond. Keep the
+    // historical replay default ascending, while bounded UIs can explicitly
+    // ask for the newest slice.
+    let q = this.#db.selectFrom("events").selectAll();
+    q = filter.newestFirst
+      ? q.orderBy("occurredAt", "desc").orderBy(sql`rowid`, "desc")
+      : q.orderBy("occurredAt", "asc").orderBy(sql`rowid`, "asc");
     if (filter.from) q = q.where("occurredAt", ">=", filter.from);
     if (filter.to) q = q.where("occurredAt", "<=", filter.to);
     if (filter.typePrefix) q = q.where("type", "like", `${filter.typePrefix}%`);

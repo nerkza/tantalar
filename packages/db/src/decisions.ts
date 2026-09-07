@@ -55,12 +55,30 @@ export function humanReason(code: string, detail?: { quality?: string }): string
       return "No release met the quality profile";
     case "size_exceeds_limit":
       return "Rejected: size exceeds the configured limit";
+    case "size_below_minimum":
+      return "Rejected: size is below the quality minimum for this runtime";
+    case "runtime_unknown":
+      return "Rejected: runtime is unavailable; size cannot be checked";
+    case "not_quality_upgrade":
+      return "Rejected: installed quality meets the cutoff, upgrades are disabled, or this release is not better";
     case "seeders_below_minimum":
       return "Rejected: too few seeders";
+    case "seeders_not_reported":
+      return "Rejected: indexer did not report a seeder count";
     case "blacklisted_release":
       return "Rejected: release is on the blocklist";
     case "quality_below_profile":
       return "Rejected: quality below the profile minimum";
+    case "availability_not_met":
+      return "Rejected: the configured availability date has not been reached";
+    case "language_not_allowed":
+      return "Rejected: language does not match the monitoring profile";
+    case "language_allowed":
+      return "Language matches the monitoring profile";
+    case "language_not_reported":
+      return "Indexer did not report a language";
+    case "eligible_lower_ranked":
+      return "Eligible, but ranked below another release";
     default:
       return code.replace(/_/g, " ");
   }

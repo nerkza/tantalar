@@ -51,7 +51,7 @@ export interface SyntheticTorrent {
 export function makeSyntheticTorrent(
   dir: string,
   name: string,
-  opts?: { fileCount?: number; fileBytes?: number; pieceLength?: number },
+  opts?: { fileCount?: number; fileBytes?: number; pieceLength?: number; announceUrls?: string[] },
 ): SyntheticTorrent {
   mkdirSync(dir, { recursive: true });
   const fileCount = opts?.fileCount ?? 2;
@@ -77,7 +77,10 @@ export function makeSyntheticTorrent(
     hashes.push(createHash("sha1").update(concat.subarray(p * pieceLength, (p + 1) * pieceLength)).digest());
   }
 
-  const announce = `https://${name.toLowerCase()}.invalid/announce`;
+  const announceUrls = opts?.announceUrls?.length
+    ? [...new Set(opts.announceUrls)]
+    : [`https://${name.toLowerCase()}.invalid/announce`];
+  const announce = announceUrls[0]!;
   const infoDict = bdict({
     name: bstr(name),
     "piece length": bint(pieceLength),
@@ -87,6 +90,9 @@ export function makeSyntheticTorrent(
   const metainfo = bdict({
     info: infoDict,
     announce: bstr(announce),
+    ...(announceUrls.length > 1
+      ? { "announce-list": blist(announceUrls.map((url) => blist([bstr(url)]))) }
+      : {}),
   });
 
   const infoMarker = Buffer.from("4:info", "ascii");
@@ -103,7 +109,7 @@ export function makeSyntheticTorrent(
     name,
     pieceLength,
     piecesTotal,
-    announceUrls: [announce],
+    announceUrls,
     files,
     payloads,
   };

@@ -35,7 +35,15 @@ export interface EpisodeRecord {
   readonly episode: number;
   /** Search string used to find releases for this episode. */
   readonly query: string;
+  readonly airDate?: string;
+  readonly title?: string;
+  readonly externalId?: string;
+  readonly overview?: string;
+  readonly runtimeMinutes?: number;
+  readonly stillPath?: string;
 }
+
+type SeriesMonitorMode = "all" | "future" | "missing" | "none";
 
 interface SeriesState {
   name: string;
@@ -43,7 +51,17 @@ interface SeriesState {
   profile: QualityProfile;
   seasons: number;
   episodesPerSeason: number;
+  monitorMode: SeriesMonitorMode;
+  destinationLibraryId?: string;
+  minimumAvailability?: string;
+  year?: number;
+  externalId?: string;
+  provider?: string;
+  overview?: string;
+  artworkUrl?: string;
   episodes: Map<string, EpisodeRecord>; // key `S<season>E<episode>`
+  acquiredEpisodeKeys: Set<string>;
+  manualFields?: string[];
 }
 
 function defaultProfile(): QualityProfile {
@@ -73,6 +91,17 @@ async function persist(): Promise<void> {
         profile: s.profile,
         seasons: s.seasons,
         episodesPerSeason: s.episodesPerSeason,
+        monitorMode: s.monitorMode,
+        ...(s.destinationLibraryId ? { destinationLibraryId: s.destinationLibraryId } : {}),
+        ...(s.minimumAvailability ? { minimumAvailability: s.minimumAvailability } : {}),
+        ...(s.year !== undefined ? { year: s.year } : {}),
+        ...(s.externalId ? { externalId: s.externalId } : {}),
+        ...(s.provider ? { provider: s.provider } : {}),
+        ...(s.overview !== undefined ? { overview: s.overview } : {}),
+        ...(s.artworkUrl ? { artworkUrl: s.artworkUrl } : {}),
+        episodes: [...s.episodes.values()],
+        acquiredEpisodeKeys: [...s.acquiredEpisodeKeys],
+        manualFields: s.manualFields ?? [],
       })),
     });
   } catch {
@@ -87,21 +116,31 @@ async function restore(): Promise<void> {
   try {
     const hit = await store.get(DOC_KEY);
     const doc = hit?.doc as
-      | { shows?: Array<{ id: string; name: string; monitored: boolean; profile: QualityProfile; seasons: number; episodesPerSeason: number }> }
+      | { shows?: Array<{ id: string; name: string; monitored: boolean; profile: QualityProfile; seasons: number; episodesPerSeason: number; monitorMode?: SeriesMonitorMode; destinationLibraryId?: string; minimumAvailability?: string; year?: number; externalId?: string; provider?: string; overview?: string; artworkUrl?: string; episodes?: EpisodeRecord[]; acquiredEpisodeKeys?: string[]; manualFields?: string[] }> }
       | undefined;
     for (const s of doc?.shows ?? []) {
       const episodes = new Map<string, EpisodeRecord>();
-      for (let se = 1; se <= s.seasons; se++) {
-        for (let e = 1; e <= s.episodesPerSeason; e++) {
-          episodes.set(episodeKey(se, e), {
-            seriesId: s.id,
-            season: se,
-            episode: e,
-            query: `${s.name} S${String(se).padStart(2, "0")}E${String(e).padStart(2, "0")}`,
-          });
+      if (Array.isArray(s.episodes)) {
+        for (const episode of s.episodes) episodes.set(episodeKey(episode.season, episode.episode), episode);
+      } else {
+        for (let se = 1; se <= s.seasons; se++) {
+          for (let e = 1; e <= s.episodesPerSeason; e++) {
+            episodes.set(episodeKey(se, e), {
+              seriesId: s.id,
+              season: se,
+              episode: e,
+              query: `${s.name} S${String(se).padStart(2, "0")}E${String(e).padStart(2, "0")}`,
+            });
+          }
         }
       }
-      shows.set(s.id, { ...s, episodes });
+      shows.set(s.id, {
+        ...s,
+        monitorMode: s.monitorMode ?? (s.monitored ? "all" : "none"),
+        episodes,
+        acquiredEpisodeKeys: new Set(s.acquiredEpisodeKeys ?? []),
+        manualFields: s.manualFields ?? [],
+      });
     }
   } catch {
     // Corrupt/absent snapshot: start clean rather than fail the mount.
@@ -110,6 +149,49 @@ async function restore(): Promise<void> {
 
 function episodeKey(season: number, episode: number): string {
   return `S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`;
+}
+
+function buildEpisodes(
+  seriesId: string,
+  name: string,
+  payload: Record<string, unknown>,
+  fallbackSeasons: number,
+  fallbackEpisodesPerSeason: number,
+): Map<string, EpisodeRecord> {
+  const episodes = new Map<string, EpisodeRecord>();
+  if (Array.isArray(payload.episodes)) {
+    for (const value of payload.episodes) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      const input = value as Record<string, unknown>;
+      const season = Number(input.season);
+      const episode = Number(input.episode);
+      if (!Number.isInteger(season) || season < 0 || season > 200 || !Number.isInteger(episode) || episode < 1 || episode > 1000) continue;
+      episodes.set(episodeKey(season, episode), {
+        seriesId,
+        season,
+        episode,
+        query: `${name} S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`,
+        ...(typeof input.title === "string" ? { title: input.title.trim().slice(0, 300) } : {}),
+        ...(typeof input.externalId === "string" ? { externalId: input.externalId.slice(0, 200) } : {}),
+        ...(typeof input.overview === "string" ? { overview: input.overview.slice(0, 5000) } : {}),
+        ...(typeof input.runtimeMinutes === "number" && Number.isInteger(input.runtimeMinutes) && input.runtimeMinutes > 0 && input.runtimeMinutes <= 10_000 ? { runtimeMinutes: input.runtimeMinutes } : {}),
+        ...(typeof input.stillPath === "string" && /^\/[A-Za-z0-9_./-]+$/.test(input.stillPath) ? { stillPath: input.stillPath.slice(0, 500) } : {}),
+        ...(typeof input.airDate === "string" ? { airDate: input.airDate.slice(0, 10) } : {}),
+      });
+    }
+  }
+  if (episodes.size > 0) return episodes;
+  for (let season = 1; season <= fallbackSeasons; season += 1) {
+    for (let episode = 1; episode <= fallbackEpisodesPerSeason; episode += 1) {
+      episodes.set(episodeKey(season, episode), {
+        seriesId,
+        season,
+        episode,
+        query: `${name} S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`,
+      });
+    }
+  }
+  return episodes;
 }
 
 /** Deterministic id from the show name so adds are idempotent by name. */
@@ -141,8 +223,48 @@ const plugin: PluginDefinition = definePlugin({
         case "add-series": {
           const name = String(payload.name ?? "").trim();
           if (!name) throw new Error("name required");
-          const id = `series-${slug(name)}`;
-          if (shows.has(id)) return { seriesId: id, created: false }; // idempotent add
+          const externalId = String(payload.externalId ?? "").trim();
+          const provider = String(payload.provider ?? "").trim();
+          const duplicate = externalId
+            ? [...shows].find(([, show]) => show.externalId === externalId && show.provider === provider)?.[0]
+            : undefined;
+          const namedId = `series-${slug(name)}`;
+          const named = shows.get(namedId);
+          const id = duplicate ?? (named && externalId && (named.externalId !== externalId || named.provider !== provider)
+            ? `${namedId}-${slug(provider)}-${slug(externalId)}` : namedId);
+          const monitorMode: SeriesMonitorMode = payload.monitorMode === "future" || payload.monitorMode === "missing" || payload.monitorMode === "none"
+            ? payload.monitorMode
+            : payload.monitored === false
+              ? "none"
+              : "all";
+          const existing = shows.get(id);
+          if (existing) {
+            if (externalId && (existing.externalId !== externalId || existing.provider !== provider)) throw new Error("series provider identity conflicts with an existing title");
+            const episodes = buildEpisodes(id, name, payload, existing.seasons, existing.episodesPerSeason);
+            const seasonCounts = new Map<number, number>();
+            for (const episode of episodes.values()) seasonCounts.set(episode.season, (seasonCounts.get(episode.season) ?? 0) + 1);
+            Object.assign(existing, {
+              name,
+              monitorMode,
+              monitored: monitorMode !== "none",
+              ...(payload.profile && typeof payload.profile === "object" ? { profile: payload.profile as QualityProfile } : {}),
+              ...(Array.isArray(payload.episodes) ? {
+                episodes,
+                seasons: seasonCounts.size,
+                episodesPerSeason: Math.max(0, ...seasonCounts.values()),
+                acquiredEpisodeKeys: new Set([...existing.acquiredEpisodeKeys].filter((key) => episodes.has(key))),
+              } : {}),
+              ...(typeof payload.destinationLibraryId === "string" ? { destinationLibraryId: payload.destinationLibraryId } : {}),
+              ...(typeof payload.minimumAvailability === "string" ? { minimumAvailability: payload.minimumAvailability } : {}),
+              ...(typeof payload.year === "number" ? { year: Math.trunc(payload.year) } : {}),
+              ...(externalId ? { externalId } : {}),
+              ...(provider ? { provider } : {}),
+              ...(typeof payload.overview === "string" ? { overview: payload.overview } : {}),
+              ...(typeof payload.artworkUrl === "string" ? { artworkUrl: payload.artworkUrl } : {}),
+            });
+            await persist();
+            return { seriesId: id, created: false };
+          }
           seq += 1;
           void seq;
           const seasons = typeof payload.seasons === "number" && payload.seasons > 0 ? Math.floor(payload.seasons) : 1;
@@ -151,37 +273,87 @@ const plugin: PluginDefinition = definePlugin({
               ? Math.floor(payload.episodesPerSeason)
               : 1;
           const profile = (payload.profile as QualityProfile | undefined) ?? defaultProfile();
-          const episodes = new Map<string, EpisodeRecord>();
-          for (let s = 1; s <= seasons; s++) {
-            for (let e = 1; e <= episodesPerSeason; e++) {
-              episodes.set(episodeKey(s, e), {
-                seriesId: id,
-                season: s,
-                episode: e,
-                query: `${name} S${String(s).padStart(2, "0")}E${String(e).padStart(2, "0")}`,
-              });
-            }
-          }
-          shows.set(id, { name, monitored: true, profile, seasons, episodesPerSeason, episodes });
-          await emitFn?.(EventTypes.SeriesAdded, { seriesId: id, name, seasons, episodesPerSeason });
+          const monitored = monitorMode !== "none";
+          const episodes = buildEpisodes(id, name, payload, seasons, episodesPerSeason);
+          const seasonCounts = new Map<number, number>();
+          for (const episode of episodes.values()) seasonCounts.set(episode.season, (seasonCounts.get(episode.season) ?? 0) + 1);
+          shows.set(id, {
+            name,
+            monitored,
+            profile,
+            seasons: seasonCounts.size,
+            episodesPerSeason: Math.max(0, ...seasonCounts.values()),
+            monitorMode,
+            ...(typeof payload.destinationLibraryId === "string" ? { destinationLibraryId: payload.destinationLibraryId } : {}),
+            ...(typeof payload.minimumAvailability === "string" ? { minimumAvailability: payload.minimumAvailability } : {}),
+            ...(typeof payload.year === "number" ? { year: Math.trunc(payload.year) } : {}),
+            ...(externalId ? { externalId } : {}),
+            ...(provider ? { provider } : {}),
+            ...(typeof payload.overview === "string" ? { overview: payload.overview } : {}),
+            ...(typeof payload.artworkUrl === "string" ? { artworkUrl: payload.artworkUrl } : {}),
+            episodes,
+            acquiredEpisodeKeys: new Set(),
+            manualFields: [],
+          });
+          await emitFn?.(EventTypes.SeriesAdded, { seriesId: id, name, seasons: seasonCounts.size, episodeCount: episodes.size, monitored, monitorMode });
           await persist();
           return { seriesId: id, created: true };
         }
+        case "list-series":
+          return {
+            series: [...shows.entries()]
+              .map(([seriesId, rec]) => ({
+                seriesId,
+                name: rec.name,
+                monitored: rec.monitored,
+                profile: rec.profile,
+                seasons: rec.seasons,
+                episodeCount: rec.episodes.size,
+                monitorMode: rec.monitorMode,
+                ...(rec.destinationLibraryId ? { destinationLibraryId: rec.destinationLibraryId } : {}),
+                ...(rec.minimumAvailability ? { minimumAvailability: rec.minimumAvailability } : {}),
+                ...(rec.year !== undefined ? { year: rec.year } : {}),
+                ...(rec.externalId ? { externalId: rec.externalId } : {}),
+                ...(rec.provider ? { provider: rec.provider } : {}),
+                ...(rec.overview !== undefined ? { overview: rec.overview } : {}),
+                ...(rec.artworkUrl ? { artworkUrl: rec.artworkUrl } : {}),
+                acquiredEpisodeCount: rec.acquiredEpisodeKeys.size,
+                acquisitionState: !rec.monitored
+                  ? "unmonitored"
+                  : rec.episodes.size > 0 && rec.acquiredEpisodeKeys.size >= rec.episodes.size
+                    ? "available"
+                    : "wanted",
+              }))
+              .sort((a, b) => a.name.localeCompare(b.name)),
+          };
         case "get-series": {
           const rec = shows.get(String(payload.seriesId ?? ""));
           if (!rec) throw new Error(`unknown series ${String(payload.seriesId)}`);
           return {
             seriesId: String(payload.seriesId),
             name: rec.name,
+            ...(rec.year !== undefined ? { year: rec.year } : {}),
             monitored: rec.monitored,
             profile: rec.profile,
+            seasons: rec.seasons,
             episodeCount: rec.episodes.size,
+            monitorMode: rec.monitorMode,
+            ...(rec.destinationLibraryId ? { destinationLibraryId: rec.destinationLibraryId } : {}),
+            ...(rec.minimumAvailability ? { minimumAvailability: rec.minimumAvailability } : {}),
+            ...(rec.externalId ? { externalId: rec.externalId } : {}),
+            ...(rec.provider ? { provider: rec.provider } : {}),
+            ...(rec.overview !== undefined ? { overview: rec.overview } : {}),
+            ...(rec.artworkUrl ? { artworkUrl: rec.artworkUrl } : {}),
+            acquiredEpisodeKeys: [...rec.acquiredEpisodeKeys],
+            manualFields: rec.manualFields ?? [],
+            episodes: [...rec.episodes.entries()].map(([episodeKey, episode]) => ({ episodeKey, ...episode })),
           };
         }
         case "set-monitoring": {
           const rec = shows.get(String(payload.seriesId ?? ""));
           if (!rec) throw new Error(`unknown series ${String(payload.seriesId)}`);
           rec.monitored = Boolean(payload.monitored);
+          rec.monitorMode = rec.monitored ? "all" : "none";
           await emitFn?.(EventTypes.SeriesMonitoringChanged, {
             seriesId: String(payload.seriesId),
             monitored: rec.monitored,
@@ -189,15 +361,63 @@ const plugin: PluginDefinition = definePlugin({
           await persist();
           return { seriesId: String(payload.seriesId), monitored: rec.monitored };
         }
+        case "set-monitor-mode": {
+          const seriesId = String(payload.seriesId ?? "");
+          const rec = shows.get(seriesId);
+          if (!rec) throw new Error(`unknown series ${seriesId}`);
+          const mode = payload.monitorMode;
+          if (mode !== "all" && mode !== "future" && mode !== "missing" && mode !== "none") throw new Error("invalid monitorMode");
+          rec.monitorMode = mode;
+          rec.monitored = mode !== "none";
+          await emitFn?.(EventTypes.SeriesMonitoringChanged, { seriesId, monitored: rec.monitored, monitorMode: mode });
+          await persist();
+          return { seriesId, monitored: rec.monitored, monitorMode: mode };
+        }
+        case "update-series": {
+          const seriesId = String(payload.seriesId ?? "");
+          const rec = shows.get(seriesId);
+          if (!rec) throw new Error(`unknown series ${seriesId}`);
+          if (payload.name !== undefined) {
+            const name = String(payload.name).trim();
+            if (!name) throw new Error("name required");
+            rec.name = name;
+          }
+          if (typeof payload.year === "number") rec.year = Math.trunc(payload.year);
+          if (payload.overview === null) delete rec.overview;
+          else if (typeof payload.overview === "string") rec.overview = payload.overview;
+          if (payload.artworkUrl === null) delete rec.artworkUrl;
+          else if (typeof payload.artworkUrl === "string") rec.artworkUrl = payload.artworkUrl;
+          if (typeof payload.destinationLibraryId === "string") rec.destinationLibraryId = payload.destinationLibraryId;
+          if (typeof payload.minimumAvailability === "string") rec.minimumAvailability = payload.minimumAvailability;
+          if (payload.profile && typeof payload.profile === "object") rec.profile = payload.profile as QualityProfile;
+          const mode = payload.monitorMode;
+          if (mode === "all" || mode === "future" || mode === "missing" || mode === "none") {
+            rec.monitorMode = mode;
+            rec.monitored = mode !== "none";
+          }
+          if (Array.isArray(payload.manualFields)) {
+            rec.manualFields = [...new Set(payload.manualFields.map(String).filter((field) => ["title", "year", "overview", "artworkUrl"].includes(field)))];
+          }
+          await persist();
+          return { seriesId, updated: true };
+        }
+        case "delete-series": {
+          const seriesId = String(payload.seriesId ?? "");
+          const deleted = shows.delete(seriesId);
+          if (deleted) await persist();
+          return { seriesId, deleted };
+        }
         case "wanted": {
           // Monitored episodes without an acquired release; the caller may
           // pass `acquiredKeys` (episode keys already grabbed/imported).
           const acquired = new Set(Array.isArray(payload.acquiredKeys) ? (payload.acquiredKeys as unknown[]).map(String) : []);
           const out: Array<{ seriesId: string; episodeKey: string; query: string }> = [];
+          const today = new Date().toISOString().slice(0, 10);
           for (const [seriesId, rec] of shows) {
             if (!rec.monitored) continue;
             for (const [key, ep] of rec.episodes) {
-              if (!acquired.has(`${seriesId}:${key}`)) {
+              if (rec.monitorMode === "future" && ep.airDate && ep.airDate < today) continue;
+              if (!rec.acquiredEpisodeKeys.has(key) && !acquired.has(`${seriesId}:${key}`)) {
                 out.push({ seriesId, episodeKey: key, query: ep.query });
               }
             }
@@ -219,8 +439,17 @@ const plugin: PluginDefinition = definePlugin({
           );
           return { searched: true, query: ep.query };
         }
-        case "mark-acquired":
-          return { marked: true };
+        case "mark-acquired": {
+          const seriesId = String(payload.seriesId ?? "");
+          const key = String(payload.episodeKey ?? "");
+          const rec = shows.get(seriesId);
+          if (!rec) throw new Error(`unknown series ${seriesId}`);
+          if (!rec.episodes.has(key)) throw new Error(`unknown episode ${key}`);
+          const marked = !rec.acquiredEpisodeKeys.has(key);
+          rec.acquiredEpisodeKeys.add(key);
+          if (marked) await persist();
+          return { marked, seriesId, episodeKey: key };
+        }
         case "conformance-probe":
           return { ok: true };
         default:

@@ -13,6 +13,7 @@ import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "@sinclair/typebox";
+import { userAvatar } from "./user-avatar.js";
 import { AuthService, API_KEY_PREFIX } from "./auth.js";
 import type { EventBus } from "./events.js";
 import type { Supervisor } from "./supervisor.js";
@@ -22,9 +23,11 @@ import { registerAdminRoutes, type AdminDeps } from "./admin.js";
 import { registerLibraryRoutes, type LibraryDeps } from "./library-routes.js";
 import { registerIndexerRoutes, type IndexerDeps } from "./indexer-routes.js";
 import { registerOpsRoutes, type OpsDeps } from "./ops-routes.js";
+import { createMovieMetadataService } from "./movie-metadata.js";
 import { registerNamingRoutes, type NamingDeps } from "./naming-routes.js";
 import type { IndexerSettingsService } from "./indexer-settings.js";
 import { OnboardingService, OnboardingError } from "./onboarding.js";
+import { getVersionMetadata, TANTALAR_RELEASE } from "./version.js";
 import type { Kysely } from "kysely";
 import type { Db } from "@tantalar/db";
 
@@ -72,6 +75,8 @@ function bearerToken(header: unknown): string | undefined {
 /* eslint-disable @typescript-eslint/no-explicit-any */
 export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   const app: FastifyInstance = Fastify({ logger: false });
+  const version = getVersionMetadata();
+  const movieMetadata = createMovieMetadataService(deps.container);
   await app.register(cookie);
   await app.register(websocket);
 
@@ -126,16 +131,18 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     reply.code(code).send({ error: err.message });
   });
 
-  app.get("/healthz", async () => ({ ok: true }));
+  app.get("/healthz", async () => ({ ok: true, version }));
   app.get("/readyz", async (_req: any, reply: any) => {
-    if (deps.ready()) return { ok: true };
+    if (deps.ready()) return { ok: true, version };
     const detail = deps.readiness?.();
     return reply.code(503).send({
       ok: false,
+      version,
       listening: detail?.listening ?? null,
       missingCapabilities: detail?.missingCapabilities ?? [],
     });
   });
+  app.get("/api/v1/version", async () => version);
 
   // Secure one-time bootstrap (wave 2, TAN-002): when no user exists yet,
   // exactly one administrator may be created without a session. The check
@@ -238,10 +245,10 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     if (!session) return reply.code(401).send({ error: "unauthorized" });
     const [user] = await deps.db!
       .selectFrom("users")
-      .select(["id", "username", "role"])
+      .select(["id", "username", "role", "avatar"])
       .where("id", "=", session.userId)
       .execute();
-    return { user: user ?? null };
+    return { user: user ? { ...user, avatar: userAvatar(user.id, user.avatar) } : null };
   });
 
   app.post("/api/v1/auth/logout", async (request: any, reply: any) => {
@@ -256,12 +263,18 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   app.get("/api/v1/events", async (request: any, reply: any) => {
     if (!(await requireAuth(reply, request, "events.read"))) return;
     const q = (request.query ?? {}) as Record<string, string | undefined>;
+    const requestedLimit = q.limit === undefined ? 100 : Number(q.limit);
+    if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1) {
+      return reply.code(400).send({ error: "limit must be a positive integer" });
+    }
+    const limit = Math.min(requestedLimit, 500);
     const events = await deps.bus.read({
       ...(q.typePrefix ? { typePrefix: q.typePrefix } : {}),
       ...(q.correlationId ? { correlationId: q.correlationId } : {}),
       ...(q.subject ? { subject: q.subject } : {}),
       ...(q.afterEventId ? { afterEventId: q.afterEventId } : {}),
-      ...(q.limit ? { limit: Number(q.limit) } : {}),
+      limit,
+      newestFirst: true,
     });
     return { events };
   });
@@ -335,21 +348,36 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       }
       return cached;
     };
-    registerServingRoutes(app, servingDeps());
+    registerServingRoutes(app, {
+      ...servingDeps(),
+      enrichItems: async items => {
+        const enriched = await movieMetadata.enrichItems(items);
+        const files = await deps.db?.selectFrom("media_catalog").select(["fileId", "quality"]).execute() ?? [];
+        const quality = new Map(files.map(file => [file.fileId, file.quality]));
+        return enriched.map(item => ({ ...item, ...(quality.get(item.fileId) && quality.get(item.fileId) !== "unknown" ? { qualityProfile: quality.get(item.fileId) } : {}) }));
+      },
+      artwork: async (fileId, variant) => {
+        const item = await deps.db?.selectFrom("media_catalog").select("itemKey").where("fileId", "=", fileId).executeTakeFirst();
+        if (!item) throw new Error("artwork unavailable");
+        return movieMetadata.itemArtwork(item.itemKey, variant);
+      },
+    });
   }
 
   app.post("/api/v1/plugins/:id/capabilities/:capability/:operation", async (request: any, reply: any) => {
-    if (!(await requireAuth(reply, request, "plugins.invoke"))) return;
+    const auth = await requireAuth(reply, request, "plugins.invoke");
+    if (!auth) return;
+    if (auth.kind === "session" && auth.role !== "admin") {
+      return reply.code(403).send({ error: "administrator required" });
+    }
     if (!csrfOk(request)) return reply.code(403).send({ error: "csrf required" });
     const capability: string = request.params?.["capability"] ?? "";
+    const pluginId: string = request.params?.["id"] ?? "";
     let provider;
     try {
-      provider = deps.container.resolve(capability);
+      provider = deps.container.resolveProvider(capability, pluginId);
     } catch (err) {
       return reply.code(503).send({ error: (err as Error).message });
-    }
-    if (provider.pluginId !== (request.params?.["id"] ?? "")) {
-      return reply.code(404).send({ error: "capability not provided by that plugin" });
     }
     const result = await provider.invoke(
       request.params?.["operation"] ?? "",
@@ -457,7 +485,7 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   // ---- Wave 9 operations surface (TAN-030–043) ----
   // Same guard chain as admin: authenticated, admin-only mutations with CSRF.
   if (deps.ops) {
-    registerOpsRoutes(app, deps.ops);
+    registerOpsRoutes(app, { ...deps.ops, ...(deps.library ? { library: deps.library } : {}) }, movieMetadata);
   }
 
   // Web UI (architecture §4): in production the built SPA under apps/web/dist
@@ -482,10 +510,16 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   // Runtime OpenAPI document (architecture §10: generated, not hand-written).
   app.get("/openapi.json", async () => ({
     openapi: "3.0.3",
-    info: { title: "Tantalar API", version: "0.1.0" },
+    info: {
+      title: "Tantalar API",
+      version: TANTALAR_RELEASE.version,
+      "x-tantalar-release-label": TANTALAR_RELEASE.label,
+      "x-tantalar-release-channel": TANTALAR_RELEASE.channel,
+    },
     paths: {
       "/healthz": { get: { responses: { "200": { description: "liveness" } } } },
       "/readyz": { get: { responses: { "200": { description: "readiness" }, "503": { description: "not ready" } } } },
+      "/api/v1/version": { get: { responses: { "200": { description: "application and build version" } } } },
       "/api/v1/auth/login": {
         post: {
           requestBody: { content: { "application/json": { schema: LoginBody } } },

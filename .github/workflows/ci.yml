@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, staging]
   pull_request:
 
 jobs:
@@ -24,6 +24,15 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
+      - name: External media tools for integration tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends par2 ffmpeg xz-utils
+          node scripts/install-test-7zip.mjs
+
+      - name: Release version consistency
+        run: pnpm run version:check
+
       - name: Typecheck
         run: pnpm run typecheck
 
@@ -39,6 +48,9 @@ jobs:
 
       - name: Test (SQLite)
         run: pnpm exec vitest run --no-file-parallelism
+
+      - name: Test (web)
+        run: pnpm --filter @tantalar/web test
 
       - name: Postgres
         run: |
@@ -80,15 +92,29 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     needs: check
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      staging-image: ${{ steps.publish.outputs.image }}
     steps:
       - uses: actions/checkout@v4
+      - name: Build metadata
+        id: build-metadata
+        run: echo "built-at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
       - name: Build image
-        run: docker build -t tantalar:ci .
+        run: |
+          docker build \
+            --build-arg TANTALAR_BUILD_VERSION="$(node scripts/version.mjs show version)" \
+            --build-arg TANTALAR_BUILD_REVISION="$GITHUB_SHA" \
+            --build-arg TANTALAR_BUILD_DATE="${{ steps.build-metadata.outputs.built-at }}" \
+            -t tantalar:ci .
       - name: Smoke boot (SQLite)
         run: |
           docker run -d --name tantalar-smoke -p 8790:8790 tantalar:ci
+          expected="$(node scripts/version.mjs show version)"
           for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8790/healthz | grep -q '"ok":true'; then
+            if curl -fsS http://127.0.0.1:8790/healthz | grep -q "\"version\":\"$expected\""; then
               echo "smoke boot OK"; exit 0
             fi
             sleep 2
@@ -99,6 +125,69 @@ jobs:
       - name: Stop smoke container
         if: always()
         run: docker rm -f tantalar-smoke || true
+      - name: Publish tested staging image
+        id: publish
+        if: github.event_name == 'push' && github.ref == 'refs/heads/staging'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          image="ghcr.io/nerkza/tantalar:staging-$GITHUB_SHA"
+          docker tag tantalar:ci "$image"
+          docker push "$image"
+          echo "image=$(docker inspect --format '{{index .RepoDigests 0}}' "$image")" >> "$GITHUB_OUTPUT"
+
+  metadata-staging:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/staging'
+    needs: [check, licenses, vulnerability-scan]
+    uses: ./.github/workflows/metadata-staging.yml
+
+  app-staging:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/staging'
+    needs: [docker, metadata-staging]
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      packages: read
+    concurrency:
+      group: application-staging
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy current staging commit to VPS
+        env:
+          STAGING_IMAGE: ${{ needs.docker.outputs.staging-image }}
+          SSH_HOST: ${{ vars.TANTALAR_STAGING_SSH_HOST }}
+          SSH_USER: ${{ vars.TANTALAR_STAGING_SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.TANTALAR_STAGING_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.TANTALAR_STAGING_KNOWN_HOSTS }}
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.TANTALAR_STAGING_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.TANTALAR_STAGING_ACCESS_CLIENT_SECRET }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin staging
+          if [ "$(git rev-parse origin/staging)" != "$GITHUB_SHA" ]; then
+            echo "A newer staging commit exists; skipping deployment."
+            exit 0
+          fi
+          : "${SSH_HOST:?set the staging SSH host}" "${SSH_USER:?set the staging SSH user}"
+          : "${SSH_PRIVATE_KEY:?set the deployment key}" "${SSH_KNOWN_HOSTS:?pin the VPS host key}"
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/id_ed25519 ~/.ssh/known_hosts
+          docker pull cloudflare/cloudflared:2026.8.3
+          printf 'Host %s\n  ProxyCommand docker run --rm -i -e TUNNEL_SERVICE_TOKEN_ID -e TUNNEL_SERVICE_TOKEN_SECRET cloudflare/cloudflared:2026.8.3 access ssh --hostname %%h\n' "$SSH_HOST" > ~/.ssh/config
+          target="$SSH_USER@$SSH_HOST"
+          release="/srv/tantalar-staging/releases/$GITHUB_SHA"
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$target" "mkdir -p '$release'"
+          scp -o BatchMode=yes -o StrictHostKeyChecking=yes docker/compose.staging.yml docker/staging.yaml scripts/deploy-staging.sh "$target:$release/"
+          printf '%s' "$GHCR_TOKEN" | ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$target" "cd '$release' && sh deploy-staging.sh '$STAGING_IMAGE' '$GITHUB_SHA' '$GITHUB_ACTOR'"
+      - name: Remove deployment key
+        if: always()
+        run: rm -f ~/.ssh/id_ed25519
 
   vulnerability-scan:
     runs-on: ubuntu-latest

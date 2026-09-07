@@ -7,7 +7,7 @@
  * confirmDelete, and traceable events for every mutation.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, existsSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Kysely } from "kysely";
@@ -33,7 +33,7 @@ const cookieRef = { current: "" };
 const viewerCookieRef = { current: "" };
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "tantalar-wave3-api-"));
+  dir = realpathSync(mkdtempSync(join(tmpdir(), "tantalar-wave3-api-")));
   db = await openDatabase({ dialect: "sqlite", sqlitePath: join(dir, "test.db") });
   await migrate(db);
   auth = new AuthService(db);
@@ -151,6 +151,19 @@ describe("library API auth boundaries", () => {
 });
 
 describe("library API flows", () => {
+  it("rejects relative library roots before resolving them against the server cwd", async () => {
+    await login("admin", "password-admin-1");
+
+    const response = await send("/api/v1/libraries", "POST", {
+      name: "Relative API Lib",
+      rootPath: ".",
+      kind: "movie",
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "library root must be an absolute path" });
+  });
+
   it("create → edit → disable → remove; media never deleted by remove", async () => {
     await login("admin", "password-admin-1");
     const root = makeRoot("api-lib");
@@ -207,6 +220,9 @@ describe("library API flows", () => {
   it("validate and rescan are exposed and event-traced", async () => {
     await login("admin", "password-admin-1");
     const root = makeRoot("api-lib-val");
+    const nested = join(root, "Nested");
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(join(nested, "Movie.mp4"), "video");
     const lib = ((await (await send("/api/v1/libraries", "POST", { name: "Val API", rootPath: root, kind: "mixed" })).json()) as {
       library: { id: string };
     }).library;
@@ -217,7 +233,11 @@ describe("library API flows", () => {
     expect(val.results.some((r) => r.ok)).toBe(true);
 
     const rescan = await send(`/api/v1/libraries/${lib.id}/rescan`, "POST");
-    expect((await rescan.json() as { checked: number }).checked).toBe(0);
+    expect(await rescan.json()).toMatchObject({ checked: 1, discovered: 1, existing: 0, missingRemoved: 0, errors: [] });
+    const catalog = (await (await get(`/api/v1/catalog?libraryId=${lib.id}`, { cookie: `${cookieRef.current}` })).json()) as {
+      items: Array<{ path: string; method: string }>;
+    };
+    expect(catalog.items).toEqual([expect.objectContaining({ path: realpathSync(join(nested, "Movie.mp4")), method: "existing" })]);
 
     const scanEvents = await bus.read({ typePrefix: EventTypes.LibraryRescanCompleted });
     expect(scanEvents.length).toBeGreaterThanOrEqual(1);

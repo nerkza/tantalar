@@ -1,19 +1,13 @@
 /**
- * Real VPN lifecycle + fail-closed kill switch (Wave 6, TAN-044/TAN-045).
+ * VPN policy, lifecycle seams and fail-closed dispatch gate.
  *
- * Replaces the phase-3b MemoryNetControl-only surface. The plugin now owns:
- *  - validated tunnel configuration (WireguardAdapter / OpenVpnAdapter over
- *    a PrivilegedRunner seam — see adapters.ts);
- *  - safe profile file handling (0600 files in a 0700 state dir);
- *  - interface detection, route pinning, DNS pinning, health (route +
- *    public endpoint, never process state), rotation and recovery;
- *  - durable audit state via ctx.storage;
- *  - a fail-closed kill switch: any non-healthy health transition BLOCKS
- *    every bound client first, closes sockets/routes before retry.
+ * The plugin owns strict WireGuard validation, safe 0600/0700 profile-file
+ * materialization, durable redacted policy intent, trusted host preflight and
+ * a fail-closed logical gate. Adapter seams exist for later Linux-boundary
+ * work, but normal boot does not claim route, DNS or leak enforcement.
  *
- * The kill switch is ALSO enforced inside both embedded download clients
- * (torrent-native, usenet-native) at their `add` boundary so no dispatch
- * path can bypass it.
+ * This package does not claim a complete network kill switch. Apply stays
+ * unavailable in normal boot until a trusted Linux boundary is wired.
  */
 import { runPlugin, definePlugin, type PluginDefinition } from "@tantalar/plugin-sdk";
 import {
@@ -30,18 +24,21 @@ import {
   validateProfileConfig,
   writeProfileFile,
   WireguardAdapter,
-  OpenVpnAdapter,
   SpawnPrivilegedRunner,
+  inspectWireguardHost,
   type PrivilegedRunner,
   type TunnelAdapter,
+  type WireguardHostPreflight,
 } from "./adapters.js";
 
 const VPN_CAPABILITY = "dev.tantalar.capability.vpn-binding";
 const PLUGIN_ID = "dev.tantalar.plugin.vpn-manager";
+const STATE_KEY = "vpn-state-v1";
+const AUDIT_KEY = "vpn-audit";
 
 const manifest = validateManifest({
   id: PLUGIN_ID,
-  version: "0.2.0",
+  version: "0.1.0",
   protocolVersion: PROTOCOL_VERSION,
   provides: [VPN_CAPABILITY],
   requires: ["dev.tantalar.capability.event.emit", "dev.tantalar.capability.log"],
@@ -61,7 +58,7 @@ export interface NetControl {
   block(clientId: string): Promise<void>;
 }
 
-/** In-memory control for pure-handler tests; production wires real adapters. */
+/** In-memory control for pure-handler tests. */
 export class MemoryNetControl implements NetControl {
   readonly bound = new Map<string, string>();
   readonly blocked = new Set<string>();
@@ -167,7 +164,29 @@ interface ProfileRecord {
   config?: ReturnType<typeof validateProfileConfig>;
 }
 
+interface PluginStorage {
+  get(key: string): Promise<{ doc: unknown } | null>;
+  put(key: string, doc: unknown): Promise<void>;
+}
+
+interface DurableVpnState {
+  readonly version: 1;
+  /** Metadata only. Tunnel configuration and credentials are never stored here. */
+  readonly profiles: readonly VpnProfile[];
+  readonly bindings: readonly ClientBinding[];
+}
+
 const WG_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+const CLIENT_ID_RE = /^[a-zA-Z0-9._-]{1,160}$/;
+const AUDIT_ACTIONS = new Set<AuditEntry["action"]>(["bind", "unbind", "block", "health", "tunnel-up", "rotate", "recover"]);
+
+function safeEndpointHost(value: unknown): string {
+  const host = typeof value === "string" ? value.trim() : "";
+  if (host.length === 0 || host.length > 253 || /[@/?#\s]/.test(host)) return "unknown";
+  if (/^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(host)) return host;
+  if (/^[0-9a-fA-F:]+$/.test(host)) return host;
+  return "unknown";
+}
 
 /**
  * Build the vpn-binding handler surface against explicit dependencies.
@@ -178,9 +197,10 @@ export function createVpnHandlers(
   deps: {
     netControl?: NetControl;
     emit?: EmitFn;
-    storage?: { get(key: string): Promise<{ doc: unknown } | null>; put(key: string, doc: unknown): Promise<void> };
+    storage?: PluginStorage;
     runner?: PrivilegedRunner;
     stateDir?: string;
+    platform?: string;
   } = {},
 ) {
   const profiles = new Map<string, ProfileRecord>();
@@ -190,33 +210,106 @@ export function createVpnHandlers(
   const tunnelHealth = new Map<string, TunnelHealth>();
   let emitFn: EmitFn | null = deps.emit ?? null;
   let auditLog: AuditEntry[] = [];
+  let lastPreflight: WireguardHostPreflight | null = null;
+
+  const profileSummaries = (): VpnProfile[] => [...profiles.values()].map((record) => ({ ...record.profile }));
+
+  async function persistState(): Promise<void> {
+    if (!deps.storage) return;
+    const durable: DurableVpnState = {
+      version: 1,
+      profiles: profileSummaries(),
+      bindings: [...bindings.entries()].map(([clientId, profileId]) => ({ clientId, profileId })),
+    };
+    await deps.storage.put(STATE_KEY, durable);
+  }
 
   async function persistAudit(entry: AuditEntry): Promise<void> {
     auditLog.push({ ...entry, at: new Date().toISOString() });
     auditLog = auditLog.slice(-500); // bounded audit trail
-    if (deps.storage) await deps.storage.put("vpn-audit", { entries: auditLog });
+    if (deps.storage) await deps.storage.put(AUDIT_KEY, { entries: auditLog });
+  }
+
+  async function restore(): Promise<void> {
+    if (!deps.storage) return;
+    const [stateHit, auditHit] = await Promise.all([
+      deps.storage.get(STATE_KEY),
+      deps.storage.get(AUDIT_KEY),
+    ]);
+
+    const savedAudit = (auditHit?.doc as { entries?: unknown } | undefined)?.entries;
+    if (Array.isArray(savedAudit)) {
+      auditLog = savedAudit
+        .filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object"
+          && AUDIT_ACTIONS.has((entry as Record<string, unknown>)["action"] as AuditEntry["action"]))
+        .slice(-500)
+        .map((entry) => ({
+          action: entry["action"] as AuditEntry["action"],
+          ...(typeof entry["at"] === "string" ? { at: entry["at"] } : {}),
+          ...(typeof entry["clientId"] === "string" && CLIENT_ID_RE.test(entry["clientId"])
+            ? { clientId: entry["clientId"] } : {}),
+          ...(typeof entry["profileId"] === "string" && WG_ID_RE.test(entry["profileId"])
+            ? { profileId: entry["profileId"] } : {}),
+          ...(typeof entry["detail"] === "string" && entry["detail"].length <= 160
+            ? { detail: entry["detail"] } : {}),
+        }));
+    }
+
+    const saved = stateHit?.doc as Partial<DurableVpnState> | undefined;
+    if (saved?.version !== 1) return;
+    if (Array.isArray(saved.profiles)) {
+      for (const profile of saved.profiles) {
+        if (!profile || typeof profile !== "object") continue;
+        const profileId = String(profile.profileId ?? "");
+        if (!WG_ID_RE.test(profileId)) continue;
+        if (profile.protocol !== "wireguard" && profile.protocol !== "openvpn") continue;
+        if (!profiles.has(profileId)) {
+          profiles.set(profileId, {
+            profile: {
+              profileId,
+              protocol: profile.protocol,
+              endpointHost: safeEndpointHost(profile.endpointHost),
+            },
+          });
+        }
+      }
+    }
+
+    bindings.clear();
+    killSwitched.clear();
+    if (Array.isArray(saved.bindings)) {
+      for (const binding of saved.bindings) {
+        if (!binding || typeof binding !== "object") continue;
+        const clientId = typeof binding.clientId === "string" ? binding.clientId : "";
+        const profileId = typeof binding.profileId === "string" ? binding.profileId : "";
+        if (!CLIENT_ID_RE.test(clientId) || !WG_ID_RE.test(profileId)) continue;
+        bindings.set(clientId, profileId);
+        killSwitched.add(clientId);
+        tunnelHealth.set(profileId, "down");
+        await deps.netControl?.block(clientId);
+      }
+    }
+  }
+
+  async function preflight(): Promise<WireguardHostPreflight> {
+    const runner = deps.runner ?? new SpawnPrivilegedRunner();
+    lastPreflight = await inspectWireguardHost(runner, deps.platform ?? process.platform);
+    return lastPreflight;
   }
 
   async function setHealth(profileId: string, health: TunnelHealth): Promise<TunnelState> {
     const record = profiles.get(profileId);
     if (!record) throw new Error(`unknown vpn profile ${profileId}`);
+    if (health !== "healthy" && health !== "degraded" && health !== "down") {
+      throw new Error(`invalid tunnel health ${JSON.stringify(health)}`);
+    }
     const previous = tunnelHealth.get(profileId) ?? "down";
-    tunnelHealth.set(profileId, health);
 
-    // Kill switch enforcement on ANY non-healthy report for a bound client:
-    // every bound client is BLOCKED (sockets/routes closed) before anything
-    // else happens — including the first-ever report, not just transitions.
-    // The binding record is KEPT but flagged blocked so the fail-closed gate
-    // denies dispatch: an unbound-looking client must never silently fall
-    // back to the default route. Dispatch reopens ONLY through an explicit
-    // healthy report (route + public endpoint proven), which also triggers
-    // a fresh bind on the control seam.
     if (health !== "healthy") {
+      tunnelHealth.set(profileId, health);
       for (const [clientId, boundProfile] of bindings) {
         if (boundProfile !== profileId) continue;
-        if (!killSwitched.has(clientId) || previous === "healthy") {
-          await deps.netControl?.block(clientId); // stop transfer before fallback routing
-        }
+        await deps.netControl?.block(clientId);
         killSwitched.add(clientId);
         await persistAudit({ action: "block", clientId, profileId, detail: `health=${health}` });
         await emitFn?.(EventTypes.TunnelHealthChanged, {
@@ -226,11 +319,20 @@ export function createVpnHandlers(
           killSwitchEngaged: true,
         });
       }
-    } else if (previous !== "healthy") {
+    } else {
+      // Health can only reopen a binding when trusted lifecycle control exists.
+      // Bind first; publish healthy and clear the logical block only after every
+      // required network mutation succeeds.
+      if (!deps.netControl) throw new Error("vpn lifecycle control unavailable; tunnel remains blocked");
+      for (const [clientId, boundProfile] of bindings) {
+        if (boundProfile === profileId && (killSwitched.has(clientId) || previous !== "healthy")) {
+          await deps.netControl.bind(clientId, profileId);
+        }
+      }
+      tunnelHealth.set(profileId, "healthy");
       for (const [clientId, boundProfile] of bindings) {
         if (boundProfile === profileId && killSwitched.has(clientId)) {
           killSwitched.delete(clientId);
-          await deps.netControl?.bind(clientId, profileId); // re-pin routes/DNS after recovery
           await persistAudit({ action: "bind", clientId, profileId, detail: "recovered" });
         }
       }
@@ -249,7 +351,7 @@ export function createVpnHandlers(
     if (config.protocol === "wireguard") {
       return new WireguardAdapter(runner, record.profile.profileId);
     }
-    return new OpenVpnAdapter(runner, config.device);
+    throw new Error("openvpn apply is disabled in this build");
   }
 
   return {
@@ -266,11 +368,11 @@ export function createVpnHandlers(
           void emitFn?.(EventTypes.TunnelHealthChanged, { profileId, health: "down", configRejected: true }).catch(() => undefined);
           continue;
         }
-        // Registration accepts metadata-only profiles (no configText yet);
-        // full validation runs when the config file is materialized.
+        // Registration accepts metadata-only profiles. WireGuard configuration
+        // is validated now, before it can touch disk. OpenVPN stays metadata-only.
         let config: ReturnType<typeof validateProfileConfig> | null = null;
         try {
-          if (typeof p.configText === "string" && p.configText.length > 0) {
+          if (protocol === "wireguard" && typeof p.configText === "string" && p.configText.length > 0) {
             config = validateProfileConfig(p);
           }
         } catch {
@@ -281,12 +383,42 @@ export function createVpnHandlers(
           profile: {
             profileId,
             protocol,
-            endpointHost: String(p.endpointHost ?? "unknown"),
+            endpointHost: safeEndpointHost(p.endpointHost),
           },
           ...(config !== null ? { config } : {}),
         });
+        if (protocol === "openvpn" && typeof p.configText === "string" && p.configText.length > 0) {
+          void emitFn?.(EventTypes.TunnelHealthChanged, {
+            profileId,
+            health: "down",
+            applyDisabled: true,
+          }).catch(() => undefined);
+        }
       }
     },
+
+    loadBindings(rawBindings: Array<Record<string, unknown>>): void {
+      bindings.clear();
+      killSwitched.clear();
+      for (const raw of rawBindings) {
+        const clientId = typeof raw.clientId === "string" ? raw.clientId.trim() : "";
+        const profileId = typeof raw.profileId === "string" ? raw.profileId.trim() : "";
+        if (!CLIENT_ID_RE.test(clientId) || !WG_ID_RE.test(profileId)) continue;
+        bindings.set(clientId, profileId);
+        killSwitched.add(clientId);
+        tunnelHealth.set(profileId, "down");
+      }
+    },
+
+    restore,
+
+    persist: persistState,
+
+    trustedHealthReport(profileId: string, health: TunnelHealth): Promise<TunnelState> {
+      return setHealth(profileId, health);
+    },
+
+    preflight,
 
     /** Write profile configs safely (0600) into the managed state dir. */
     materializeProfiles(): Record<string, string> {
@@ -302,6 +434,15 @@ export function createVpnHandlers(
     buildLifecycleControl(): LifecycleNetControl {
       const runner = deps.runner ?? new SpawnPrivilegedRunner();
       const map = new Map<string, { config: ReturnType<typeof validateProfileConfig>; adapter: TunnelAdapter; path: string | null }>();
+      const dir = deps.stateDir ?? "/var/lib/tantalar/vpn";
+      for (const [profileId, record] of profiles) {
+        if (!record.config) continue;
+        map.set(profileId, {
+          config: record.config,
+          adapter: buildAdapter(record),
+          path: writeProfileFile(dir, record.config),
+        });
+      }
       return new LifecycleNetControl(runner, map, persistAudit);
     },
 
@@ -310,18 +451,19 @@ export function createVpnHandlers(
     },
 
     async recover(): Promise<number> {
-      // Restart recovery: every previously-bound client re-verifies its
-      // tunnel; anything that cannot prove healthy stays blocked.
+      // Restart recovery never deletes desired binding intent. Deleting it
+      // would make pre-dispatch treat the client as explicitly direct.
       let recovered = 0;
       for (const [clientId, profileId] of [...bindings]) {
         const health = tunnelHealth.get(profileId) ?? "down";
-        if (health === "healthy") recovered += 1;
+        if (health === "healthy" && deps.netControl) recovered += 1;
         else {
-          bindings.delete(clientId);
           await deps.netControl?.block(clientId);
+          killSwitched.add(clientId);
           await persistAudit({ action: "recover", clientId, profileId, detail: "blocked-unhealthy" });
         }
       }
+      await persistState();
       return recovered;
     },
 
@@ -329,7 +471,36 @@ export function createVpnHandlers(
       [VPN_CAPABILITY]: async (operation: string, payload: Record<string, unknown>): Promise<unknown> => {
         switch (operation) {
           case "profiles":
-            return { profiles: [...profiles.values()].map((r) => r.profile) };
+            return { profiles: profileSummaries() };
+          case "preflight": {
+            const host = await preflight();
+            return {
+              ...host,
+              lifecycleControlReady: Boolean(deps.netControl),
+              enforcementReady: host.supported && Boolean(deps.netControl),
+            };
+          }
+          case "status": {
+            const host = await preflight();
+            return {
+              host,
+              lifecycleControlReady: Boolean(deps.netControl),
+              enforcementReady: host.supported && Boolean(deps.netControl),
+              openvpnApplySupported: false,
+              profiles: [...profiles.values()].map((record) => ({
+                ...record.profile,
+                configured: Boolean(record.config),
+                applySupported: record.profile.protocol === "wireguard" && Boolean(record.config)
+                  && host.supported && Boolean(deps.netControl),
+              })),
+              bindings: [...bindings.entries()].map(([clientId, profileId]) => ({
+                clientId,
+                profileId,
+                blocked: killSwitched.has(clientId) || tunnelHealth.get(profileId) !== "healthy" || !deps.netControl,
+              })),
+              checkedAt: lastPreflight?.checkedAt ?? host.checkedAt,
+            };
+          }
           case "bindings": {
             const out: ClientBinding[] = [...bindings.entries()].map(([clientId, profileId]) => ({
               clientId,
@@ -339,37 +510,54 @@ export function createVpnHandlers(
           }
           case "set-binding": {
             const clientId = String(payload.clientId ?? "");
-            if (!clientId) throw new Error("clientId required");
+            if (!CLIENT_ID_RE.test(clientId)) throw new Error("valid clientId required");
             if (payload.profileId === null || payload.profileId === undefined || payload.profileId === "") {
               // Explicit VPN-disable path: back to direct binding.
               await deps.netControl?.unbind(clientId);
               bindings.delete(clientId);
+              killSwitched.delete(clientId);
+              await persistState();
               await persistAudit({ action: "unbind", clientId });
               return { clientId, profileId: null };
             }
             const profileId = String(payload.profileId);
-            if (!profiles.has(profileId)) throw new Error(`unknown vpn profile ${profileId}`);
-            await deps.netControl?.bind(clientId, profileId);
+            const record = profiles.get(profileId);
+            if (!record) throw new Error(`unknown vpn profile ${profileId}`);
+            if (record.profile.protocol !== "wireguard") throw new Error("openvpn apply is disabled in this build");
             bindings.set(clientId, profileId);
-            killSwitched.delete(clientId); // explicit re-bind re-opens the gate
-            await persistAudit({ action: "bind", clientId, profileId });
-            return { clientId, profileId };
+            killSwitched.add(clientId);
+            tunnelHealth.set(profileId, "down");
+            await persistState();
+            if (!deps.netControl) {
+              await persistAudit({ action: "block", clientId, profileId, detail: "lifecycle-control-unavailable" });
+              return { clientId, profileId, applied: false, blocked: true, reason: "lifecycle-control-unavailable" };
+            }
+            await deps.netControl.bind(clientId, profileId);
+            await persistAudit({ action: "bind", clientId, profileId, detail: "awaiting-trusted-health" });
+            return { clientId, profileId, applied: true, blocked: true, reason: "awaiting-trusted-health" };
           }
           case "rotate-tunnel": {
             const clientId = String(payload.clientId ?? "");
+            if (!CLIENT_ID_RE.test(clientId)) throw new Error("valid clientId required");
             const fromId = String(payload.fromProfileId ?? "");
             const toId = String(payload.toProfileId ?? "");
             if (!profiles.has(fromId)) throw new Error(`unknown vpn profile ${fromId}`);
-            if (!profiles.has(toId)) throw new Error(`unknown vpn profile ${toId}`);
+            const target = profiles.get(toId);
+            if (!target) throw new Error(`unknown vpn profile ${toId}`);
+            if (target.profile.protocol !== "wireguard") throw new Error("openvpn apply is disabled in this build");
+            if (!deps.netControl) throw new Error("vpn lifecycle control unavailable; tunnel remains blocked");
             // Rotation ordering: block (teardown) THEN bind the new tunnel.
-            await deps.netControl?.block(clientId);
-            await deps.netControl?.bind(clientId, toId);
+            killSwitched.add(clientId);
+            await deps.netControl.block(clientId);
+            await deps.netControl.bind(clientId, toId);
             bindings.set(clientId, toId);
+            tunnelHealth.set(toId, "down");
+            await persistState();
             await persistAudit({ action: "rotate", clientId, profileId: toId, detail: `from=${fromId}` });
-            return { clientId, profileId: toId, rotatedFrom: fromId };
+            return { clientId, profileId: toId, rotatedFrom: fromId, blocked: true, reason: "awaiting-trusted-health" };
           }
           case "health-report":
-            return setHealth(String(payload.profileId), payload.health as TunnelHealth);
+            throw new Error("health-report is runtime-internal and cannot be submitted by a client");
           case "tunnel-state":
             return {
               profileId: String(payload.profileId),
@@ -388,14 +576,14 @@ export function createVpnHandlers(
               return { allowDispatch: true, profileId: null, health: null };
             }
             const health = tunnelHealth.get(profileId);
-            if (health === "healthy") {
+            if (health === "healthy" && deps.netControl) {
               return { allowDispatch: true, profileId, health };
             }
             // Anything else blocks — degraded, down, or simply not yet reported.
             return { allowDispatch: false, profileId, health: health ?? "down" };
           }
           case "audit-log":
-            return { entries: auditLog };
+            return { entries: auditLog.map((entry) => ({ ...entry })) };
           case "conformance-probe":
             return { ok: true };
           default:
@@ -410,16 +598,21 @@ let active = createVpnHandlers();
 
 const plugin: PluginDefinition = definePlugin({
   manifest,
-  mount(ctx) {
+  async mount(ctx) {
     const cfg = loadConfig();
     const rawProfiles = Array.isArray(cfg.profiles) ? (cfg.profiles as Record<string, unknown>[]) : [];
+    const rawBindings = Array.isArray(cfg.bindings) ? (cfg.bindings as Record<string, unknown>[]) : [];
     active = createVpnHandlers({
       emit: (type, payload, opts) => ctx.emit(type, payload, opts),
       storage: ctx.storage,
       stateDir: typeof cfg.stateDir === "string" ? cfg.stateDir : undefined,
     });
     active.loadProfiles(rawProfiles);
-    ctx.log("info", "vpn-manager mounted (real lifecycle adapters)");
+    active.loadBindings(rawBindings);
+    await active.restore();
+    await active.recover();
+    await active.persist();
+    ctx.log("info", "vpn-manager mounted (policy restored; enforcement requires trusted lifecycle control)");
   },
   unmount(ctx) {
     ctx.log("info", "vpn-manager unmounted");

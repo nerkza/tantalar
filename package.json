@@ -1,7 +1,11 @@
 {
   "name": "tantalar",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.0.1-alpha.0",
+  "tantalarRelease": {
+    "label": "0.0.1 Alpha",
+    "channel": "alpha"
+  },
   "type": "module",
   "packageManager": "pnpm@11.22.0",
   "engines": {
@@ -9,8 +13,12 @@
   },
   "scripts": {
     "build": "tsc -b",
+    "prebuild": "node scripts/version.mjs check",
     "test": "vitest run",
-    "typecheck": "tsc -b --pretty false"
+    "typecheck": "tsc -b --pretty false",
+    "version:check": "node scripts/version.mjs check",
+    "version:show": "node scripts/version.mjs show",
+    "version:set": "node scripts/version.mjs set"
   },
   "devDependencies": {
     "@mantine/core": "^8.3.18",

@@ -79,6 +79,7 @@ export class Supervisor {
   readonly #opts: SupervisorOptions;
   readonly #plugins = new Map<string, RunningPlugin>();
   #healthTimer: NodeJS.Timeout | null = null;
+  #stopping = false;
 
   constructor(opts: SupervisorOptions) {
     this.#opts = opts;
@@ -114,6 +115,31 @@ export class Supervisor {
     const { manifest, config } = existing;
     await this.unmount(pluginId);
     return this.mount(manifest, config);
+  }
+
+  /** Apply new config and restore the last working process when it fails. */
+  async reconfigure(pluginId: string, config: Record<string, unknown>): Promise<PluginRuntime> {
+    const existing = this.#plugins.get(pluginId);
+    if (!existing) throw new Error(`plugin not mounted: ${pluginId}`);
+    const { manifest, config: previousConfig } = existing;
+    await this.unmount(pluginId);
+    try {
+      const runtime = await this.mount(manifest, config);
+      if (runtime.state !== "healthy") throw new Error(`plugin did not reach healthy state (${runtime.state})`);
+      return runtime;
+    } catch (error) {
+      if (this.#plugins.has(pluginId)) await this.unmount(pluginId).catch(() => undefined);
+      try {
+        const restored = await this.mount(manifest, previousConfig);
+        if (restored.state !== "healthy") throw new Error(`plugin did not reach healthy state (${restored.state})`);
+      } catch (rollbackError) {
+        throw Object.assign(
+          new Error(`configuration failed and rollback failed: ${(rollbackError as Error).message}`),
+          { rolledBack: false, cause: error },
+        );
+      }
+      throw Object.assign(new Error(`configuration failed: ${(error as Error).message}`), { rolledBack: true });
+    }
   }
 
   async mount(manifestInput: unknown, config: Record<string, unknown> = {}): Promise<PluginRuntime> {
@@ -156,6 +182,12 @@ export class Supervisor {
         return { manifest, state: plugin.state, restartCount: plugin.restartCount };
       }
       await this.#rollback(plugin);
+      if (plugin.proc) {
+        const proc = plugin.proc;
+        plugin.proc = null;
+        plugin.unmountedIntentionally = true;
+        proc.kill("SIGKILL");
+      }
       this.#plugins.delete(manifest.id);
       throw err;
     }
@@ -213,6 +245,14 @@ export class Supervisor {
   }
 
   async stopAll(): Promise<void> {
+    // Mark the whole supervisor before awaiting the first sequential unmount.
+    // A process-group SIGINT can otherwise make later children look crashed
+    // while an earlier child is still draining.
+    this.#stopping = true;
+    for (const plugin of this.#plugins.values()) {
+      plugin.unmountedIntentionally = true;
+      if (plugin.restartTimer) clearTimeout(plugin.restartTimer);
+    }
     for (const id of [...this.#plugins.keys()]) {
       await this.unmount(id).catch(() => undefined);
     }
@@ -265,7 +305,10 @@ export class Supervisor {
         resolve({ __processExited: true, code, signal });
         plugin.pending.delete(id);
       }
-      if (plugin.unmountedIntentionally || plugin.proc !== proc) return;
+      if (this.#stopping || plugin.unmountedIntentionally || plugin.proc !== proc) {
+        if (plugin.proc === proc) plugin.proc = null;
+        return;
+      }
       void this.#handleCrash(plugin, code, signal);
     });
 
@@ -287,7 +330,20 @@ export class Supervisor {
     if (remote.id !== plugin.manifest.id) {
       throw new Error(`handshake failed: manifest id mismatch ${remote.id}`);
     }
-    await this.#request(plugin, "mount", {}, 10000);
+    const mounted = (await this.#request(plugin, "mount", {}, 10000)) as {
+      ok?: boolean;
+      error?: string;
+      __processExited?: boolean;
+    } | undefined;
+    if (mounted?.__processExited) {
+      throw new Error(`mount failed for ${plugin.manifest.id}: process exited`);
+    }
+    if (mounted?.error) {
+      throw new Error(`mount failed for ${plugin.manifest.id}: ${mounted.error}`);
+    }
+    if (mounted?.ok !== true) {
+      throw new Error(`mount failed for ${plugin.manifest.id}: invalid acknowledgement`);
+    }
   }
 
   #makeProvider(plugin: RunningPlugin, capability: string): CapabilityProvider {
@@ -298,7 +354,9 @@ export class Supervisor {
         if (plugin.state !== "healthy" && plugin.state !== "degraded") {
           throw new Error(`capability-unavailable: ${capability} (plugin ${plugin.state})`);
         }
-        const result = (await this.#request(plugin, "call", { capability, operation, payload }, 10000)) as {
+        // Large-file hashing and cross-device copies remain bounded, while health pings stay responsive.
+        const timeout = capability === "dev.tantalar.capability.importer" && ["import", "review-import"].includes(operation) ? 30 * 60_000 : 10_000;
+        const result = (await this.#request(plugin, "call", { capability, operation, payload }, timeout)) as {
           value?: unknown;
           error?: string;
         };
@@ -397,9 +455,12 @@ export class Supervisor {
           throw new Error(`capability ${capability} not declared in requires`);
         }
         const provider = this.#opts.container.resolve(capability);
+        const payload = (p.payload as Record<string, unknown>) ?? {};
         const value = await provider.invoke(
           String(p.operation ?? ""),
-          (p.payload as Record<string, unknown>) ?? {},
+          capability === "dev.tantalar.capability.secret.resolve"
+            ? { ...payload, requesterPluginId: plugin.manifest.id }
+            : payload,
         );
         result = { value };
       } catch (err) {

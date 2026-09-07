@@ -4,13 +4,17 @@
  * full state set: loading, empty, error+retry, permission-denied and
  * degraded-service handling. All styling reads `--tantalar-*` tokens.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useDebouncedValue, useMediaQuery } from "@mantine/hooks";
 import type { ColumnDef } from "@tanstack/react-table";
 import {
   Alert,
+  Box,
   Button,
+  Drawer,
   Group,
+  Modal,
   NativeSelect,
   Paper,
   PasswordInput,
@@ -21,14 +25,19 @@ import {
   TextInput,
   Title,
 } from "@mantine/core";
-import { api, type DownloadJob, type AuditEntry } from "../api";
-import { DenseGrid, type GridLayout } from "./DenseGrid";
-import {
-  assembleChains,
-  reconstructDecision,
-} from "../activity/trajectory";
+import { api, type DownloadJob, type AuditEntry, type TrajectoryEvent, type WantedLedgerItem } from "../api";
+import { formatDateTime, formatShortDate } from "../date";
+import { useLiveEventFeed, type LiveFeedStatus } from "../live-event-feed";
+import { DenseGrid, initialExplorerQuery, type GridLayout } from "./DenseGrid";
+import { MediaArtwork } from "../components/MovieMetadata";
+import { stateLabel } from "../state-label";
+import { DownloadProgress, downloadRate } from "./DownloadProgress";
 import { useTheme } from "../theme/engine";
 import { DEFAULT_TOKENS, TOKEN_PREFIX, TOKEN_LABELS, sanitizeTokenOverrides } from "../theme/tokens";
+import { assembleChains, reconstructDecision, type DecisionNarrative } from "../activity/trajectory";
+import "./audit.css";
+import { ActionNotice, useActionFeedback } from "../components/ActionNotice";
+import { UsersView } from "./PeoplePage";
 
 // ---- Shared state wrappers -------------------------------------------------
 
@@ -72,37 +81,56 @@ function useAdminQuery<T>(key: readonly unknown[], fn: () => Promise<T>) {
 
 export function QueueView({ adminId }: { adminId: string | null }) {
   const qc = useQueryClient();
-  const { layout, update: setLayout } = usePersistedGridPrefs(adminId);
   const [showHistory, setShowHistory] = useState(false);
-  const [note, setNote] = useState<string | null>(null);
-  const q = useAdminQuery(["admin", "queue", showHistory], () => api.queue(showHistory));
+  const [queueQuery, setQueueQuery] = useState(initialExplorerQuery);
+  const samples = useRef(new Map<string, { job: DownloadJob; rate: number | null; observedAt: number }>());
+  const [note, setNote, noteSeverity, noteRevision] = useActionFeedback();
+  const [removeTarget, setRemoveTarget] = useState<DownloadJob | null>(null);
+  const [removing, setRemoving] = useState(false);
+  const q = useQuery({ queryKey: ["admin", "queue", showHistory, queueQuery], queryFn: async () => {
+    const response = await api.queue(showHistory, queueQuery);
+    const next = new Map(response.jobs.map(job => {
+      const previous = samples.current.get(job.jobId);
+      const unchanged = previous?.job.updatedAt === job.updatedAt;
+      const rate = unchanged && Date.now() - previous.observedAt <= 10_000 ? previous.rate : downloadRate(previous?.job, job);
+      return [job.jobId, { job, rate, observedAt: unchanged ? previous.observedAt : Date.now() }];
+    }));
+    const rates = Object.fromEntries([...next].map(([id, sample]) => [id, sample.rate]));
+    samples.current = next;
+    return { ...response, rates };
+  }, retry: false, refetchInterval: 2_000, placeholderData: previous => previous });
 
   const act = async (
     job: DownloadJob,
     action: "pause" | "resume" | "retry" | "remove",
   ) => {
     setNote(null);
-    // Destructive removal states its data-file consequence up front.
     if (action === "remove") {
-      const deleteFiles = window.confirm(
-        `Remove “${job.title}” from the queue?\n\nOK = remove and DELETE downloaded files.\nCancel = keep the files.`,
-      );
-      if (!deleteFiles) return;
-      try {
-        const res = await api.queueAction(job.jobId, "remove", { deleteDataFiles: true });
-        setNote(res.note ?? "Removed.");
-      } catch (err) {
-        setNote((err as Error).message);
-      }
-      void qc.invalidateQueries({ queryKey: ["admin", "queue"] });
+      setRemoveTarget(job);
       return;
     }
     try {
       await api.queueAction(job.jobId, action);
     } catch (err) {
-      setNote((err as Error).message);
+      setNote((err as Error).message, "error");
     }
     void qc.invalidateQueries({ queryKey: ["admin", "queue"] });
+  };
+
+  const remove = async (deleteDataFiles: boolean) => {
+    if (!removeTarget) return;
+    setRemoving(true);
+    setNote(null);
+    try {
+      const res = await api.queueAction(removeTarget.jobId, "remove", { deleteDataFiles });
+      setNote(res.note ?? "Removed.");
+      setRemoveTarget(null);
+      void qc.invalidateQueries({ queryKey: ["admin", "queue"] });
+    } catch (err) {
+      setNote((err as Error).message, "error");
+    } finally {
+      setRemoving(false);
+    }
   };
 
   if (q.isPending) return <LoadState />;
@@ -110,15 +138,17 @@ export function QueueView({ adminId }: { adminId: string | null }) {
 
   const jobs = q.data.jobs;
   const columns: ReadonlyArray<ColumnDef<DownloadJob, unknown>> = [
-    { id: "title", header: "Title", accessorKey: "title" },
-    { id: "source", header: "Engine", accessorFn: (r) => r.source },
-    { id: "state", header: "State", accessorKey: "state" },
-    { id: "progressPercent", header: "Progress %", accessorKey: "progressPercent" },
-    { id: "priority", header: "Priority", accessorKey: "priority" },
-    { id: "retryCount", header: "Retries", accessorKey: "retryCount" },
+    { id: "title", header: "Title", accessorFn: r => r.media?.title ?? r.title, cell: ({ row }) => <div><Text size="sm" fw={600}>{row.original.media?.title ?? row.original.title}</Text>{row.original.media ? <Text size="xs" c="dimmed">{[row.original.media.year, stateLabel(row.original.media.kind), row.original.media.episode].filter(Boolean).join(" · ")}</Text> : null}</div> },
+    { id: "source", header: "Engine", accessorFn: r => r.source, cell: ({ row }) => row.original.source === "usenet" ? "Usenet" : "Torrent", meta: { secondary: true } },
+    { id: "state", header: "Status", accessorFn: r => r.status ?? r.state, meta: { compact: true }, cell: ({ row }) => stateLabel(row.original.status ?? row.original.state) },
+    { id: "progressPercent", header: "Progress", accessorKey: "progressPercent", meta: { dataType: "number", compact: true }, cell: ({ row }) => <DownloadProgress job={row.original} bytesPerSecond={q.data.rates[row.original.jobId] ?? null} /> },
+    { id: "release", header: "Release", accessorFn: r => r.media && r.media.title !== r.title ? r.title : "", meta: { secondary: true } },
+    { id: "priority", header: "Priority", accessorKey: "priority", meta: { dataType: "number", secondary: true } },
+    { id: "retryCount", header: "Retries", accessorKey: "retryCount", meta: { dataType: "number", secondary: true } },
     {
       id: "failure",
       header: "Failure detail",
+      meta: { secondary: true },
       accessorFn: (r) => r.failureReason ?? "",
       cell: ({ row }) =>
         row.original.failureReason ? (
@@ -128,10 +158,11 @@ export function QueueView({ adminId }: { adminId: string | null }) {
     {
       id: "handoff",
       header: "Import handoff",
+      meta: { secondary: true },
       accessorFn: (r) => r.importHandoffPath ?? "",
       cell: ({ row }) =>
         row.original.importHandoffPath ? (
-          <Text size="xs">handed to importer</Text>
+          <Text size="xs">Imported</Text>
         ) : null,
     },
     {
@@ -179,13 +210,30 @@ export function QueueView({ adminId }: { adminId: string | null }) {
           onChange={(e) => setShowHistory(e.currentTarget.checked)}
         />
       </Group>
-      {note ? <div role="status" data-testid="queue-note">{note}</div> : null}
+      <ActionNotice message={note} title="Downloads" severity={noteSeverity} revision={noteRevision} />
+      <Modal
+        opened={removeTarget !== null}
+        onClose={() => setRemoveTarget(null)}
+        title="Remove download"
+        centered
+      >
+        <Stack gap="md">
+          <Text size="sm">Remove “{removeTarget?.title}” from the queue?</Text>
+          <Group justify="flex-end">
+            <Button variant="default" disabled={removing} onClick={() => setRemoveTarget(null)}>Cancel</Button>
+            <Button variant="default" loading={removing} onClick={() => void remove(false)}>Keep downloaded files</Button>
+            <Button color="red" loading={removing} onClick={() => void remove(true)}>Delete downloaded files</Button>
+          </Group>
+        </Stack>
+      </Modal>
       <DenseGrid
         testId="queue-grid"
+        artwork={job => <MediaArtwork src={job.media?.artworkUrl} title={job.media?.title ?? job.title} />}
+        onQueryChange={setQueueQuery}
+        total={q.data.total ?? jobs.length}
+        filters={["state", "source"].map(id => ({ id, label: id === "state" ? "Status" : "Sources", options: (q.data.facets?.[id] ?? [...new Set(jobs.map(job => id === "state" ? job.status ?? job.state : job.source))]).sort().map(value => ({ value, label: stateLabel(value) })) }))}
         columns={columns}
         data={jobs}
-        layout={layout}
-        onLayoutChange={setLayout}
         emptyMessage={showHistory ? "No downloads yet." : "The download queue is empty."}
       />
     </Stack>
@@ -194,49 +242,85 @@ export function QueueView({ adminId }: { adminId: string | null }) {
 
 // ---- Wanted view ------------------------------------------------------------
 
-interface WantedRow {
-  seriesId?: string;
-  movieId?: string;
-  episodeKey?: string;
-}
+export function WantedView({
+  adminId,
+  onSearchReleases,
+}: {
+  adminId: string | null;
+  onSearchReleases?: (item: WantedLedgerItem) => void;
+}) {
+  const qc = useQueryClient();
+  const [busy, setBusy] = useState<string | null>(null);
+  const [note, setNote, noteSeverity, noteRevision] = useActionFeedback();
+  const q = useAdminQuery(["admin", "wanted"], api.wanted);
 
-export function WantedView({ adminId }: { adminId: string | null }) {
-  const { layout, update: setLayout } = usePersistedGridPrefs(adminId);
-  const q = useAdminQuery(["admin", "wanted"], async () => {
-    const wanted: WantedRow[] = [];
-    for (const [pluginId, cap] of [
-      ["dev.tantalar.plugin.series", "dev.tantalar.capability.series"],
-      ["dev.tantalar.plugin.movies", "dev.tantalar.capability.movies"],
-    ] as const) {
-      try {
-        const res = await api.invokeCapability(pluginId, cap, "wanted");
-        const rows = ((res.result as Record<string, unknown>).wanted ?? []) as WantedRow[];
-        wanted.push(...rows);
-      } catch {
-        /* plugin absent or not that kind — skip */
-      }
+  const recover = async (item: WantedLedgerItem) => {
+    const recovery = item.recovery;
+    if (!recovery) return;
+    if (recovery.action === "search") {
+      onSearchReleases?.(item);
+      return;
     }
-    return wanted;
-  });
+    if (!recovery.jobId) return;
+    setBusy(item.itemKey);
+    setNote(null);
+    try {
+      await api.queueAction(recovery.jobId, recovery.action);
+    } catch (error) {
+      setNote((error as Error).message, "error");
+    } finally {
+      setBusy(null);
+      void Promise.all([
+        qc.invalidateQueries({ queryKey: ["admin", "wanted"] }),
+        qc.invalidateQueries({ queryKey: ["admin", "queue"] }),
+      ]);
+    }
+  };
 
   if (q.isPending) return <LoadState />;
   if (q.isError) return <ErrorState message={(q.error as Error).message} onRetry={() => void q.refetch()} />;
 
-  const columns: ReadonlyArray<ColumnDef<WantedRow, unknown>> = [
-    { id: "seriesId", header: "Series", accessorKey: "seriesId" },
-    { id: "movieId", header: "Movie", accessorKey: "movieId" },
-    { id: "episodeKey", header: "Episode", accessorKey: "episodeKey" },
+  const columns: ReadonlyArray<ColumnDef<WantedLedgerItem, unknown>> = [
+    { id: "title", header: "Item", accessorKey: "title" },
+    {
+      id: "kind",
+      header: "Type",
+      accessorFn: (item) => item.kind === "movie" ? "Movie" : `Series · ${item.episodeKey ?? "Episode"}`,
+    },
+    { id: "state", header: "State", accessorKey: "state" },
+    {
+      id: "failureDetail",
+      header: "Failure detail",
+      accessorFn: (item) => item.failureDetail ?? "",
+      cell: ({ row }) => row.original.failureDetail
+        ? <Text size="xs" c="var(--tantalar-color-danger)">{row.original.failureDetail}</Text>
+        : null,
+    },
+    {
+      id: "recovery",
+      header: "Next action",
+      enableSorting: false,
+      cell: ({ row }) => row.original.recovery ? (
+        <Button
+          size="compact-xs"
+          variant="default"
+          loading={busy === row.original.itemKey}
+          onClick={() => void recover(row.original)}
+        >
+          {row.original.recovery.label}
+        </Button>
+      ) : null,
+    },
   ];
 
   return (
     <Stack gap="sm">
       <Title order={4}>Wanted</Title>
+      <ActionNotice message={note} title="Wanted media" severity="error" revision={noteRevision} />
       <DenseGrid
         testId="wanted-grid"
         columns={columns}
-        data={q.data}
-        layout={layout}
-        onLayoutChange={setLayout}
+        data={q.data.items}
         emptyMessage="Nothing is missing — everything monitored is acquired."
       />
     </Stack>
@@ -246,18 +330,23 @@ export function WantedView({ adminId }: { adminId: string | null }) {
 // ---- History view -----------------------------------------------------------
 
 export function HistoryView({ adminId }: { adminId: string | null }) {
-  const { layout, update: setLayout } = usePersistedGridPrefs(adminId);
-  const q = useAdminQuery(["admin", "history"], () => api.history() as Promise<{ history: Record<string, unknown>[] }>);
+  const q = useAdminQuery(["admin", "history"], () => api.history());
 
   if (q.isPending) return <LoadState />;
   if (q.isError) return <ErrorState message={(q.error as Error).message} onRetry={() => void q.refetch()} />;
 
-  const rows = q.data.history ?? [];
+  const rows: Record<string, unknown>[] = (q.data.history ?? []).map(entry => ({ ...entry }));
   const columns: ReadonlyArray<ColumnDef<Record<string, unknown>, unknown>> = [
     { id: "userId", header: "Viewer", accessorFn: (r) => String(r.userId ?? "") },
     { id: "fileId", header: "File", accessorFn: (r) => String(r.fileId ?? "") },
     { id: "completed", header: "Completed", accessorFn: (r) => String(r.completed ?? "") },
-    { id: "startedAt", header: "Started", accessorFn: (r) => String(r.startedAt ?? "") },
+    {
+      id: "startedAt",
+      header: "Started",
+      accessorFn: (r) => String(r.startedAt ?? ""),
+      cell: ({ row }) => formatDateTime(String(row.original.startedAt ?? "")),
+      meta: { dataType: "time" },
+    },
   ];
 
   return (
@@ -267,8 +356,6 @@ export function HistoryView({ adminId }: { adminId: string | null }) {
         testId="history-grid"
         columns={columns}
         data={rows}
-        layout={layout}
-        onLayoutChange={setLayout}
         emptyMessage="No watch history yet."
       />
     </Stack>
@@ -277,10 +364,27 @@ export function HistoryView({ adminId }: { adminId: string | null }) {
 
 // ---- Plugins view (Wave 9, TAN-031: full management) ------------------------
 
+function pluginDisplayName(id: string): string {
+  const slug = id.split(".plugin.").at(-1) ?? id;
+  const names: Record<string, string> = {
+    "indexer-torznab-newznab": "Torznab & Newznab Indexers",
+    "metadata-tmdb-tvdb": "TMDB & TVDB Metadata",
+    "torrent-native": "Native Torrent",
+    "usenet-native": "Native Usenet",
+    serving: "Media Serving",
+  };
+  if (names[slug]) return names[slug];
+  const acronyms: Record<string, string> = { mcp: "MCP", nntp: "NNTP", sabnzbd: "SABnzbd", tmdb: "TMDB", tvdb: "TVDB", vpn: "VPN" };
+  return slug
+    .split("-")
+    .map((word) => acronyms[word] ?? `${word.charAt(0).toUpperCase()}${word.slice(1)}`)
+    .join(" ");
+}
+
 export function PluginsView() {
   const qc = useQueryClient();
   const q = useAdminQuery(["admin", "plugins"], () => api.plugins());
-  const [note, setNote] = useState<string | null>(null);
+  const [note, setNote, noteSeverity, noteRevision] = useActionFeedback();
 
   const act = async (id: string, action: "restart" | "disable") => {
     setNote(null);
@@ -302,7 +406,7 @@ export function PluginsView() {
       const res = await api.pluginAction(id, action);
       setNote(res.impact ?? `${action} completed for ${id}.`);
     } catch (err) {
-      setNote(`${id}: ${(err as Error).message}`);
+      setNote(`${id}: ${(err as Error).message}`, "error");
     }
     void qc.invalidateQueries({ queryKey: ["admin", "plugins"] });
   };
@@ -312,203 +416,547 @@ export function PluginsView() {
 
   return (
     <Stack gap="sm">
-      <Title order={4}>Plugins</Title>
-      {note ? <div role="status" data-testid="plugins-note">{note}</div> : null}
-      {q.data.plugins.length === 0 ? (
-        <Text c="var(--tantalar-color-text-dimmed)">No plugins are mounted.</Text>
-      ) : (
-        <Stack gap="xs">
-          {q.data.plugins.map((p) => (
-            <Paper
-              key={p.manifest.id}
-              data-testid={`plugin-${p.manifest.id}`}
-              p="sm"
-              radius="md"
-              style={{
-                background: "var(--tantalar-color-surface-raised)",
-                border: "1px solid var(--tantalar-color-border)",
-              }}
-            >
-              <Group justify="space-between" wrap="wrap">
-                <div>
-                  <Text fw={600}>{p.manifest.id}</Text>
-                  <Text size="sm" c="var(--tantalar-color-text-dimmed)">
-                    v{p.manifest.version} · restarts: {p.restartCount}
-                    {p.manifest.provides.length > 0 ? ` · provides ${p.manifest.provides.length}` : ""}
-                  </Text>
-                </div>
-                <Group gap="xs">
-                  <Text size="sm" c={p.state === "running" || p.state === "healthy" ? "var(--tantalar-color-success)" : "var(--tantalar-color-warning)"}>
-                    {p.state}
-                  </Text>
-                  <Button
-                    size="compact-xs"
-                    variant="default"
-                    data-testid={`restart-${p.manifest.id}`}
-                    onClick={() => void act(p.manifest.id, "restart")}
-                  >
-                    Restart
-                  </Button>
-                  <Button
-                    size="compact-xs"
-                    variant="light"
-                    color="red"
-                    data-testid={`disable-${p.manifest.id}`}
-                    onClick={() => void act(p.manifest.id, "disable")}
-                  >
-                    Disable
-                  </Button>
-                </Group>
-              </Group>
-            </Paper>
-          ))}
-        </Stack>
-      )}
+      <Group justify="space-between" align="flex-start" wrap="wrap">
+        <div>
+          <Title order={4}>Installed extensions</Title>
+          <Text size="sm" c="var(--tantalar-color-text-dimmed)">
+            First-party and community extensions use the same public plugin contract.
+          </Text>
+        </div>
+        <Button
+          variant="default"
+          disabled
+          title="Plugin package verification and installation are not available yet."
+        >
+          Import plugin
+        </Button>
+      </Group>
+      <Text size="xs" c="var(--tantalar-color-text-dimmed)">
+        Local archive import and a community directory are planned. Import stays disabled until packages can be verified and installed safely.
+      </Text>
+      <ActionNotice message={note} title="Plugins" severity={noteSeverity} revision={noteRevision} />
+      <DenseGrid testId="plugins-grid" ariaLabel="plugins" data={q.data.plugins} defaultView="list" rowTestId={p => `plugin-${p.manifest.id}`}
+        filters={[{ id: "state", label: "States", options: [...new Set(q.data.plugins.map(p => p.state))].map(value => ({ value, label: value })) }]}
+        columns={[
+          { id: "name", header: "Name", accessorFn: p => pluginDisplayName(p.manifest.id), size: 250 },
+          { id: "id", header: "ID", accessorFn: p => p.manifest.id, size: 300 },
+          { id: "version", header: "Version", accessorFn: p => p.manifest.version, size: 100 },
+          { id: "state", header: "State", accessorKey: "state", size: 100 },
+          { id: "restartCount", header: "Restarts", accessorKey: "restartCount", size: 90, meta: { dataType: "number" } },
+          { id: "actions", header: "Actions", enableHiding: false, size: 210, cell: ({ row: { original: p } }) => <Group gap="xs"><Button size="compact-xs" variant="default" data-testid={`restart-${p.manifest.id}`} onClick={() => void act(p.manifest.id, "restart")}>Restart</Button><Button size="compact-xs" variant="light" color="red" data-testid={`disable-${p.manifest.id}`} onClick={() => void act(p.manifest.id, "disable")}>Disable</Button></Group> },
+        ]}
+      />
     </Stack>
   );
 }
 
 // ---- Users view (Wave 9, TAN-032: full management + last-admin safeguard) ----
 
-export function UsersView() {
-  const qc = useQueryClient();
-  const q = useAdminQuery(["admin", "users"], () => api.users());
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [role, setRole] = useState<"admin" | "viewer">("viewer");
-  const [error, setError] = useState<string | null>(null);
-  const [note, setNote] = useState<string | null>(null);
+export { UsersView };
 
-  if (q.isPending) return <LoadState />;
-  if (q.isError) {
-    const status = (q.error as { status?: number }).status;
-    if (status === 403) return <PermissionState />;
-    return <ErrorState message={(q.error as Error).message} onRetry={() => void q.refetch()} />;
+// ---- Audit view (Wave 9, TAN-032: unified operations log) --------------------
+
+export const OPERATIONS_LOG_CATEGORIES = [
+  "Access",
+  "Extensions",
+  "Acquisition",
+  "Media",
+  "Playback",
+  "Automation",
+  "System",
+  "Other",
+] as const;
+
+export type OperationsLogCategory = (typeof OPERATIONS_LOG_CATEGORIES)[number];
+
+export const OPERATIONS_LOG_CATEGORY_COLORS: Readonly<Record<OperationsLogCategory, string>> = {
+  Access: "violet",
+  Extensions: "grape",
+  Acquisition: "orange",
+  Media: "cyan",
+  Playback: "blue",
+  Automation: "teal",
+  System: "gray",
+  Other: "indigo",
+};
+
+const CATEGORY_PREFIXES: ReadonlyArray<readonly [OperationsLogCategory, readonly string[]]> = [
+  ["Access", ["user", "apikey", "auth"]],
+  ["Extensions", ["plugin", "capability"]],
+  ["Acquisition", ["acquisition", "queue", "download", "grab", "release", "indexer", "blacklist", "comparison", "tunnel", "client.dispatch"]],
+  ["Media", ["library", "import", "media", "metadata", "movie", "series"]],
+  ["Playback", ["playback", "transcode"]],
+  ["Automation", ["scheduler", "webhook", "mcp"]],
+  ["System", ["system", "server", "client.incident", "upgrade"]],
+];
+
+export function classifyOperationsLogAction(action: string): OperationsLogCategory {
+  const normalized = action.replace(/^dev\.tantalar\.event\./, "").toLowerCase();
+  for (const [category, prefixes] of CATEGORY_PREFIXES) {
+    if (prefixes.some((prefix) => normalized === prefix || normalized.startsWith(`${prefix}.`))) return category;
   }
+  return "Other";
+}
 
-  const create = async () => {
-    setError(null);
-    try {
-      await api.createUser(username, password, role);
-      setUsername("");
-      setPassword("");
-      void qc.invalidateQueries({ queryKey: ["admin", "users"] });
-    } catch (err) {
-      setError((err as Error).message);
-    }
+export interface OperationsLogEntry {
+  readonly id: string;
+  readonly category: OperationsLogCategory;
+  readonly source: "Audit" | "Event";
+  readonly occurredAt: string;
+  readonly actor: string;
+  readonly action: string;
+  readonly target: string;
+  readonly detail: Record<string, unknown>;
+  readonly correlationId?: string;
+  readonly causationId?: string;
+}
+
+const AUDIT_LAYOUT_KEY = "tantalar.audit-grid.layout.v2";
+const TRACE_LAYOUT_KEY = "tantalar.trace-grid.layout.v1";
+const DEFAULT_AUDIT_LAYOUT: GridLayout = {
+  hiddenColumns: ["trace"],
+  density: "dense",
+  columnOrder: ["occurredAt", "category", "source", "actor", "action", "target", "trace"],
+  columnWidths: {
+    occurredAt: 150,
+    category: 100,
+    source: 72,
+    actor: 135,
+    action: 210,
+    target: 165,
+    trace: 180,
+  },
+  sorting: [{ id: "occurredAt", desc: true }],
+};
+const DEFAULT_TRACE_LAYOUT: GridLayout = {
+  hiddenColumns: ["source", "trace"],
+  density: "dense",
+  columnOrder: ["occurredAt", "category", "action", "target", "source", "trace"],
+  columnWidths: {
+    occurredAt: 150,
+    category: 100,
+    action: 250,
+    target: 180,
+    source: 90,
+    trace: 180,
+  },
+  sorting: [{ id: "occurredAt", desc: true }],
+};
+
+function loadGridLayout(key: string, fallback: GridLayout): GridLayout {
+  try {
+    const stored = window.localStorage.getItem(key);
+    return stored ? { ...fallback, ...JSON.parse(stored) as GridLayout } : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function saveGridLayout(key: string, layout: GridLayout): void {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(layout));
+  } catch {
+    // The layout remains usable for this session when storage is unavailable.
+  }
+}
+
+function eventLogEntry(event: TrajectoryEvent): OperationsLogEntry {
+  return {
+    id: `event:${event.eventId}`,
+    category: classifyOperationsLogAction(event.type),
+    source: "Event",
+    occurredAt: event.occurredAt,
+    actor: event.producer,
+    action: event.type,
+    target: event.subject ?? "—",
+    detail: event.payload,
+    correlationId: event.correlationId,
+    causationId: event.causationId,
   };
+}
 
-  const manage = async (
-    u: { id: string; username: string; role: string },
-    action: "promote" | "demote" | "resetPassword" | "revokeSessions" | "deactivate" | "reactivate",
-  ) => {
-    setNote(null);
-    try {
-      if (action === "promote" || action === "demote") {
-        await api.setUserRole(u.id, action === "promote" ? "admin" : "viewer");
-        setNote(`${u.username} is now ${action === "promote" ? "an administrator" : "a viewer"}.`);
-        if (action === "demote") setNote((n) => `${n} Their active sessions were signed out.`);
-      } else if (action === "resetPassword") {
-        const newPassword = window.prompt(`New password for ${u.username} (at least 8 characters):`) ?? "";
-        if (!newPassword) return;
-        await api.resetUserPassword(u.id, newPassword);
-        setNote(`Password reset for ${u.username}; their sessions were signed out.`);
-      } else if (action === "revokeSessions") {
-        const res = await api.revokeUserSessions(u.id);
-        setNote(`Signed out ${u.username} (${res.revoked} session${res.revoked === 1 ? "" : "s"}).`);
-      } else if (action === "deactivate") {
-        await api.setUserActive(u.id, false);
-        setNote(`${u.username} was deactivated and signed out.`);
-      } else {
-        await api.setUserActive(u.id, true);
-        setNote(`${u.username} was reactivated.`);
-      }
-    } catch (err) {
-      // Last-admin refusals surface here with the server's reason.
-      setNote(`${u.username}: ${(err as Error).message}`);
-    }
-    void qc.invalidateQueries({ queryKey: ["admin", "users"] });
-  };
+type TimelineWindowMinutes = 5 | 15 | 30 | 360 | 1_440;
 
+function AuditActivityMap({
+  entries,
+  selectedId,
+  onSelect,
+  windowMinutes,
+  onWindowMinutesChange,
+  liveStatus,
+}: {
+  readonly entries: readonly OperationsLogEntry[];
+  readonly selectedId?: string;
+  readonly onSelect: (entry: OperationsLogEntry) => void;
+  readonly windowMinutes: TimelineWindowMinutes;
+  readonly onWindowMinutesChange: (minutes: TimelineWindowMinutes) => void;
+  readonly liveStatus: LiveFeedStatus;
+}) {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const windowStart = now - windowMinutes * 60_000;
+  const duration = Math.max(1_000, now - windowStart);
+  const visibleEntries = entries.filter((entry) => {
+    const occurredAt = Date.parse(entry.occurredAt);
+    return Number.isFinite(occurredAt) && occurredAt >= windowStart && occurredAt <= now;
+  });
+  const byCategory = OPERATIONS_LOG_CATEGORIES.map((category) => ({
+    category,
+    entries: visibleEntries.filter((entry) => entry.category === category),
+  })).filter((lane) => lane.entries.length > 0);
   return (
-    <Stack gap="sm">
-      <Title order={4}>Users</Title>
-      {note ? <div role="status" data-testid="users-note">{note}</div> : null}
-      <Stack gap="xs" component="form" onSubmit={(e) => { e.preventDefault(); void create(); }} w={340}>
-        <TextInput label="Username" data-testid="new-user-username" value={username} onChange={(e) => setUsername(e.currentTarget.value)} required />
-        <PasswordInput label="Password" data-testid="new-user-password" value={password} onChange={(e) => setPassword(e.currentTarget.value)} required />
-        <NativeSelect
-          aria-label="Role"
-          data={[{ value: "viewer", label: "Viewer" }, { value: "admin", label: "Admin" }]}
-          value={role}
-          onChange={(e) => setRole(e.currentTarget.value as "admin" | "viewer")}
-        />
-        {error ? <div role="alert">{error}</div> : null}
-        <Button type="submit" data-testid="create-user">Create user</Button>
-      </Stack>
-      <Stack gap="xs" data-testid="users-grid">
-        {q.data.users.map((u) => (
-        <Paper
-          key={u.id}
-          data-testid={`user-${u.username}`}
-          p="sm"
-          radius="md"
-          style={{ background: "var(--tantalar-color-surface)", border: "1px solid var(--tantalar-color-border)" }}
-        >
-          <Group justify="space-between" wrap="wrap">
-            <div>
-              <Text size="sm" fw={600}>{u.username}</Text>
-              <Text size="xs" c="var(--tantalar-color-text-dimmed)">
-                {u.role}
-                {" · "}
-                created {u.createdAt.slice(0, 10)}
-              </Text>
+    <section
+      className="tantalar-activity-map"
+      aria-label="Activity timeline"
+      data-testid="audit-activity-map"
+      data-live={liveStatus === "live" || undefined}
+    >
+      <Group justify="space-between" gap="xs" mb="xs">
+        <Group gap="xs">
+          <Text fw={600}>Timeline</Text>
+          <span
+            className="tantalar-activity-map__connection"
+            data-state={liveStatus}
+            role="status"
+            aria-label={`Timeline connection: ${liveStatus}`}
+          >
+            {liveStatus === "live"
+              ? null
+              : liveStatus === "unavailable"
+                ? "Unavailable"
+                : liveStatus === "connecting"
+                  ? "Connecting…"
+                  : "Feed disconnected. Retrying…"}
+          </span>
+        </Group>
+        <Group gap="xs">
+          <Text size="xs" c="dimmed" className="tantalar-tabular">{visibleEntries.length} events</Text>
+          <NativeSelect
+            aria-label="Activity window"
+            value={String(windowMinutes)}
+            onChange={(event) => onWindowMinutesChange(Number(event.currentTarget.value) as TimelineWindowMinutes)}
+            data={[
+              { value: "5", label: "5 min" },
+              { value: "15", label: "15 min" },
+              { value: "30", label: "30 min" },
+              { value: "360", label: "6 hr" },
+              { value: "1440", label: "24 hr" },
+            ]}
+            size="xs"
+          />
+        </Group>
+      </Group>
+      {byCategory.length === 0 ? (
+        <div className="tantalar-activity-map__empty">No activity in this window</div>
+      ) : (
+        <div className="tantalar-activity-map__lanes">
+          {byCategory.map((lane) => (
+            <div className="tantalar-activity-map__lane" key={lane.category}>
+              <span>{lane.category}</span>
+              <div>
+                {lane.entries.map((entry) => {
+                  const color = OPERATIONS_LOG_CATEGORY_COLORS[entry.category];
+                  const left = Math.max(0, Math.min(100, ((Date.parse(entry.occurredAt) - windowStart) / duration) * 100));
+                  return (
+                    <button
+                      type="button"
+                      key={entry.id}
+                      className="tantalar-activity-map__event"
+                      data-selected={selectedId === entry.id || undefined}
+                      style={{ backgroundColor: `var(--mantine-color-${color}-6)`, left: `${left}%` }}
+                      aria-label={`${entry.category}: ${entry.action} at ${formatDateTime(entry.occurredAt)}`}
+                      title={`${entry.action}\n${formatDateTime(entry.occurredAt)}`}
+                      onClick={() => onSelect(entry)}
+                    />
+                  );
+                })}
+              </div>
             </div>
-            <Group gap="xs">
-              {u.role === "viewer" ? (
-                <Button size="compact-xs" variant="default" onClick={() => void manage(u, "promote")}>Make admin</Button>
-              ) : (
-                <Button size="compact-xs" variant="default" onClick={() => void manage(u, "demote")}>Make viewer</Button>
-              )}
-              <Button size="compact-xs" variant="default" onClick={() => void manage(u, "resetPassword")}>Reset password</Button>
-              <Button size="compact-xs" variant="default" onClick={() => void manage(u, "revokeSessions")}>Sign out</Button>
-              {u.role !== undefined ? (
-                <Button size="compact-xs" variant="light" color="red" onClick={() => void manage(u, "deactivate")}>Deactivate</Button>
-              ) : null}
-            </Group>
-          </Group>
-        </Paper>
-        ))}
-      </Stack>
-    </Stack>
+          ))}
+        </div>
+      )}
+      <div className="tantalar-activity-map__axis" aria-hidden="true">
+        <span>{new Date(windowStart).toLocaleTimeString()}</span>
+        <span>now</span>
+      </div>
+    </section>
   );
 }
 
-// ---- Audit view (Wave 9, TAN-032: security audit log) ------------------------
+function mergeOperationsLog(
+  auditEntries: readonly AuditEntry[],
+  events: readonly TrajectoryEvent[],
+): OperationsLogEntry[] {
+  return [
+    ...auditEntries.map((entry) => ({
+      id: `audit:${entry.id}`,
+      category: classifyOperationsLogAction(entry.action),
+      source: "Audit" as const,
+      occurredAt: entry.occurredAt,
+      actor: entry.actorUsername ?? "system",
+      action: entry.action,
+      target: `${entry.targetType}:${entry.targetId}`,
+      detail: entry.detail,
+    })),
+    ...events.map((event) => ({
+      id: `event:${event.eventId}`,
+      category: classifyOperationsLogAction(event.type),
+      source: "Event" as const,
+      occurredAt: event.occurredAt,
+      actor: event.producer,
+      action: event.type,
+      target: event.subject ?? "—",
+      detail: event.payload,
+      correlationId: event.correlationId,
+      causationId: event.causationId,
+    })),
+  ].sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
+}
 
-export function AuditView() {
-  const q = useAdminQuery(["admin", "audit"], () => api.auditLog(200));
+function mergeTimelineEntries(
+  snapshot: readonly OperationsLogEntry[],
+  streamed: readonly OperationsLogEntry[],
+): OperationsLogEntry[] {
+  const byId = new Map(snapshot.map((entry) => [entry.id, entry]));
+  for (const entry of streamed) byId.set(entry.id, entry);
+  return [...byId.values()].sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
+}
+
+export function downloadAuditLog(entries: readonly OperationsLogEntry[]): void {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(entries, null, 2)], { type: "application/json" }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `tantalar-operations-${new Date().toISOString().slice(0, 10)}.json`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+export function OperationsLogInspector({
+  entry,
+  onClose,
+  narrative,
+}: {
+  readonly entry: OperationsLogEntry;
+  readonly onClose: () => void;
+  readonly narrative?: DecisionNarrative | null;
+}) {
+  return (
+    <section
+      role="region"
+      aria-label="Selected audit record"
+      className="tantalar-audit-inspector"
+      data-testid="operations-log-inspector"
+    >
+      <Group className="tantalar-audit-inspector__header" justify="space-between" align="flex-start" mb="sm" wrap="nowrap">
+        <div>
+          <Title order={5} lineClamp={2}>{entry.action}</Title>
+        </div>
+        <Button size="compact-xs" variant="subtle" onClick={onClose}>Close</Button>
+      </Group>
+      <Tabs key={entry.id} defaultValue="summary" keepMounted={false}>
+        <Tabs.List aria-label="Selected record details">
+          <Tabs.Tab value="summary">Summary</Tabs.Tab>
+          {narrative ? <Tabs.Tab value="trace">Trace</Tabs.Tab> : null}
+          <Tabs.Tab value="raw">Raw</Tabs.Tab>
+          <Tabs.Tab value="links">Links</Tabs.Tab>
+        </Tabs.List>
+        <Tabs.Panel value="summary" pt="sm">
+          <Stack gap={4}>
+            <Text size="sm"><strong>Category:</strong> {entry.category}</Text>
+            <Text size="sm"><strong>Source:</strong> {entry.source}</Text>
+            <Text size="sm"><strong>Recorded:</strong> {formatDateTime(entry.occurredAt)}</Text>
+            <Text size="sm"><strong>Actor / producer:</strong> {entry.actor}</Text>
+            <Text size="sm"><strong>Target / subject:</strong> {entry.target}</Text>
+          </Stack>
+        </Tabs.Panel>
+        {narrative ? (
+          <Tabs.Panel value="trace" pt="sm">
+            <Stack gap="sm">
+              <Text size="sm">{narrative.summary}</Text>
+              <Stack component="ol" gap="xs" m={0} pl="md">
+                {narrative.steps.map((step) => (
+                  <Box component="li" key={step.id}>
+                    <Text size="sm" fw={600}>{step.label}</Text>
+                    <Text size="xs" c="dimmed">
+                      {formatDateTime(step.at)}{step.detail ? ` · ${step.detail}` : ""}
+                    </Text>
+                  </Box>
+                ))}
+              </Stack>
+            </Stack>
+          </Tabs.Panel>
+        ) : null}
+        <Tabs.Panel value="raw" pt="sm">
+          <Text component="pre" size="xs" ff="monospace" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+            {JSON.stringify(entry.detail, null, 2)}
+          </Text>
+        </Tabs.Panel>
+        <Tabs.Panel value="links" pt="sm">
+          {entry.correlationId || entry.causationId ? (
+            <Stack gap={4}>
+              <Text size="sm" ff="monospace"><strong>Operation:</strong> {entry.correlationId ?? "Not stored"}</Text>
+              <Text size="sm" ff="monospace"><strong>Caused by:</strong> {entry.causationId ?? "Not stored"}</Text>
+            </Stack>
+          ) : (
+            <Text size="sm" c="dimmed">No operation links were stored for this record.</Text>
+          )}
+        </Tabs.Panel>
+      </Tabs>
+    </section>
+  );
+}
+
+export function AuditView({ typePrefix = "" }: { readonly typePrefix?: string } = {}) {
+  const normalizedTypePrefix = typePrefix.trim();
+  const [category, setCategory] = useState<"All" | OperationsLogEntry["category"]>("All");
+  const [selectedEntry, setSelectedEntry] = useState<OperationsLogEntry | null>(null);
+  const [layout, setLayout] = useState<GridLayout>(() => loadGridLayout(AUDIT_LAYOUT_KEY, DEFAULT_AUDIT_LAYOUT));
+  const [windowMinutes, setWindowMinutes] = useState<TimelineWindowMinutes>(1_440);
+  const live = useLiveEventFeed(normalizedTypePrefix ? { typePrefix: normalizedTypePrefix } : {});
+  const narrowInspector = useMediaQuery("(max-width: 74.99em)") ?? false;
+  const q = useQuery({
+    queryKey: ["admin", "operations-log", normalizedTypePrefix],
+    queryFn: async ({ signal }) => {
+      const [audit, operations] = await Promise.all([
+        api.auditLog(200, { signal }),
+        api.events({
+          ...(normalizedTypePrefix ? { typePrefix: normalizedTypePrefix } : {}),
+          limit: 500,
+        }, { signal }),
+      ]);
+      const merged = mergeOperationsLog(audit.entries, operations.events);
+      return normalizedTypePrefix
+        ? merged.filter((entry) => entry.action.startsWith(normalizedTypePrefix))
+        : merged;
+    },
+    retry: false,
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+  });
+  const entries = useMemo(
+    () => category === "All" ? (q.data ?? []) : (q.data ?? []).filter((entry) => entry.category === category),
+    [category, q.data],
+  );
+  const liveEntries = useMemo(
+    () => live.events
+      .filter((event) => !normalizedTypePrefix || event.type.startsWith(normalizedTypePrefix))
+      .map(eventLogEntry),
+    [live.events, normalizedTypePrefix],
+  );
+  const timelineEntries = useMemo(
+    () => mergeTimelineEntries(entries, category === "All" ? liveEntries : liveEntries.filter((entry) => entry.category === category)),
+    [category, entries, liveEntries],
+  );
   if (q.isPending) return <LoadState />;
   if (q.isError) return <ErrorState message={(q.error as Error).message} onRetry={() => void q.refetch()} />;
 
-  const entries = q.data.entries;
-  const columns: ReadonlyArray<ColumnDef<AuditEntry, unknown>> = [
-    { id: "occurredAt", header: "When", accessorKey: "occurredAt" },
-    { id: "actor", header: "Actor", accessorFn: (r) => r.actorUsername ?? "" },
-    { id: "action", header: "Action", accessorKey: "action" },
-    { id: "target", header: "Target", accessorFn: (r) => `${r.targetType}:${r.targetId}` },
+  const columns: ReadonlyArray<ColumnDef<OperationsLogEntry, unknown>> = [
+    {
+      id: "occurredAt",
+      header: "When",
+      accessorKey: "occurredAt",
+      size: 150,
+      cell: ({ row }) => <Text size="xs">{formatDateTime(row.original.occurredAt)}</Text>,
+      meta: { dataType: "time" },
+    },
+    {
+      id: "category",
+      header: "Category",
+      accessorKey: "category",
+      size: 116,
+      cell: ({ row }) => <Text size="xs">{row.original.category}</Text>,
+    },
+    { id: "source", header: "Source", accessorKey: "source", size: 72 },
+    { id: "actor", header: "Actor", accessorKey: "actor", size: 135 },
+    { id: "action", header: "Action", accessorKey: "action", size: 210 },
+    { id: "target", header: "Target", accessorKey: "target", size: 165 },
+    {
+      id: "trace",
+      header: "Trace",
+      size: 180,
+      accessorFn: (r) => [r.correlationId, r.causationId].filter(Boolean).join(" "),
+      cell: ({ row }) => (
+        <Text size="xs" ff="monospace">
+          {row.original.correlationId ?? row.original.causationId ?? "—"}
+        </Text>
+      ),
+    },
   ];
 
   return (
     <Stack gap="sm" data-testid="audit-view">
-      <Title order={4}>Security audit log</Title>
-      <DenseGrid
-        testId="audit-grid"
-        columns={columns}
-        data={entries}
-        layout={{ hiddenColumns: [], density: "dense" }}
-        emptyMessage="No security events recorded yet."
+      <Group justify="flex-end" gap="xs">
+        <Button variant="default" onClick={() => {
+          setSelectedEntry(null);
+          void q.refetch();
+        }}>Refresh</Button>
+        <Button variant="default" disabled={entries.length === 0} onClick={() => downloadAuditLog(entries)}>
+          Export JSON
+        </Button>
+      </Group>
+      <AuditActivityMap
+        entries={timelineEntries}
+        selectedId={selectedEntry?.id}
+        onSelect={setSelectedEntry}
+        windowMinutes={windowMinutes}
+        onWindowMinutesChange={setWindowMinutes}
+        liveStatus={live.status}
       />
+      <div className="tantalar-audit-workspace" data-inspector-open={Boolean(selectedEntry) || undefined}>
+        <Box className="tantalar-audit-workspace__log">
+          <DenseGrid
+            testId="audit-grid"
+            columns={columns}
+            data={entries}
+            layout={layout}
+            onLayoutChange={(next) => {
+              setLayout(next);
+              saveGridLayout(AUDIT_LAYOUT_KEY, next);
+            }}
+            ariaLabel="operations log"
+            emptyMessage={category === "All" ? "No loaded records yet." : `No loaded ${category.toLowerCase()} records yet.`}
+            pagination
+            paginationResetKey={category}
+            onRowActivate={setSelectedEntry}
+            isRowSelected={(entry) => entry.id === selectedEntry?.id}
+            rowAriaLabel={(entry) => `Inspect ${entry.action}`}
+            toolbarStart={(
+              <NativeSelect
+                aria-label="Log category"
+                value={category}
+                onChange={(event) => {
+                  setCategory(event.currentTarget.value as typeof category);
+                  setSelectedEntry(null);
+                }}
+                data={[
+                  { value: "All", label: "All categories" },
+                  ...OPERATIONS_LOG_CATEGORIES.map((value) => ({ value, label: value })),
+                ]}
+                w={220}
+              />
+            )}
+          />
+        </Box>
+        {!narrowInspector ? (
+          <aside className="tantalar-audit-workspace__inspector" aria-label="Audit inspector panel">
+            {selectedEntry ? (
+              <OperationsLogInspector entry={selectedEntry} onClose={() => setSelectedEntry(null)} />
+            ) : null}
+          </aside>
+        ) : null}
+      </div>
+      <Drawer
+        opened={narrowInspector && selectedEntry !== null}
+        onClose={() => setSelectedEntry(null)}
+        position="right"
+        size="100%"
+        title="Inspect operation"
+      >
+        {selectedEntry ? <OperationsLogInspector entry={selectedEntry} onClose={() => setSelectedEntry(null)} /> : null}
+      </Drawer>
     </Stack>
   );
 }
@@ -616,24 +1064,40 @@ export function SystemHealthView() {
   if (q.isPending) return <LoadState />;
   if (q.isError) return <ErrorState message={(q.error as Error).message} onRetry={() => void q.refetch()} />;
 
-  const degraded = !q.data.ready || q.data.eventCount === null;
+  const unhealthyPlugins = q.data.plugins.filter((p) => p.state !== "healthy" && p.state !== "running");
+  const fixturePlugins = q.data.plugins.filter((p) => p.id.includes(".fixture-"));
+  const runtimeDegraded = q.data.ready === false || q.data.eventCount === null || unhealthyPlugins.length > 0;
+  const setupLimitations = [
+    ...q.data.missingCapabilities.map((capability) => `Missing capability: ${capability}`),
+    ...(!q.data.transcoder.ffmpegAvailable ? ["FFmpeg is unavailable; transcoding cannot run."] : []),
+    ...(!q.data.network.vpnCapabilityMounted ? ["VPN control is not mounted; protected routing is unavailable."] : []),
+    ...(fixturePlugins.length > 0
+      ? [`Development fixtures are active: ${fixturePlugins.map((plugin) => plugin.id).join(", ")}.`]
+      : []),
+  ];
   return (
     <Stack gap="sm" data-testid="system-health">
       <Title order={4}>System health</Title>
-      {degraded ? (
+      {runtimeDegraded ? (
         <Alert color="yellow" title="Degraded service">
-          <Text size="sm">Some subsystems did not report cleanly. Values below may be incomplete.</Text>
+          <Text size="sm">The runtime is not fully operational. Review the states below before relying on automation.</Text>
+        </Alert>
+      ) : setupLimitations.length > 0 ? (
+        <Alert color="yellow" title="Alpha setup incomplete">
+          <Stack gap={4}>
+            {setupLimitations.map((limitation) => <Text size="sm" key={limitation}>{limitation}</Text>)}
+          </Stack>
         </Alert>
       ) : (
-        <Text c="var(--tantalar-color-success)">All systems ready.</Text>
+        <Text c="var(--tantalar-color-success)">Configured capabilities are ready.</Text>
       )}
-      <Text>Ready: {String(q.data.ready)}</Text>
+      <Text>Runtime ready: {String(q.data.ready)}</Text>
       <Text>Events in log: {q.data.eventCount === null ? "unknown" : q.data.eventCount}</Text>
       <Stack gap="xs">
         {q.data.plugins.map((p) => (
           <Group key={p.id} justify="space-between">
             <Text size="sm">{p.id}</Text>
-            <Text size="sm" c={p.state === "running" ? "var(--tantalar-color-success)" : "var(--tantalar-color-warning)"}>
+            <Text size="sm" c={p.state === "healthy" || p.state === "running" ? "var(--tantalar-color-success)" : "var(--tantalar-color-warning)"}>
               {p.state} · {p.restarts} restarts
             </Text>
           </Group>
@@ -648,93 +1112,150 @@ export function SystemHealthView() {
 export function ActivityView() {
   const [typePrefix, setTypePrefix] = useState("");
   const [subject, setSubject] = useState("");
-  const [correlationId, setCorrelationId] = useState("");
-  const [selectedChain, setSelectedChain] = useState<string | null>(null);
+  const [correlationId, setCorrelationId] = useState(() => new URLSearchParams(window.location.hash.split("?")[1]).get("correlationId") ?? "");
+  const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
+  const [layout, setLayout] = useState<GridLayout>(() => loadGridLayout(TRACE_LAYOUT_KEY, DEFAULT_TRACE_LAYOUT));
+  const [windowMinutes, setWindowMinutes] = useState<TimelineWindowMinutes>(1_440);
+  const narrowInspector = useMediaQuery("(max-width: 74.99em)") ?? false;
+  const [debouncedTypePrefix] = useDebouncedValue(typePrefix.trim(), 300);
+  const [debouncedSubject] = useDebouncedValue(subject.trim(), 300);
+  const [debouncedCorrelationId] = useDebouncedValue(correlationId.trim(), 300);
+  const live = useLiveEventFeed({
+    ...(debouncedTypePrefix ? { typePrefix: debouncedTypePrefix } : {}),
+    ...(debouncedSubject ? { subject: debouncedSubject } : {}),
+    ...(debouncedCorrelationId ? { correlationId: debouncedCorrelationId } : {}),
+  });
 
-  const q = useAdminQuery(
-    ["admin", "trajectory", typePrefix, subject, correlationId],
-    () =>
+  const q = useQuery({
+    queryKey: ["admin", "trace", debouncedTypePrefix, debouncedSubject, debouncedCorrelationId],
+    queryFn: ({ signal }) =>
       api.events({
-        ...(typePrefix ? { typePrefix } : {}),
-        ...(subject ? { subject } : {}),
-        ...(correlationId ? { correlationId } : {}),
+        ...(debouncedTypePrefix ? { typePrefix: debouncedTypePrefix } : {}),
+        ...(debouncedSubject ? { subject: debouncedSubject } : {}),
+        ...(debouncedCorrelationId ? { correlationId: debouncedCorrelationId } : {}),
         limit: 500,
-      }),
-  );
+      }, { signal }),
+    retry: false,
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+  });
 
-  const chains = useMemo(() => assembleChains(q.data?.events ?? []), [q.data]);
+  useEffect(() => {
+    setSelectedEventId(null);
+  }, [debouncedTypePrefix, debouncedSubject, debouncedCorrelationId]);
 
-  const selected = selectedChain ? chains.find((c) => c.correlationId === selectedChain) : undefined;
-  const narrative = selected ? reconstructDecision(selected) : null;
+  const entries = useMemo(() => (q.data?.events ?? []).map(eventLogEntry), [q.data]);
+  const liveEntries = useMemo(() => live.events.map(eventLogEntry), [live.events]);
+  const timelineEntries = useMemo(() => mergeTimelineEntries(entries, liveEntries), [entries, liveEntries]);
+  const selectedEntry = [...entries, ...liveEntries].find((entry) => entry.id === `event:${selectedEventId}`) ?? null;
+  const chains = useMemo(() => {
+    const events = new Map<string, TrajectoryEvent>();
+    for (const event of [...(q.data?.events ?? []), ...live.events]) events.set(event.eventId, event);
+    return assembleChains([...events.values()]);
+  }, [live.events, q.data?.events]);
+  const selectedChain = selectedEntry?.correlationId
+    ? chains.find((chain) => chain.correlationId === selectedEntry.correlationId)
+    : undefined;
+  const narrative = selectedChain ? reconstructDecision(selectedChain) : null;
+  const selectEntry = (entry: OperationsLogEntry) => setSelectedEventId(entry.id.replace(/^event:/, ""));
+
+  const columns: ReadonlyArray<ColumnDef<OperationsLogEntry, unknown>> = [
+    { id: "occurredAt", header: "When", accessorKey: "occurredAt", size: 150, cell: ({ row }) => <Text size="xs">{formatDateTime(row.original.occurredAt)}</Text>, meta: { dataType: "time" } },
+    { id: "category", header: "Category", accessorKey: "category", size: 116, cell: ({ row }) => <Text size="xs">{row.original.category}</Text> },
+    { id: "action", header: "Operation", accessorKey: "action", size: 250 },
+    { id: "target", header: "Subject", accessorKey: "target", size: 180 },
+    { id: "source", header: "Source", accessorKey: "actor", size: 90 },
+    { id: "trace", header: "Trace", accessorFn: (entry) => entry.correlationId ?? entry.causationId ?? "—", size: 180 },
+  ];
 
   return (
-    <Stack gap="sm" data-testid="activity-view">
-      <Title order={4}>Activity & Trajectory</Title>
-      <Group wrap="wrap">
-        <TextInput
-          aria-label="Filter by event type prefix"
-          placeholder="dev.tantalar.event.grab…"
-          label="Type prefix"
-          value={typePrefix}
-          onChange={(e) => setTypePrefix(e.currentTarget.value)}
-        />
-        <TextInput
-          aria-label="Filter by subject"
-          label="Subject"
-          value={subject}
-          onChange={(e) => setSubject(e.currentTarget.value)}
-        />
-        <TextInput
-          aria-label="Filter by correlation id"
-          label="Correlation id"
-          value={correlationId}
-          onChange={(e) => setCorrelationId(e.currentTarget.value)}
-        />
+    <Stack gap="sm" data-testid="activity-view" className="tantalar-trace-view">
+      <Group justify="flex-end" gap="xs">
+        <Button variant="default" onClick={() => {
+          setSelectedEventId(null);
+          void q.refetch();
+        }}>Refresh</Button>
+        <Button variant="default" disabled={entries.length === 0} onClick={() => downloadAuditLog(entries)}>
+          Export JSON
+        </Button>
       </Group>
-
-      {q.isPending ? <LoadState /> : null}
+      <AuditActivityMap
+        entries={timelineEntries}
+        selectedId={selectedEntry?.id}
+        onSelect={selectEntry}
+        windowMinutes={windowMinutes}
+        onWindowMinutesChange={setWindowMinutes}
+        liveStatus={live.status}
+      />
       {q.isError ? <ErrorState message={(q.error as Error).message} onRetry={() => void q.refetch()} /> : null}
-      {q.isSuccess && chains.length === 0 ? (
-        <Text c="var(--tantalar-color-text-dimmed)">No activity matches those filters.</Text>
-      ) : null}
-
-      {chains.length > 0 ? (
-        <NativeSelect
-          aria-label="Correlation chain"
-          data-testid="chain-select"
-          data={[
-            { value: "", label: `${chains.length} correlation chains — pick one to reconstruct` },
-            ...chains.map((c) => ({
-              value: c.correlationId,
-              label: `${c.events.length} events · ${c.events[0]?.occurredAt ?? ""}`,
-            })),
-          ]}
-          value={selectedChain ?? ""}
-          onChange={(e) => setSelectedChain(e.currentTarget.value || null)}
-        />
-      ) : null}
-
-      {narrative && selected ? (
-        <Paper p="md" radius="md" data-testid="decision-reconstruction"
-          style={{ background: "var(--tantalar-color-surface)", border: "1px solid var(--tantalar-color-border)" }}>
-          <Text fw={600} mb="xs">{narrative.summary}</Text>
-          <ol style={{ margin: 0, paddingLeft: 20 }}>
-            {narrative.steps.map((s) => (
-              <li key={s.id}>
-                <Text size="sm">
-                  {s.label} <Text span c="dimmed" size="xs">({s.at})</Text>
-                  {s.detail ? <Text span size="xs" c="dimmed"> — {s.detail}</Text> : null}
-                </Text>
-              </li>
-            ))}
-          </ol>
-          {narrative.complete ? (
-            <Text size="sm" c="var(--tantalar-color-success)" mt="xs">
-              Full grab→import chain reconstructed from the event log.
-            </Text>
-          ) : null}
-        </Paper>
-      ) : null}
+      <div className="tantalar-audit-workspace" data-inspector-open={Boolean(selectedEntry) || undefined}>
+        <main className="tantalar-audit-workspace__log">
+          <DenseGrid
+            testId="trace-grid"
+            columns={columns}
+            data={entries}
+            layout={layout}
+            onLayoutChange={(next) => {
+              setLayout(next);
+              saveGridLayout(TRACE_LAYOUT_KEY, next);
+            }}
+            loading={q.isPending}
+            ariaLabel="operation trace"
+            emptyMessage="No operations match those filters."
+            pagination
+            paginationResetKey={`${debouncedTypePrefix}:${debouncedSubject}:${debouncedCorrelationId}`}
+            onRowActivate={selectEntry}
+            isRowSelected={(entry) => entry.id === selectedEntry?.id}
+            rowAriaLabel={(entry) => `Inspect ${entry.action}`}
+            toolbarStart={(
+              <details className="tantalar-trace-filters">
+                <summary>Trace filters</summary>
+                <Group wrap="wrap" mt="xs">
+                  <TextInput
+                    aria-label="Filter by event type prefix"
+                    placeholder="Event type"
+                    value={typePrefix}
+                    onChange={(e) => setTypePrefix(e.currentTarget.value)}
+                    w={180}
+                  />
+                  <TextInput
+                    aria-label="Filter by subject"
+                    placeholder="Subject"
+                    value={subject}
+                    onChange={(e) => setSubject(e.currentTarget.value)}
+                    w={180}
+                  />
+                  <TextInput
+                    aria-label="Filter by operation id"
+                    placeholder="Operation ID"
+                    value={correlationId}
+                    onChange={(e) => setCorrelationId(e.currentTarget.value)}
+                    w={180}
+                  />
+                </Group>
+              </details>
+            )}
+          />
+        </main>
+        {!narrowInspector ? (
+        <aside className="tantalar-audit-workspace__inspector" aria-label="Trace inspector panel">
+            {selectedEntry ? (
+              <OperationsLogInspector entry={selectedEntry} onClose={() => setSelectedEventId(null)} narrative={narrative} />
+            ) : null}
+          </aside>
+        ) : null}
+      </div>
+      <Drawer
+        opened={narrowInspector && selectedEntry !== null}
+        onClose={() => setSelectedEventId(null)}
+        position="right"
+        size="100%"
+        title="Inspect event"
+      >
+        {selectedEntry ? (
+          <OperationsLogInspector entry={selectedEntry} onClose={() => setSelectedEventId(null)} narrative={narrative} />
+        ) : null}
+      </Drawer>
     </Stack>
   );
 }

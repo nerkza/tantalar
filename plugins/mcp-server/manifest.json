@@ -5,7 +5,10 @@
   "provides": ["dev.tantalar.capability.mcp.status"],
   "requires": [
     "dev.tantalar.capability.auth.introspection",
-    "dev.tantalar.capability.event.emit"
+    "dev.tantalar.capability.event.emit",
+    "dev.tantalar.capability.mcp.activity.read",
+    "dev.tantalar.capability.mcp.operation.read",
+    "dev.tantalar.capability.mcp.config.read"
   ],
   "subscriptions": [],
   "entry": { "command": "node dist/plugin.js" }

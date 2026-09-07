@@ -1,0 +1,23 @@
+.tantalar-profile-picture {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1;
+  overflow: hidden;
+  border-radius: var(--tantalar-radius-md, 8px);
+  color: var(--tantalar-color-primary, #4d8df6);
+  background: var(--tantalar-color-surface-raised, #222634);
+}
+.tantalar-profile-picture img, .tantalar-profile-picture svg { display: block; width: 100%; height: 100%; object-fit: cover; }
+.tantalar-profile-picture__face { color: var(--tantalar-color-primary-contrast, #10121a); }
+.tantalar-profile-picture[data-preset="wink"] { color: var(--tantalar-color-success, #46a758); }
+.tantalar-profile-picture[data-preset="glasses"] { color: var(--tantalar-color-warning, #f5a524); }
+.tantalar-profile-picture[data-preset="robot"] { color: var(--tantalar-color-text-dimmed, #9aa0b4); }
+.tantalar-profile-picture[data-preset="cat"] { color: var(--tantalar-color-danger, #e5484d); }
+.tantalar-profile-picture[data-preset="owl"] { color: var(--tantalar-color-text, #eef0f6); }
+.tantalar-picture-editor__preview { width: calc(var(--tantalar-space-unit, 4px) * 32); align-self: center; }
+.tantalar-picture-editor__choices { display: grid; grid-template-columns: repeat(3, 1fr); gap: calc(var(--tantalar-space-unit, 4px) * 3); }
+.tantalar-picture-editor__choices button { border: 2px solid transparent; border-radius: var(--tantalar-radius-md, 8px); padding: var(--tantalar-space-unit, 4px); background: transparent; cursor: pointer; }
+.tantalar-picture-editor__choices button[aria-pressed="true"] { border-color: var(--tantalar-color-text, #eef0f6); }
+.tantalar-picture-editor__choices button:focus-visible, .tantalar-picture-editor__upload:focus-within { outline: 2px solid var(--tantalar-color-primary, #4d8df6); outline-offset: 2px; }
+.tantalar-picture-editor__upload { display: grid; gap: calc(var(--tantalar-space-unit, 4px) * 2); font-weight: 600; }
+.tantalar-picture-editor__upload input { width: 100%; min-width: 0; font: inherit; font-weight: 400; }

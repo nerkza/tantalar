@@ -43,18 +43,6 @@ export function assembleChains(events: readonly TrajectoryEvent[]): TrajectoryCh
     .sort((a, b) => compareEvents(a.events[0]!, b.events[0]!));
 }
 
-const GRAB_STEP_ORDER = [
-  "dev.tantalar.event.indexer.searched",
-  "dev.tantalar.event.comparison.verdict",
-  "dev.tantalar.event.grab.decision",
-  "dev.tantalar.event.client.dispatch",
-  "dev.tantalar.event.download.queued",
-  "dev.tantalar.event.download.progress",
-  "dev.tantalar.event.download.completed",
-  "dev.tantalar.event.import.started",
-  "dev.tantalar.event.import.completed",
-] as const;
-
 /** Short human step label for known pipeline event types. */
 export function stepLabel(type: string): string {
   switch (type) {
@@ -62,8 +50,12 @@ export function stepLabel(type: string): string {
       return "Searched indexers";
     case "dev.tantalar.event.comparison.verdict":
       return "Compared releases";
+    case "dev.tantalar.event.release.decision.recorded":
+      return "Assessed releases";
     case "dev.tantalar.event.grab.decision":
       return "Grab decision";
+    case "dev.tantalar.event.dispatch.gate.checked":
+      return "VPN gate checked";
     case "dev.tantalar.event.client.dispatch":
       return "Dispatched to client";
     case "dev.tantalar.event.download.queued":
@@ -103,25 +95,47 @@ export interface DecisionNarrative {
 export function reconstructDecision(chain: TrajectoryChain): DecisionNarrative {
   const steps = chain.events.map((e) => ({
     id: e.eventId,
-    label: stepLabel(e.type),
+    label: stepLabelForEvent(e),
     at: e.occurredAt,
     detail: summarizePayload(e),
   }));
   const types = new Set(chain.events.map((e) => e.type));
   const verdict = chain.events.find((e) => e.type === "dev.tantalar.event.comparison.verdict");
+  const assessmentEvent = chain.events.find((e) => e.type === "dev.tantalar.event.release.decision.recorded");
   const decision = chain.events.find(
     (e) => e.type === "dev.tantalar.event.grab.decision",
   );
-  const winner = (verdict?.payload as { winnerGuid?: string } | undefined)?.winnerGuid;
-  const decidedGuid = (decision?.payload as { guid?: string; decided?: boolean; reason?: string } | undefined);
+  const winner = (verdict?.payload as { winnerGuid?: string } | undefined)?.winnerGuid
+    ?? (assessmentEvent?.payload as { winnerCandidateId?: string } | undefined)?.winnerCandidateId;
+  const candidates = (verdict?.payload as { candidates?: Array<{ guid?: string; title?: string }> } | undefined)?.candidates;
+  const winnerTitle = candidates?.find((candidate) => candidate.guid === winner)?.title ?? winner;
+  const decidedGuid = (decision?.payload as { guid?: string; releaseId?: string; decided?: boolean; reason?: string } | undefined);
+  const selectedId = decidedGuid?.releaseId ?? decidedGuid?.guid;
+  const assessments = (assessmentEvent?.payload as {
+    assessments?: Array<{
+      candidateId?: string;
+      title?: string;
+      reasons?: Array<{ code?: string; message?: string }>;
+    }>;
+  } | undefined)?.assessments ?? [];
+  const selectedAssessment = assessments.find((assessment) => assessment.candidateId === selectedId);
+  const selectedTitle = candidates?.find((candidate) => candidate.guid === selectedId)?.title
+    ?? selectedAssessment?.title;
+  const selectedReasons = selectedAssessment?.reasons
+    ?.map((reason) => reason.message ?? reason.code?.replaceAll("_", " "))
+    .filter((reason): reason is string => Boolean(reason))
+    .join("; ");
   const importDone = types.has("dev.tantalar.event.import.completed");
 
   let summary: string;
-  if (decidedGuid?.decided && winner) {
-    summary =
-      `Grabbed "${winner}" because it won release comparison` +
-      (decidedGuid.guid && decidedGuid.guid !== winner ? ` (operator picked ${decidedGuid.guid})` : "") +
-      (importDone ? ", and it imported successfully." : ".");
+  if (decidedGuid?.decided) {
+    const title = selectedTitle ?? winnerTitle ?? "selected release";
+    if (selectedId && winner && selectedId !== winner) {
+      summary = `Grabbed "${title}" because the operator selected an eligible lower-ranked release${selectedReasons ? `: ${selectedReasons}` : ""}.`;
+    } else {
+      summary = `Grabbed "${title}" because it won release comparison${selectedReasons ? `: ${selectedReasons}` : ""}`
+        + (importDone ? ", and it imported successfully." : ".");
+    }
   } else if (decidedGuid && decidedGuid.decided === false) {
     const reason = String(decidedGuid.reason ?? "no qualifying release");
     summary = `Nothing was grabbed: ${reason.replaceAll("_", " ")}.`;
@@ -129,34 +143,69 @@ export function reconstructDecision(chain: TrajectoryChain): DecisionNarrative {
     summary = `${chain.events.length} related operations under this correlation.`;
   }
 
-  // Order steps by pipeline semantics when they are all known grab steps,
-  // otherwise keep chronological order.
-  const allKnown = chain.events.every((e) => (GRAB_STEP_ORDER as readonly string[]).includes(e.type));
-  const orderedSteps = allKnown
-    ? [...steps].sort(
-        (a, b) =>
-          (GRAB_STEP_ORDER as readonly string[]).indexOf(labelToType(a.label)) -
-          (GRAB_STEP_ORDER as readonly string[]).indexOf(labelToType(b.label)),
-      )
-    : steps;
+  const verified = chain.events.some((event) =>
+    event.type === "dev.tantalar.event.download.progress"
+    && ("verification" in event.payload || "crcWarnings" in event.payload));
 
   return {
     summary,
-    steps: orderedSteps,
-    complete: types.has("dev.tantalar.event.grab.decision") && importDone,
+    steps,
+    complete:
+      types.has("dev.tantalar.event.grab.decision")
+      && types.has("dev.tantalar.event.dispatch.gate.checked")
+      && types.has("dev.tantalar.event.client.dispatch")
+      && types.has("dev.tantalar.event.download.completed")
+      && verified
+      && importDone,
   };
 }
 
-function labelToType(label: string): string {
-  for (const t of GRAB_STEP_ORDER) if (stepLabel(t) === label) return t;
-  return label;
+function stepLabelForEvent(event: TrajectoryEvent): string {
+  if (event.type === "dev.tantalar.event.dispatch.gate.checked") {
+    return event.payload.allowed === false ? "VPN gate blocked" : "VPN gate passed";
+  }
+  if (event.type === "dev.tantalar.event.download.progress") {
+    if (event.payload.recovered === true) return "Download recovered";
+    if ("verification" in event.payload || "crcWarnings" in event.payload) return "Download verified";
+  }
+  return stepLabel(event.type);
 }
 
 function summarizePayload(e: TrajectoryEvent): string {
   const p = e.payload ?? {};
+  if (e.type === "dev.tantalar.event.comparison.verdict") {
+    const candidates = Array.isArray(p.candidates) ? p.candidates : [];
+    const winner = candidates.find((value) => value && typeof value === "object"
+      && (value as Record<string, unknown>).guid === p.winnerGuid) as Record<string, unknown> | undefined;
+    const reasons = Array.isArray(p.reasons) ? p.reasons.map((reason) => String(reason).replaceAll("_", " ")) : [];
+    return [
+      `winner=${String(winner?.title ?? "none")}`,
+      `candidates=${candidates.length}`,
+      `rejected=${Array.isArray(p.rejected) ? p.rejected.length : 0}`,
+      ...(reasons.length ? [`reasons=${reasons.join("; ")}`] : []),
+    ].join(" ");
+  }
+  if (e.type === "dev.tantalar.event.release.decision.recorded" && Array.isArray(p.assessments)) {
+    return p.assessments.map((value) => {
+      const assessment = value && typeof value === "object" ? value as Record<string, unknown> : {};
+      const reasons = Array.isArray(assessment.reasons)
+        ? assessment.reasons.map((reason) => {
+            const detail = reason && typeof reason === "object" ? reason as Record<string, unknown> : {};
+            return String(detail.message ?? detail.code ?? "");
+          }).filter(Boolean)
+        : [];
+      return `${String(assessment.title ?? "Release")}: ${assessment.accepted === true ? "accepted" : "rejected"}${reasons.length ? ` — ${reasons.join("; ")}` : ""}`;
+    }).join(" | ");
+  }
   const parts: string[] = [];
-  for (const k of ["itemKey", "query", "winnerGuid", "guid", "downloadId", "path", "mode", "reason", "progressPercent"]) {
+  for (const k of ["itemKey", "query", "winnerGuid", "guid", "clientId", "health", "downloadId", "path", "mode", "reason", "progressPercent"]) {
     if (p[k] !== undefined) parts.push(`${k}=${String(p[k])}`);
+  }
+  if (Array.isArray(p.candidates)) parts.push(`candidates=${p.candidates.length}`);
+  if (Array.isArray(p.rejected)) parts.push(`rejected=${p.rejected.length}`);
+  if (p.verification && typeof p.verification === "object") {
+    const verification = p.verification as Record<string, unknown>;
+    parts.push(`verified=${String(verification.verifiedPieces ?? "?")}/${String(verification.totalPieces ?? "?")}`);
   }
   return parts.join(" ");
 }

@@ -3,7 +3,12 @@
   "version": "0.1.0",
   "protocolVersion": 1,
   "provides": ["dev.tantalar.capability.download-client", "dev.tantalar.capability.usenet.engine"],
-  "requires": ["dev.tantalar.capability.event.emit", "dev.tantalar.capability.log"],
+  "requires": [
+    "dev.tantalar.capability.event.emit",
+    "dev.tantalar.capability.log",
+    "dev.tantalar.capability.secret.resolve",
+    "dev.tantalar.capability.vpn-binding"
+  ],
   "subscriptions": [],
   "entry": { "command": "node dist/plugin.js" }
 }

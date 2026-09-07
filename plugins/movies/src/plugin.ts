@@ -35,6 +35,14 @@ interface MovieState {
   year: number;
   monitored: boolean;
   profile: QualityProfile;
+  externalId?: string;
+  provider?: string;
+  overview?: string;
+  artworkUrl?: string;
+  availableAt?: string;
+  destinationLibraryId?: string;
+  minimumAvailability?: string;
+  manualFields?: string[];
   /** Release guid of the currently held copy, if any. */
   acquiredGuid: string | null;
 }
@@ -97,29 +105,76 @@ const plugin: PluginDefinition = definePlugin({
         case "add-movie": {
           const title = String(payload.title ?? "").trim();
           if (!title) throw new Error("title required");
-          const id = `movie-${slug(title)}-${String(payload.year ?? 0)}`;
+          const externalId = String(payload.externalId ?? "").trim();
+          const provider = String(payload.provider ?? "").trim();
+          const duplicate = externalId
+            ? [...movies].find(([, movie]) => movie.externalId === externalId && movie.provider === provider)?.[0]
+            : undefined;
+          const id = duplicate ?? `movie-${slug(title)}-${String(payload.year ?? 0)}`;
           const existing = movies.get(id);
-          if (existing) return { movieId: id, created: false }; // idempotent add
+          if (existing) {
+            Object.assign(existing, {
+              monitored: payload.monitored !== false,
+              ...(payload.profile && typeof payload.profile === "object" ? { profile: payload.profile as QualityProfile } : {}),
+              ...(typeof payload.destinationLibraryId === "string" ? { destinationLibraryId: payload.destinationLibraryId } : {}),
+              ...(typeof payload.minimumAvailability === "string" ? { minimumAvailability: payload.minimumAvailability } : {}),
+              ...(externalId ? { externalId } : {}),
+              ...(provider ? { provider } : {}),
+              ...(typeof payload.overview === "string" ? { overview: payload.overview } : {}),
+              ...(typeof payload.artworkUrl === "string" ? { artworkUrl: payload.artworkUrl } : {}),
+              ...(typeof payload.availableAt === "string" ? { availableAt: payload.availableAt } : {}),
+            });
+            await persist();
+            return { movieId: id, created: false };
+          }
+          const monitored = payload.monitored !== false;
           movies.set(id, {
             title,
             year: typeof payload.year === "number" ? payload.year : 0,
-            monitored: payload.monitored !== false,
+            monitored,
             profile:
               (payload.profile as QualityProfile | undefined) ?? { name: "uhd", preferredQualities: ["2160p", "1080p"] },
+            ...(externalId ? { externalId } : {}),
+            ...(provider ? { provider } : {}),
+            ...(typeof payload.overview === "string" ? { overview: payload.overview } : {}),
+            ...(typeof payload.artworkUrl === "string" ? { artworkUrl: payload.artworkUrl } : {}),
+            ...(typeof payload.availableAt === "string" ? { availableAt: payload.availableAt } : {}),
+            ...(typeof payload.destinationLibraryId === "string" ? { destinationLibraryId: payload.destinationLibraryId } : {}),
+            ...(typeof payload.minimumAvailability === "string" ? { minimumAvailability: payload.minimumAvailability } : {}),
+            manualFields: [],
             acquiredGuid: null,
           });
-          await emitFn?.(EventTypes.MovieAdded, { movieId: id, title, monitored: true });
+          await emitFn?.(EventTypes.MovieAdded, { movieId: id, title, monitored });
           await persist();
           return { movieId: id, created: true };
         }
+        case "list-movies":
+          return {
+            movies: [...movies.entries()]
+              .map(([movieId, rec]) => ({
+                movieId,
+                ...rec,
+                acquisitionState: rec.acquiredGuid ? "available" : rec.monitored ? "wanted" : "unmonitored",
+              }))
+              .sort((a, b) => a.title.localeCompare(b.title)),
+          };
         case "get-movie": {
           const rec = movies.get(String(payload.movieId ?? ""));
           if (!rec) throw new Error(`unknown movie ${String(payload.movieId)}`);
           return {
             movieId: String(payload.movieId),
             title: rec.title,
+            year: rec.year,
             monitored: rec.monitored,
             profile: rec.profile,
+            ...(rec.externalId ? { externalId: rec.externalId } : {}),
+            ...(rec.provider ? { provider: rec.provider } : {}),
+            ...(rec.overview !== undefined ? { overview: rec.overview } : {}),
+            ...(rec.artworkUrl ? { artworkUrl: rec.artworkUrl } : {}),
+            ...(rec.availableAt ? { availableAt: rec.availableAt } : {}),
+            ...(rec.destinationLibraryId ? { destinationLibraryId: rec.destinationLibraryId } : {}),
+            ...(rec.minimumAvailability ? { minimumAvailability: rec.minimumAvailability } : {}),
+            manualFields: rec.manualFields ?? [],
             acquiredGuid: rec.acquiredGuid,
           };
         }
@@ -133,6 +188,38 @@ const plugin: PluginDefinition = definePlugin({
           });
           await persist();
           return { movieId: String(payload.movieId), monitored: rec.monitored };
+        }
+        case "update-movie": {
+          const movieId = String(payload.movieId ?? "");
+          const rec = movies.get(movieId);
+          if (!rec) throw new Error(`unknown movie ${movieId}`);
+          if (payload.title !== undefined) {
+            const title = String(payload.title).trim();
+            if (!title) throw new Error("title required");
+            rec.title = title;
+          }
+          if (typeof payload.year === "number") rec.year = Math.trunc(payload.year);
+          if (payload.overview === null) delete rec.overview;
+          else if (typeof payload.overview === "string") rec.overview = payload.overview;
+          if (payload.artworkUrl === null) delete rec.artworkUrl;
+          else if (typeof payload.artworkUrl === "string") rec.artworkUrl = payload.artworkUrl;
+          if (payload.availableAt === null) delete rec.availableAt;
+          else if (typeof payload.availableAt === "string") rec.availableAt = payload.availableAt;
+          if (typeof payload.destinationLibraryId === "string") rec.destinationLibraryId = payload.destinationLibraryId;
+          if (typeof payload.minimumAvailability === "string") rec.minimumAvailability = payload.minimumAvailability;
+          if (payload.profile && typeof payload.profile === "object") rec.profile = payload.profile as QualityProfile;
+          if (typeof payload.monitored === "boolean") rec.monitored = payload.monitored;
+          if (Array.isArray(payload.manualFields)) {
+            rec.manualFields = [...new Set(payload.manualFields.map(String).filter((field) => ["title", "year", "overview", "artworkUrl"].includes(field)))];
+          }
+          await persist();
+          return { movieId, updated: true };
+        }
+        case "delete-movie": {
+          const movieId = String(payload.movieId ?? "");
+          const deleted = movies.delete(movieId);
+          if (deleted) await persist();
+          return { movieId, deleted };
         }
         case "scan": {
           // One scan pass over all monitored movies without a copy.

@@ -3,15 +3,31 @@
  * reporting semantics (monotonic + rewind escape), negotiation decision
  * handling against a mocked fetch, and library page rendering boundaries.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, render, screen } from "@testing-library/react";
+import { createElement } from "react";
+import { MantineProvider } from "@mantine/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import React from "react";
 
 // ---- engine -------------------------------------------------------------------
 
 const { attachPlayback, srtToVtt } = await import("../src/player/engine.js");
 const { ProgressReporter } = await import("../src/player/progress.js");
+
+beforeAll(() => {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    value: vi.fn().mockImplementation(() => ({
+      matches: false,
+      media: "",
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })),
+  });
+});
 
 describe("srtToVtt", () => {
   it("converts an SRT payload into valid WebVTT", () => {
@@ -58,6 +74,7 @@ describe("attachPlayback", () => {
 // ---- progress reporter ----------------------------------------------------------
 
 import { api } from "../src/api.js";
+const { ensurePlaybackReady, PlayerPage } = await import("../src/pages/PlayerPage.js");
 
 function mockApiSetResume() {
   const calls: Array<{ positionMs: number; allowRewind?: boolean }> = [];
@@ -115,5 +132,69 @@ describe("ProgressReporter", () => {
     expect(mocked.calls[1]!.allowRewind).toBe(true);
     expect(mocked.calls[1]!.positionMs).toBe(30000);
     reporter.stop();
+  });
+});
+
+describe("PlayerPage HLS startup", () => {
+  it("starts the real transcode session before attaching HLS playback", async () => {
+    const original = api.startTranscodeSession;
+    const start = vi.fn().mockResolvedValue({ started: "session-1", ready: true });
+    api.startTranscodeSession = start;
+    try {
+      await ensurePlaybackReady({
+        mode: "hls",
+        sessionId: "session-1",
+        manifestUrl: "/api/v1/hls/session-1/manifest.m3u8",
+        qualities: ["1280x720"],
+      });
+      expect(start).toHaveBeenCalledWith("session-1");
+    } finally {
+      api.startTranscodeSession = original;
+    }
+  });
+
+  it("stops local playback when the server ends the session", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const originals = {
+      negotiate: api.negotiate,
+      subtitles: api.subtitles,
+      browse: api.browse,
+      resumePoint: api.resumePoint,
+      touchPlaybackSession: api.touchPlaybackSession,
+      closePlaybackSession: api.closePlaybackSession,
+      setResume: api.setResume,
+    };
+    const pause = vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+    const load = vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => undefined);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const missing = Object.assign(new Error("unknown session"), { status: 404 });
+    api.negotiate = vi.fn().mockResolvedValue({
+      decision: { mode: "direct", sessionId: "session-1", streamUrl: "/stream", reason: "direct" },
+    });
+    api.subtitles = vi.fn().mockResolvedValue({ tracks: [] });
+    api.browse = vi.fn().mockResolvedValue({ items: [] });
+    api.resumePoint = vi.fn().mockResolvedValue({ resumePoint: null });
+    api.touchPlaybackSession = vi.fn().mockRejectedValue(missing);
+    api.closePlaybackSession = vi.fn().mockResolvedValue({ closed: true });
+    api.setResume = vi.fn().mockResolvedValue({ accepted: true });
+
+    try {
+      render(createElement(MantineProvider, null,
+        createElement(QueryClientProvider, { client }, createElement(PlayerPage, { fileId: "file-1" })),
+      ));
+      await vi.waitFor(() => expect(screen.getByTestId("player-page").getAttribute("data-mode")).toBe("direct"));
+      await act(async () => vi.advanceTimersByTimeAsync(10_000));
+      expect(screen.getAllByText(/Playback session ended on the server/).length).toBeGreaterThan(0);
+      expect(pause).toHaveBeenCalled();
+      expect(load).toHaveBeenCalled();
+      expect(screen.getByTestId("player-video").getAttribute("src")).toBeNull();
+    } finally {
+      Object.assign(api, originals);
+      client.clear();
+      pause.mockRestore();
+      load.mockRestore();
+      vi.useRealTimers();
+      cleanup();
+    }
   });
 });

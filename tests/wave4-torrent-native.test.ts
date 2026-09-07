@@ -61,7 +61,11 @@ function manifestFor(id: string, capability: string[], command: string) {
     version: "0.1.0",
     protocolVersion: 1,
     provides: capability,
-    requires: ["dev.tantalar.capability.event.emit", "dev.tantalar.capability.log"],
+    requires: [
+      "dev.tantalar.capability.event.emit",
+      "dev.tantalar.capability.log",
+      "dev.tantalar.capability.vpn-binding",
+    ],
     subscriptions: [],
     entry: { command },
   };
@@ -76,6 +80,7 @@ interface PluginConfig {
 }
 
 async function mountPlugin(config: PluginConfig = {}): Promise<void> {
+  config = { engineMode: "memory", ...config };
   const m = manifestFor(PLUGIN_ID, [CLIENT_CAP, ENGINE_CAP], PLUGIN_ENTRY);
   Object.assign(m, { __config: config });
   const rt = await supervisor.mount(m, config as Record<string, unknown>);
@@ -95,6 +100,11 @@ beforeAll(async () => {
   container = new ServiceContainer();
   container.register({ pluginId: "core", capability: "dev.tantalar.capability.event.emit", invoke: async () => ({ ok: true }) });
   container.register({ pluginId: "core", capability: "dev.tantalar.capability.log", invoke: async () => ({ ok: true }) });
+  container.register({
+    pluginId: "core",
+    capability: "dev.tantalar.capability.vpn-binding",
+    invoke: async () => ({ allowDispatch: true, health: "healthy", profileId: "test-loopback" }),
+  });
   supervisor = new Supervisor({
     bus,
     container,
@@ -159,6 +169,48 @@ describe("synthetic torrent parsing (legal fixtures)", () => {
 // ---- Full lifecycle over the process boundary --------------------------------------
 
 describe("torrent-native embedded engine (TAN-009)", () => {
+  it("reports truthful non-secret runtime status", async () => {
+    const status = (await engineCap().invoke("runtime-status", {})) as {
+      ready: boolean;
+      engine: string;
+      dhtEnabled: boolean;
+      publicDiscoveryEnabled: boolean;
+      downloadRootsConfigured: number;
+      activeJobs: number;
+      limitations: string[];
+    };
+    expect(status).toMatchObject({
+      ready: false,
+      engine: "memory",
+      dhtEnabled: false,
+      publicDiscoveryEnabled: false,
+      downloadRootsConfigured: 1,
+    });
+    expect(status.activeJobs).toBeGreaterThanOrEqual(0);
+    expect(status.limitations.join(" ")).toMatch(/test-only|public trackers/i);
+  });
+
+  it("validates and durably configures download roots", async () => {
+    await expect(engineCap().invoke("configure", { downloadRoots: ["relative/path"] })).rejects.toThrow(
+      /absolute path/i,
+    );
+    await expect(
+      engineCap().invoke("configure", { downloadRoots: [join(dir, "missing-root")] }),
+    ).rejects.toThrow(/does not exist/i);
+
+    const configured = (await engineCap().invoke("configure", { downloadRoots: [downloadRoot] })) as {
+      downloadRootsConfigured: number;
+    };
+    expect(configured.downloadRootsConfigured).toBe(1);
+
+    await supervisor.unmount(PLUGIN_ID);
+    await mountPlugin({ maxConcurrent: 50 });
+    const recovered = (await engineCap().invoke("runtime-status", {})) as {
+      downloadRootsConfigured: number;
+    };
+    expect(recovered.downloadRootsConfigured).toBe(1);
+  });
+
   let tor: ReturnType<typeof makeSyntheticTorrent>;
 
   beforeAll(() => {
@@ -183,6 +235,11 @@ describe("torrent-native embedded engine (TAN-009)", () => {
       if (found) last = { ...found, progressPercent: last.progressPercent };
     }
     expect(last.state).toBe("completed");
+    const completed = (await client().invoke("completed-files", { downloadId: added.downloadId })) as {
+      files: Array<{ path: string; sizeBytes: number }>;
+    };
+    expect(completed.files).toHaveLength(tor.files.length);
+    expect(completed.files.every((file) => resolve(file.path).startsWith(resolve(downloadRoot)) && file.sizeBytes > 0)).toBe(true);
 
     // Payload bytes landed under the configured root only. The memory
     // engine writes files relative to the job's download root (the plugin
@@ -290,7 +347,7 @@ describe("torrent-native embedded engine (TAN-009)", () => {
       client().invoke("add", { itemKey: "x-nzb", title: "X", kind: "nzb", sourceUrl: "/tmp/x.nzb" }),
     ).rejects.toThrow(/torrent releases only/);
     await expect(
-      client().invoke("add", { itemKey: "x-http", title: "X", kind: "torrent", sourceUrl: "https://tracker.invalid/a.torrent" }),
+      client().invoke("add", { itemKey: "x-http", title: "X", kind: "torrent", sourceUrl: "file://tracker.invalid/a.torrent" }),
     ).rejects.toThrow(/magnet URI or a contained/);
   });
 });

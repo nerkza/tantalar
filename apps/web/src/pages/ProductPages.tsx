@@ -6,13 +6,16 @@
  * Every view implements loading, empty, error+retry states. All styling
  * reads `--tantalar-*` tokens; no internal token names appear in copy.
  */
+import type { ColumnDef } from "@tanstack/react-table";
+import { DenseGrid, initialExplorerQuery, type ExplorerQuery } from "../admin/DenseGrid";
 import { useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import {
   Alert,
   Button,
   Card,
   Grid,
+  Modal,
   Group,
   Progress,
   SimpleGrid,
@@ -22,6 +25,7 @@ import {
   Title,
 } from "@mantine/core";
 import { api, type LibraryItem } from "../api";
+import { MediaArtwork, MovieDetails, movieSummary, mediaLabelColumns, mediaLabelFilters } from "../components/MovieMetadata";
 
 export function LoadState({ label = "Loading…" }: { label?: string }) {
   return (
@@ -48,58 +52,36 @@ export function ErrorState({ message, onRetry }: { message: string; onRetry: () 
 }
 
 function PosterCard({
-  title,
-  subtitle,
-  testId,
-  progressPct,
-  onOpen,
+  title, subtitle, artworkUrl, testId, progressPct, onOpen, onDetails,
 }: {
   title: string;
   subtitle?: string;
+  artworkUrl?: string;
   testId: string;
   progressPct?: number;
   onOpen: () => void;
+  onDetails?: () => void;
 }) {
   return (
-    <Card
-      component="button"
-      data-testid={testId}
-      onClick={onOpen}
-      shadow="sm"
-      padding="md"
-      radius="md"
-      aria-label={`Play ${title}`}
-      style={{
-        textAlign: "left",
-        cursor: "pointer",
-        width: "100%",
-        background: "var(--tantalar-color-surface-raised)",
-        color: "var(--tantalar-color-text)",
-        borderColor: "var(--tantalar-color-border)",
-      }}
-    >
-      <Card.Section
-        h={90}
-        style={{
-          background: "linear-gradient(135deg, var(--tantalar-color-primary) 0%, var(--tantalar-color-surface) 100%)",
-          borderRadius: "var(--tantalar-radius-md) var(--tantalar-radius-md) 0 0",
-        }}
-        aria-hidden="true"
-      />
-      <Title order={6} mt="xs" lineClamp={1}>{title}</Title>
-      {subtitle ? (
-        <Text size="xs" c="var(--tantalar-color-text-dimmed)">{subtitle}</Text>
-      ) : null}
-      {progressPct !== undefined ? (
-        <>
-          <Group justify="space-between" mt={4}>
-            <Text size="xs" c="var(--tantalar-color-text-dimmed)">{Math.round(progressPct)}% watched</Text>
-          </Group>
-          <Progress value={progressPct} mt={4} size="xs" />
-        </>
-      ) : null}
+    <Card withBorder padding="sm" className="tantalar-movie-card">
+      <button type="button" data-testid={testId} onClick={onOpen} aria-label={`Play ${title}`} className="tantalar-movie-card__open">
+        <MediaArtwork src={artworkUrl} title={title} />
+        <strong className="tantalar-movie-card__title">{title}</strong>
+        {subtitle ? <Text component="span" size="xs" c="var(--tantalar-color-text-dimmed)">{subtitle}</Text> : null}
+      </button>
+      {progressPct !== undefined ? <>
+        <Text size="xs" mt="xs">{Math.round(progressPct)}% watched</Text>
+        <Progress value={progressPct} mt="xs" size="xs" />
+      </> : null}
+      {onDetails ? <Button variant="subtle" mt="xs" onClick={onDetails} aria-label={`Details for ${title}`}>Details</Button> : null}
     </Card>
   );
+}
+
+function MovieDialog({ item, onClose, onWatch }: { item: LibraryItem | null; onClose: () => void; onWatch: (fileId: string) => void }) {
+  return <Modal opened={item !== null} onClose={onClose} title={item?.title ?? "Movie details"} size="lg">
+    {item ? <Stack><MovieDetails item={item} /><Button onClick={() => onWatch(item.fileId)}>Play {item.title}</Button></Stack> : null}
+  </Modal>;
 }
 
 /** Shared browse query with derived movies/series splits. */
@@ -111,6 +93,7 @@ function useLibrary() {
 
 export function HomePage({ onWatch }: { onWatch: (fileId: string) => void }) {
   const q = useLibrary();
+  const [detailId, setDetailId] = useState<string | null>(null);
 
   if (q.isPending) return <LoadState label="Loading home…" />;
   if (q.isError) return <ErrorState message={(q.error as Error).message} onRetry={() => void q.refetch()} />;
@@ -120,6 +103,7 @@ export function HomePage({ onWatch }: { onWatch: (fileId: string) => void }) {
 
   return (
     <Stack gap="lg" data-testid="home-page">
+      <MovieDialog item={q.data.items.find((item) => item.fileId === detailId) ?? null} onClose={() => setDetailId(null)} onWatch={onWatch} />
       <Title order={3}>Home</Title>
 
       <section aria-label="Continue watching">
@@ -138,7 +122,9 @@ export function HomePage({ onWatch }: { onWatch: (fileId: string) => void }) {
                   key={cw.fileId}
                   testId={`continue-${cw.fileId}`}
                   title={item?.title ?? cw.fileId}
-                  subtitle={item?.kind === "series" ? "Series episode" : "Movie"}
+                  artworkUrl={item?.artworkUrl}
+                  subtitle={item?.episode ? `${item.episode.episodeKey} · ${item.episode.title}` : item?.kind === "movie" ? movieSummary(item) : "Series episode"}
+                  onDetails={item?.kind === "movie" ? () => setDetailId(item.fileId) : undefined}
                   progressPct={pct}
                   onOpen={() => onWatch(cw.fileId)}
                 />
@@ -152,7 +138,7 @@ export function HomePage({ onWatch }: { onWatch: (fileId: string) => void }) {
         <Title order={5}>In your library</Title>
         {recent.length === 0 ? (
           <Text c="var(--tantalar-color-text-dimmed)" mt="xs" size="sm">
-            Your library is empty. An administrator can add libraries in Settings.
+          Your library is empty. An administrator can add libraries in Control.
           </Text>
         ) : (
           <SimpleGrid cols={{ base: 1, xs: 2, sm: 3, md: 4 }} mt="sm">
@@ -161,7 +147,9 @@ export function HomePage({ onWatch }: { onWatch: (fileId: string) => void }) {
                 key={item.fileId}
                 testId={`home-item-${item.fileId}`}
                 title={item.title}
-                subtitle={item.kind === "series" ? "Series" : "Movie"}
+                artworkUrl={item.artworkUrl}
+                subtitle={item.episode ? `${item.episode.episodeKey} · ${item.episode.title}` : item.kind === "movie" ? `${movieSummary(item)} · Available` : "Series"}
+                onDetails={item.kind === "movie" ? () => setDetailId(item.fileId) : undefined}
                 onOpen={() => onWatch(item.fileId)}
               />
             ))}
@@ -174,7 +162,6 @@ export function HomePage({ onWatch }: { onWatch: (fileId: string) => void }) {
 
 // ---- Catalog (Movies / Series) ----------------------------------------------
 
-const KIND_LABEL: Record<LibraryItem["kind"], string> = { series: "Series", movie: "Movie" };
 
 export function CatalogPage({
   kindFilter,
@@ -186,52 +173,35 @@ export function CatalogPage({
   heading: string;
   onWatch: (fileId: string) => void;
 }) {
-  const q = useLibrary();
-  const [filter, setFilter] = useState("");
-
-  const items = useMemo(() => {
-    const all = q.data?.items ?? [];
-    return all
-      .filter((i) => (kindFilter ? i.kind === kindFilter : true))
-      .filter((i) => i.title.toLowerCase().includes(filter.trim().toLowerCase()));
-  }, [q.data, kindFilter, filter]);
-
-  if (q.isPending) return <LoadState label={`Loading ${heading.toLowerCase()}…`} />;
-  if (q.isError) return <ErrorState message={(q.error as Error).message} onRetry={() => void q.refetch()} />;
-
+  const [query, setQuery] = useState<ExplorerQuery>(initialExplorerQuery);
+  const q = useQuery({
+    queryKey: ["library", "explorer", kindFilter, query],
+    placeholderData: keepPreviousData,
+    queryFn: ({ signal }) => api.browsePage({ ...query, filters: { ...query.filters, ...(kindFilter ? { kind: kindFilter } : {}) } }, signal),
+  });
+  const [detailId, setDetailId] = useState<string | null>(null);
+  const columns = useMemo<ColumnDef<LibraryItem, unknown>[]>(() => [
+          { id: "title", header: "Title", accessorKey: "title", size: 320, cell: ({ row }) => <div>{row.original.title}{row.original.episode ? <Text size="sm" c="dimmed" lineClamp={1}>{row.original.episode.episodeKey} · {row.original.episode.title}</Text> : null}</div> },
+          ...mediaLabelColumns<LibraryItem>(),
+          { id: "kind", header: "Type", accessorKey: "kind", size: 110 },
+          { id: "actions", header: "Actions", enableHiding: false, size: 220, cell: ({ row }) => <Group gap="xs">
+            <Button variant="default" data-testid={`catalog-${row.original.fileId}`} aria-label={`Play ${row.original.title}`} onClick={() => onWatch(row.original.fileId)}>Play</Button>
+            <Button variant="subtle" aria-label={`Details for ${row.original.title}`} onClick={() => setDetailId(row.original.fileId)}>Details</Button>
+          </Group> },
+        ], [onWatch]);
   return (
     <Stack gap="lg" data-testid={`${heading.toLowerCase()}-page`}>
-      <Group justify="space-between" wrap="wrap">
-        <Title order={3}>{heading}</Title>
-        <TextInput
-          aria-label={`Search ${heading}`}
-          placeholder="Search titles…"
-          value={filter}
-          onChange={(e) => setFilter(e.currentTarget.value)}
-          miw={{ base: "100%", sm: 260 }}
-        />
-      </Group>
-
-      {items.length === 0 ? (
-        <Text c="var(--tantalar-color-text-dimmed)" size="sm">
-          {filter
-            ? `No ${heading.toLowerCase()} match “${filter}”.`
-            : `No ${heading.toLowerCase()} are visible to you yet.`}
-        </Text>
-      ) : (
-        <Grid mt="sm">
-          {items.map((item) => (
-            <Grid.Col key={item.fileId} span={{ base: 12, xs: 6, sm: 4, md: 3, lg: 2 }}>
-              <PosterCard
-                testId={`catalog-${item.fileId}`}
-                title={item.title}
-                subtitle={KIND_LABEL[item.kind]}
-                onOpen={() => onWatch(item.fileId)}
-              />
-            </Grid.Col>
-          ))}
-        </Grid>
-      )}
+      <MovieDialog item={q.data?.items.find(item => item.fileId === detailId) ?? null} onClose={() => setDetailId(null)} onWatch={onWatch} />
+      <Title order={1}>{heading}</Title>
+      {q.isError ? <ErrorState message={(q.error as Error).message} onRetry={() => void q.refetch()} /> : null}
+      <DenseGrid<LibraryItem>
+        key={kindFilter ?? "all"} testId={`catalog-${kindFilter ?? "all"}-grid`} ariaLabel={heading}
+        defaultView="medium" data={q.data?.items ?? []} total={q.data?.total ?? 0} loading={q.isFetching}
+        onQueryChange={setQuery} artwork={item => <MediaArtwork src={item.artworkUrl} title={item.title} />}
+        emptyMessage={`No matching ${heading.toLowerCase()}.`}
+        filters={[...mediaLabelFilters(q.data?.facets), ...(kindFilter ? [] : [{ id: "kind", label: "Types", options: [{ value: "movie", label: "Movies" }, { value: "series", label: "Series" }] }])]}
+        columns={columns}
+      />
     </Stack>
   );
 }

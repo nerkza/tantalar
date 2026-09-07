@@ -13,7 +13,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { Kysely } from "kysely";
@@ -47,6 +47,7 @@ let app: Awaited<ReturnType<typeof buildServer>>;
 let address = "";
 let dir: string;
 let mediaRoot: string;
+let hlsRoot: string;
 
 // fixture media files (synthetic bytes)
 const FILES: Record<string, string> = {}; // fileId -> path
@@ -98,6 +99,14 @@ function post(path: string, body?: unknown, who = ADMIN) {
   });
 }
 
+function put(path: string, body: unknown, who = ADMIN) {
+  return fetch(`${address}${path}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json", "x-csrf-token": who.csrf, cookie: who.cookie },
+    body: JSON.stringify(body),
+  });
+}
+
 function del(path: string, who = ADMIN) {
   return fetch(`${address}${path}`, {
     method: "DELETE",
@@ -115,7 +124,9 @@ const BROWSER_FULL = {
 beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), "tantalar-p5-"));
   mediaRoot = join(dir, "media");
+  hlsRoot = join(dir, "segments");
   mkdirSync(mediaRoot, { recursive: true });
+  mkdirSync(hlsRoot, { recursive: true });
 
   db = await openDatabase({ dialect: "sqlite", sqlitePath: join(dir, "t.db") });
   await migrate(db);
@@ -200,10 +211,18 @@ beforeAll(async () => {
     supervisor,
     container,
     ready: () => true,
+    ops: { auth, db, supervisor, container, bus, ready: () => true, dataDir: dir, sqlitePath: join(dir, "t.db") },
     serving: (invoke) => ({
       invoke,
-      resolvePath: (fileId) => FILES[fileId.replace(/^f-/, "")] ?? null,
-      mediaRoots: [mediaRoot],
+      resolvePath: async (fileId) => FILES[fileId.replace(/^f-/, "")] ?? null,
+      mediaRoots: async () => [mediaRoot],
+      hlsRoot,
+      resolveSegmentPath: (sessionId, fileName) => join(hlsRoot, sessionId, fileName),
+      resolveLibraryAccess: async (userId, isAdmin) => {
+        if (isAdmin || userId === "u-admin") return ["*"];
+        if (userId === "u-kids") return ["lib-main"];
+        return [];
+      },
     }),
   });
   await app.listen({ port: 0, host: "127.0.0.1" });
@@ -235,7 +254,7 @@ describe("capability negotiation (stories 13, 16)", () => {
     expect(res.status).toBe(200);
     const { decision } = (await res.json()) as { decision: { mode: string; streamUrl?: string } };
     expect(decision.mode).toBe("direct");
-    expect(decision.streamUrl).toBe("/api/v1/stream/f-mp4-h264-aac");
+    expect(decision.streamUrl).toMatch(/^\/api\/v1\/stream\/f-mp4-h264-aac\?sessionId=/);
   });
 
   it("negotiates HLS for unsupported containers (mkv/avi) and codecs (hevc/av1)", async () => {
@@ -351,6 +370,9 @@ describe("authorization boundaries (story 21)", () => {
   it("browse hides restricted libraries per viewer", async () => {
     const admin = (await (await get("/api/v1/library")).json()) as { items: unknown[] };
     expect(admin.items.length).toBe(4);
+    // Durable grants are re-applied on each request, so stale plugin state
+    // cannot make an allowed library disappear after a plugin restart.
+    await serving().invoke("set-viewer", { userId: "u-kids", libraries: [] });
     const kids = (await (await get("/api/v1/library?viewerId=u-kids")).json()) as {
       items: Array<{ fileId: string }>;
     };
@@ -426,6 +448,86 @@ describe("browsing, resume points, watch history (stories 15, 18)", () => {
     ).toBe(true);
   });
 
+  it("returns one newest viewer-safe row for each visible catalog item", async () => {
+    const userId = `u-history-${Date.now()}`;
+    await serving().invoke("set-viewer", { userId, libraries: ["*"] });
+    await serving().invoke("set-resume", {
+      userId,
+      fileId: "f-mp4-h264-aac",
+      positionMs: 10_000,
+      durationMs: 100_000,
+    });
+    await serving().invoke("set-resume", {
+      userId,
+      fileId: "f-mp4-h264-aac",
+      positionMs: 20_000,
+      durationMs: 100_000,
+    });
+    await new Promise((resolve_) => setTimeout(resolve_, 2));
+    await serving().invoke("set-resume", {
+      userId,
+      fileId: "f-mkv-hevc-dts",
+      positionMs: 99_000,
+      durationMs: 100_000,
+    });
+    await serving().invoke("set-resume", {
+      userId,
+      fileId: "f-avi-av1-truehd",
+      positionMs: 30_000,
+      durationMs: 100_000,
+    });
+    await serving().invoke("register-entry", {
+      fileId: "f-history-removed",
+      itemKey: "item-history-removed",
+      title: "Removed movie",
+      kind: "movie",
+      libraryId: "lib-main",
+      container: "mp4",
+      videoCodec: "h264",
+      audioCodec: "aac",
+      sizeBytes: 1,
+      subtitles: [],
+    });
+    await serving().invoke("set-resume", {
+      userId,
+      fileId: "f-history-removed",
+      positionMs: 15_000,
+      durationMs: 100_000,
+    });
+    await serving().invoke("remove-entry", { fileId: "f-history-removed" });
+
+    // A stale resume cannot survive a current grant or catalog check.
+    await serving().invoke("set-viewer", { userId, libraries: ["lib-main"] });
+    const result = (await serving().invoke("history", { userId })) as {
+      history: Array<Record<string, unknown>>;
+    };
+
+    expect(result.history.map((row) => row.fileId)).toEqual([
+      "f-mkv-hevc-dts",
+      "f-mp4-h264-aac",
+    ]);
+    expect(result.history.filter((row) => row.fileId === "f-mp4-h264-aac")).toHaveLength(1);
+    expect(result.history[0]).toMatchObject({
+      fileId: "f-mkv-hevc-dts",
+      title: "f-mkv-hevc-dts",
+      kind: "movie",
+      positionMs: 99_000,
+      durationMs: 100_000,
+      completed: true,
+      artworkUrl: null,
+    });
+    expect(Object.keys(result.history[0] ?? {}).sort()).toEqual([
+      "artworkUrl",
+      "completed",
+      "durationMs",
+      "fileId",
+      "kind",
+      "lastWatchedAt",
+      "positionMs",
+      "title",
+    ]);
+  });
+
   it("collections group visible items by kind", async () => {
     const lib = (await (await get("/api/v1/library")).json()) as {
       collections: Array<{ name: string; fileIds: string[] }>;
@@ -466,7 +568,7 @@ describe("subtitle inventory (story 19)", () => {
 // ---- Story 17: transcode lifecycle ------------------------------------------------
 
 describe("transcode session lifecycle (story 17)", () => {
-  it("opens an HLS session, serves manifest + playlists + segments, closes cleanly", async () => {
+  it("opens an HLS session, refuses unstarted output, and closes cleanly", async () => {
     const open = await post("/api/v1/transcode-session", {
       fileId: "f-mkv-hevc-dts",
       qualities: ["1080p", "720p"],
@@ -481,10 +583,9 @@ describe("transcode session lifecycle (story 17)", () => {
     expect(text).toContain("#EXT-X-STREAM-INF");
     expect(text).toContain("1080p");
 
-    expect((await get(`/api/v1/hls/${sessionId}/0/playlist.m3u8`)).status).toBe(200);
+    expect((await get(`/api/v1/hls/${sessionId}/0/playlist.m3u8`)).status).toBe(503);
     const seg = await get(`/api/v1/hls/${sessionId}/0/seg0.ts`);
-    expect(seg.status).toBe(200);
-    expect(seg.headers.get("content-type")).toBe("video/mp2t");
+    expect(seg.status).toBe(404);
 
     const cancel = await del(`/api/v1/transcode-session/${sessionId}`);
     expect(cancel.status).toBe(200);
@@ -687,19 +788,18 @@ describe("review repairs: viewer-bound HLS sessions (P1-3)", () => {
 
 describe("review repairs: HTTP-triggered real ffmpeg worker + real segments (P2-4)", () => {
   it("starts a real ffmpeg worker via HTTP and serves the produced segment bytes", async () => {
-    const segmentsDir = join(dir, "segments");
     await serving().invoke("configure", {
-      segmentsDir,
+      segmentsDir: hlsRoot,
       ffmpegCommand: "ffmpeg",
-      // {{sessionId}} is substituted per session; output lands where the
-      // segment reader looks for it.
       ffmpegArgs: [
-        "-f", "lavfi", "-i", "testsrc=duration=1:size=64x64:rate=10",
-        "-c:v", "mpeg2video", "-f", "mpegts",
-        join("{{sessionIdPlaceholder}}", "seg0.ts"),
+        "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "testsrc=duration=2:size=64x64:rate=10",
+        "-c:v", "libx264", "-preset", "ultrafast",
+        "-f", "hls", "-hls_time", "1", "-hls_list_size", "0",
+        "-hls_segment_filename", join("{{sessionIdPlaceholder}}", "seg%05d.ts"),
+        join("{{sessionIdPlaceholder}}", "playlist.m3u8"),
       ],
     });
-    void segmentsDir;
     const open = await post("/api/v1/transcode-session", { fileId: "f-mkv-hevc-dts" });
     const { sessionId } = (await open.json()) as { sessionId: string };
     const start = await post(`/api/v1/hls/${sessionId}/start`);
@@ -707,14 +807,18 @@ describe("review repairs: HTTP-triggered real ffmpeg worker + real segments (P2-
     const started = (await start.json()) as { started: string; pid?: number };
     expect(started.started).toBe(sessionId);
 
-    // The worker is a REAL ffmpeg process writing a REAL mpeg-ts file.
-    const segPath = join(segmentsDir, sessionId, "seg0.ts");
+    const playlist = await get(`/api/v1/hls/${sessionId}/0/playlist.m3u8`);
+    expect(playlist.status).toBe(200);
+    expect(await playlist.text()).toContain("#EXTINF");
+
+    // The worker is a REAL ffmpeg process writing a REAL MPEG-TS file.
+    const segPath = join(hlsRoot, sessionId, "seg00000.ts");
     for (let i = 0; i < 100 && !existsSync(segPath); i++) {
       await new Promise((r) => setTimeout(r, 100));
     }
     expect(existsSync(segPath)).toBe(true);
 
-    const seg = await get(`/api/v1/hls/${sessionId}/0/seg0.ts`);
+    const seg = await get(`/api/v1/hls/${sessionId}/0/seg00000.ts`);
     expect(seg.status).toBe(200);
     expect(seg.headers.get("content-type")).toBe("video/mp2t");
     const buf = Buffer.from(await seg.arrayBuffer());
@@ -730,14 +834,16 @@ describe("review repairs: durable orphan cleanup (P2-5)", () => {
     // Victim process that would survive a kill -9 of the server.
     const victim = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
     const exited = new Promise<boolean>((res) => victim.once("exit", () => res(true)));
-    // Simulate crash state: the PREVIOUS instance durably recorded the worker.
+    // Stop the current instance first so its graceful unmount cannot overwrite
+    // the crash snapshot that the next instance must recover.
     const statePath = join(dir, "serving-state.json");
+    await supervisor.unmount(SERVING_ID);
+    // Simulate crash state: the PREVIOUS instance durably recorded the worker.
     const snap = JSON.parse(await import("node:fs").then((fs) => fs.readFileSync(statePath, "utf8")));
     writeFileSync(
       statePath,
       JSON.stringify({ ...snap, workers: [{ sessionId: "crash-sim", pid: victim.pid }] }),
     );
-    await supervisor.unmount(SERVING_ID);
     await mount(SERVING_ID, SERVING_CAP, SERVING_ENTRY, {
       ffmpegCommand: process.execPath,
       ffmpegArgs: ["-e", "setInterval(()=>{},1000)"],
@@ -748,6 +854,39 @@ describe("review repairs: durable orphan cleanup (P2-5)", () => {
     });
     // The remounted plugin must SIGKILL the durably-recorded pid.
     expect(await Promise.race([exited, new Promise<boolean>((r) => setTimeout(() => r(false), 5000))])).toBe(true);
+  });
+
+  it("restores normalized viewer history after a serving-plugin restart", async () => {
+    const userId = `u-history-persist-${Date.now()}`;
+    await serving().invoke("set-viewer", { userId, libraries: ["lib-main"] });
+    await serving().invoke("set-resume", {
+      userId,
+      fileId: "f-mp4-h264-atmos",
+      positionMs: 45_000,
+      durationMs: 120_000,
+    });
+
+    const statePath = join(dir, "serving-state.json");
+    await supervisor.unmount(SERVING_ID);
+    await mount(SERVING_ID, SERVING_CAP, SERVING_ENTRY, {
+      ffmpegCommand: process.execPath,
+      ffmpegArgs: ["-e", "setInterval(()=>{},1000)"],
+      maxWorkers: 2,
+      idleTimeoutMs: 60_000,
+      hangTimeoutMs: 60_000,
+      stateFile: statePath,
+    });
+
+    const restored = (await serving().invoke("history", { userId })) as {
+      history: Array<Record<string, unknown>>;
+    };
+    expect(restored.history).toHaveLength(1);
+    expect(restored.history[0]).toMatchObject({
+      fileId: "f-mp4-h264-atmos",
+      positionMs: 45_000,
+      durationMs: 120_000,
+      completed: false,
+    });
   });
 });
 
@@ -766,5 +905,146 @@ describe("review repairs: named-viewer impersonation restricted (P2-6)", () => {
     // Acting as themselves is fine.
     const self = await fetch(`${address}/api/v1/history`, { headers: h });
     expect(self.status).toBe(200);
+  });
+});
+
+describe("R5-11 playback administration", () => {
+  it("reports the same FFmpeg readiness in Playback and system diagnostics", async () => {
+    const [playbackResponse, diagnosticsResponse] = await Promise.all([
+      get("/api/v1/playback"),
+      get("/api/v1/system/diagnostics"),
+    ]);
+    expect(playbackResponse.status).toBe(200);
+    expect(diagnosticsResponse.status).toBe(200);
+    const playback = (await playbackResponse.json()) as { probe: { available: boolean } };
+    const diagnostics = (await diagnosticsResponse.json()) as { transcoder: { ffmpegAvailable: boolean } };
+    expect(diagnostics.transcoder.ffmpegAvailable).toBe(playback.probe.available);
+  });
+
+  it("lists redacted live sessions and stops a transcode with correlated evidence", async () => {
+    const [admin] = await db.selectFrom("users").select("id").where("username", "=", "admin").execute();
+    const opened = (await serving().invoke("open-session", {
+      userId: admin!.id,
+      fileId: "f-mkv-hevc-dts",
+      reason: "admin-test",
+      client: "Fixture browser",
+      network: "local",
+    })) as { sessionId: string };
+    await serving().invoke("start-worker", { sessionId: opened.sessionId });
+
+    const response = await get("/api/v1/playback");
+    expect(response.status).toBe(200);
+    const snapshot = (await response.json()) as {
+      sessions: Array<Record<string, unknown>>;
+      policy: Record<string, unknown>;
+    };
+    const session = snapshot.sessions.find((item) => item.sessionId === opened.sessionId);
+    expect(session).toMatchObject({
+      title: "f-mkv-hevc-dts",
+      viewer: "admin",
+      client: "Fixture browser",
+      mode: "hls",
+      state: "transcoding",
+      workerAlive: true,
+    });
+    expect(session).not.toHaveProperty("path");
+    expect(session).not.toHaveProperty("userId");
+
+    const stopped = await post(`/api/v1/playback/sessions/${opened.sessionId}/stop-transcode`);
+    expect(stopped.status).toBe(200);
+    const state = await serving().invoke("session-state", { sessionId: opened.sessionId }) as { closed: boolean; workerAlive: boolean };
+    expect(state).toMatchObject({ closed: true, workerAlive: false });
+
+    const eventRows = await db.selectFrom("events")
+      .select(["type", "correlationId"])
+      .where("correlationId", "=", opened.sessionId)
+      .execute();
+    expect(eventRows.some((event) => event.type === EventTypes.PlaybackStarted)).toBe(true);
+    expect(eventRows.some((event) => event.type === EventTypes.PlaybackEnded)).toBe(true);
+    const auditRows = await db.selectFrom("audit_log")
+      .select("action")
+      .where("targetId", "=", opened.sessionId)
+      .execute();
+    expect(auditRows).toContainEqual({ action: "playback.transcode.stopped" });
+  });
+
+  it("validates and restores the durable global playback policy", async () => {
+    const current = (await serving().invoke("playback-policy", {})) as { policy: Record<string, unknown> };
+    const policy = {
+      ...current.policy,
+      preferDirectPlay: false,
+      maxConcurrentTranscodes: 3,
+      hardwareAcceleration: "software",
+      transcodeCacheMaxBytes: 512 * 1024 * 1024,
+    };
+    const saved = await put("/api/v1/playback/policy", policy);
+    expect(saved.status).toBe(200);
+
+    const unsupported = await put("/api/v1/playback/policy", { ...policy, hardwareAcceleration: "not_a_real_accelerator" });
+    expect(unsupported.status).toBe(400);
+
+    const statePath = join(dir, "serving-state.json");
+    await supervisor.unmount(SERVING_ID);
+    await mount(SERVING_ID, SERVING_CAP, SERVING_ENTRY, {
+      ffmpegCommand: process.execPath,
+      ffmpegArgs: ["-e", "setInterval(()=>{},1000)"],
+      stateFile: statePath,
+    });
+    const restored = (await serving().invoke("playback-policy", {})) as { policy: Record<string, unknown> };
+    expect(restored.policy).toMatchObject({
+      preferDirectPlay: false,
+      maxConcurrentTranscodes: 3,
+      hardwareAcceleration: "software",
+    });
+  });
+
+  it("applies saved audio and subtitle language defaults to a new session", async () => {
+    const capture = join(dir, "selected-audio-map.txt");
+    await serving().invoke("register-entry", {
+      fileId: "f-language-policy",
+      itemKey: "item-language-policy",
+      title: "Language policy fixture",
+      kind: "movie",
+      libraryId: "lib-a",
+      container: "mp4",
+      videoCodec: "h264",
+      audioCodec: "aac",
+      sizeBytes: 4096,
+      audioTracks: [
+        { streamIndex: 1, lang: "eng", codec: "aac", default: true },
+        { streamIndex: 2, lang: "jpn", codec: "aac" },
+      ],
+      subtitles: [{ trackId: "sub-jpn", lang: "jpn", format: "srt", source: "embedded", content: "WEBVTT" }],
+    });
+    await serving().invoke("set-viewer", { userId: "admin", libraries: ["*"] });
+    const current = (await serving().invoke("playback-policy", {})) as { policy: Record<string, unknown> };
+    await serving().invoke("set-playback-policy", {
+      ...current.policy,
+      preferDirectPlay: true,
+      defaultAudioLanguage: "jpn",
+      defaultSubtitleLanguage: "jpn",
+      subtitleMode: "always",
+    });
+    await serving().invoke("configure", {
+      ffmpegCommand: process.execPath,
+      ffmpegArgs: [
+        "-e",
+        `require("node:fs").writeFileSync(${JSON.stringify(capture)}, process.argv[1]); setInterval(()=>{},1000)`,
+        "0:a:0?",
+      ],
+    });
+
+    const decision = (await serving().invoke("negotiate", {
+      fileId: "f-language-policy",
+      userId: "admin",
+      capabilities: BROWSER_FULL,
+    })) as { decision: { mode: string; sessionId: string; audioLanguage?: string; subtitleTrackId?: string } };
+    expect(decision.decision).toMatchObject({ mode: "hls", audioLanguage: "jpn", subtitleTrackId: "sub-jpn" });
+    await serving().invoke("start-worker", { sessionId: decision.decision.sessionId });
+    for (let attempt = 0; attempt < 30 && !existsSync(capture); attempt++) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+    }
+    expect(readFileSync(capture, "utf8")).toBe("0:2?");
+    await serving().invoke("close-session", { sessionId: decision.decision.sessionId });
   });
 });

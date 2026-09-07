@@ -2,11 +2,22 @@ packages:
   - "apps/*"
   - "packages/*"
   - "plugins/*"
+# ip.isPublic is not called by either installed consumer. See the dependency
+# reachability review in plugins/torrent-native/THIRD_PARTY.md before changing pins.
+audit:
+  ignore:
+    - GHSA-2p57-rm9w-gvfp
 allowBuilds:
   argon2: true
   better-sqlite3: true
+  bufferutil: set this to true or false
   esbuild: true
+  ip-set: set this to true or false
+  node-datachannel: set this to true or false
   protobufjs: true
+  utf-8-validate: set this to true or false
+  utp-native: set this to true or false
+  workerd: true
 onlyBuiltDependencies:
   - esbuild
   - better-sqlite3

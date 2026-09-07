@@ -5,5 +5,8 @@
     "rootDir": "src",
     "outDir": "dist"
   },
+  "references": [
+    { "path": "../../plugins/indexer-torznab-newznab" }
+  ],
   "include": ["src"]
 }

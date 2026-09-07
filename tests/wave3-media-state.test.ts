@@ -14,7 +14,7 @@
  *  - traceable events on every mutation.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, writeFileSync, symlinkSync, existsSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, symlinkSync, existsSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Kysely } from "kysely";
@@ -52,7 +52,7 @@ let service: LibraryService;
 let dir: string;
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "tantalar-wave3-"));
+  dir = realpathSync(mkdtempSync(join(tmpdir(), "tantalar-wave3-")));
   db = await openDatabase({ dialect: "sqlite", sqlitePath: join(dir, "t.db") });
   await migrate(db);
   bus = new EventBus(db);
@@ -306,6 +306,34 @@ describe("library management flows (TAN-020)", () => {
 // ---- Validation, rescan, catalog identity -----------------------------------------
 
 describe("validate, rescan and import identity (TAN-021)", () => {
+  it("discovers nested video files idempotently and never follows symlinks", async () => {
+    const root = join(dir, "lib-discovery");
+    const nested = join(root, "Film (2026)");
+    const outside = join(dir, "outside-video.mkv");
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(join(nested, "Film.2026.MKV"), "video");
+    writeFileSync(join(nested, "Film.2026.nfo"), "metadata");
+    writeFileSync(outside, "outside");
+    symlinkSync(outside, join(nested, "escape.mkv"));
+    const lib = await service.create({ name: "Discovery", rootPath: root, kind: "movie" });
+
+    const first = await service.rescan(lib.id);
+    expect(first).toMatchObject({ checked: 1, discovered: 1, existing: 0, missingRemoved: 0, skipped: 2, errors: [] });
+    const [record] = await service.catalogList(lib.id);
+    expect(record).toMatchObject({ method: "existing", quality: "unknown" });
+    expect(record?.path).toBe(realpathSync(join(nested, "Film.2026.MKV")));
+
+    const second = await service.rescan(lib.id);
+    expect(second).toMatchObject({ checked: 1, discovered: 0, existing: 1, missingRemoved: 0, errors: [] });
+    expect((await service.catalogList(lib.id))[0]?.fileId).toBe(record?.fileId);
+
+    const { unlinkSync } = await import("node:fs");
+    unlinkSync(join(nested, "Film.2026.MKV"));
+    const third = await service.rescan(lib.id);
+    expect(third).toMatchObject({ checked: 0, discovered: 0, existing: 0, missingRemoved: 1 });
+    expect(await service.catalogList(lib.id)).toHaveLength(0);
+  });
+
   it("validates containment and reports missing files; rescan drops vanished rows", async () => {
     const root = join(dir, "lib-d");
     mkdirSync(root, { recursive: true });

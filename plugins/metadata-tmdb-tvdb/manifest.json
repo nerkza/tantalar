@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "protocolVersion": 1,
   "provides": ["dev.tantalar.capability.metadata-provider"],
-  "requires": ["dev.tantalar.capability.event.emit", "dev.tantalar.capability.log"],
+  "requires": ["dev.tantalar.capability.event.emit", "dev.tantalar.capability.log", "dev.tantalar.capability.secret.resolve"],
   "subscriptions": [],
   "entry": { "command": "node dist/plugin.js" }
 }

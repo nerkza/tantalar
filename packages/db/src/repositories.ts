@@ -199,7 +199,7 @@ export interface MediaCatalogRecord {
   itemKey: string;
   path: string;
   quality: string;
-  method: "hardlink" | "copy";
+  method: "hardlink" | "copy" | "existing";
   sourceHash: string;
   importedAt: string;
   updatedAt: string;
@@ -278,7 +278,7 @@ export class MediaCatalogRepository {
     itemKey: string;
     path: string;
     quality: string;
-    method: "hardlink" | "copy";
+    method: "hardlink" | "copy" | "existing";
     sourceHash: string;
   }): Promise<{ record: MediaCatalogRecord; created: boolean }> {
     if (!input.libraryId || !input.itemKey || !input.path || !input.sourceHash)

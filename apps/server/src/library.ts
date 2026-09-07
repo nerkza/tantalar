@@ -13,7 +13,9 @@
  *  - catalog writes are idempotent by (sourceHash, destinationPath).
  */
 import { realpathSync, statSync, existsSync, unlinkSync } from "node:fs";
-import { sep, resolve as pathResolve } from "node:path";
+import { lstat, readdir, realpath } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { extname, isAbsolute, join, relative, sep, resolve as pathResolve } from "node:path";
 import { EventTypes } from "@tantalar/contracts";
 import {
   LibraryRepository,
@@ -64,17 +66,49 @@ export interface LibraryServiceOptions {
   bus: EventBus;
   libraries: LibraryRepository;
   mediaCatalog: MediaCatalogRepository;
+  onCatalogUpsert?: (record: MediaCatalogRecord, library: LibraryRecord) => Promise<void>;
+  onCatalogRemove?: (fileId: string) => Promise<void>;
 }
 
+export interface LibraryScanResult {
+  readonly checked: number;
+  readonly discovered: number;
+  readonly existing: number;
+  readonly missingRemoved: number;
+  readonly skipped: number;
+  readonly errors: string[];
+}
+
+const VIDEO_EXTENSIONS = new Set([
+  ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".ts", ".webm", ".wmv",
+]);
+
 export class LibraryService {
+  readonly #busy = new Set<string>();
+  async exclusive<T>(id: string, work: () => Promise<T>): Promise<T> {
+    if (this.#busy.has(id)) throw new LibraryError("Library file work is already running. Retry after it finishes.", 409);
+    this.#busy.add(id);
+    try { return await work(); } finally { this.#busy.delete(id); }
+  }
   readonly #bus: EventBus;
   readonly #libraries: LibraryRepository;
   readonly #mediaCatalog: MediaCatalogRepository;
+  readonly #onCatalogUpsert?: LibraryServiceOptions["onCatalogUpsert"];
+  readonly #onCatalogRemove?: LibraryServiceOptions["onCatalogRemove"];
 
   constructor(opts: LibraryServiceOptions) {
     this.#bus = opts.bus;
     this.#libraries = opts.libraries;
     this.#mediaCatalog = opts.mediaCatalog;
+    this.#onCatalogUpsert = opts.onCatalogUpsert;
+    this.#onCatalogRemove = opts.onCatalogRemove;
+  }
+
+  async refreshCatalogEntry(fileId: string): Promise<void> {
+    const record = await this.#mediaCatalog.get(fileId);
+    if (!record) throw new LibraryError("Catalog file not found.", 404);
+    const library = await this.get(record.libraryId);
+    await this.#onCatalogUpsert?.(record, library);
   }
 
   async #emit(type: string, payload: Record<string, unknown>, correlationId?: string): Promise<void> {
@@ -91,6 +125,9 @@ export class LibraryService {
    * real directory and must NOT be (or pass through) a symlink.
    */
   static resolveRoot(rootPath: string): string {
+    if (!isAbsolute(rootPath)) {
+      throw new LibraryError("library root must be an absolute path", 400);
+    }
     const abs = pathResolve(rootPath);
     if (!existsSync(abs)) throw new LibraryError(`library root does not exist: ${abs}`, 400);
     if (!statSync(abs).isDirectory()) throw new LibraryError(`library root is not a directory: ${abs}`, 400);
@@ -185,7 +222,9 @@ export class LibraryService {
    */
   async remove(id: string, correlationId?: string): Promise<{ removed: true; mediaFilesDeleted: false }> {
     await this.get(id);
+    const catalog = await this.#mediaCatalog.listByLibrary(id);
     await this.#libraries.remove(id); // cascades catalog rows only
+    for (const row of catalog) await this.#onCatalogRemove?.(row.fileId);
     await this.#emit(EventTypes.LibraryRemoved, { libraryId: id, mediaFilesDeleted: false }, correlationId);
     return { removed: true, mediaFilesDeleted: false };
   }
@@ -265,26 +304,121 @@ export class LibraryService {
     return out;
   }
 
-  /**
-   * Rescan: re-check every cataloged file in the library, dropping rows
-   * whose files vanished and reporting progress via events.
-   */
-  async rescan(id: string, correlationId?: string): Promise<{ checked: number; missingRemoved: number }> {
+  /** Discover supported videos recursively, without following symlinks. */
+  async rescan(id: string, correlationId?: string): Promise<LibraryScanResult> {
+    return this.exclusive(id, () => this.#rescan(id, correlationId));
+  }
+
+  async #rescan(id: string, correlationId?: string): Promise<LibraryScanResult> {
     const lib = await this.get(id);
+    const root = LibraryService.resolveRoot(lib.rootPath);
     const rows = await this.#mediaCatalog.listByLibrary(lib.id);
+    const byPath = new Map(rows.map((row) => [pathResolve(row.path), row]));
+    const files: string[] = [];
+    const errors: string[] = [];
+    let skipped = 0;
+
+    const walk = async (directory: string): Promise<void> => {
+      let entries;
+      try {
+        entries = await readdir(directory, { withFileTypes: true });
+      } catch (err) {
+        errors.push(`${relative(root, directory) || "."}: ${(err as Error).message}`);
+        return;
+      }
+      entries.sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of entries) {
+        if (entry.name === ".tantalar-recycle") { skipped++; continue; }
+        const candidate = join(directory, entry.name);
+        try {
+          const info = await lstat(candidate);
+          if (info.isSymbolicLink()) {
+            skipped += 1;
+          } else if (info.isDirectory()) {
+            const realDirectory = await realpath(candidate);
+            if (isInside(root, realDirectory)) await walk(realDirectory);
+            else skipped += 1;
+          } else if (info.isFile() && VIDEO_EXTENSIONS.has(extname(entry.name).toLowerCase())) {
+            const realFile = await realpath(candidate);
+            if (isInside(root, realFile)) files.push(realFile);
+            else skipped += 1;
+          } else {
+            skipped += 1;
+          }
+        } catch (err) {
+          errors.push(`${relative(root, candidate)}: ${(err as Error).message}`);
+        }
+      }
+    };
+
+    await walk(root);
     let missingRemoved = 0;
     for (const row of rows) {
-      if (!existsSync(pathResolve(row.path))) {
+      try {
+        await lstat(pathResolve(row.path));
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+          errors.push(`${relative(root, row.path)}: ${(err as Error).message}`);
+          continue;
+        }
         await this.#mediaCatalog.delete(row.fileId);
+        try {
+          await this.#onCatalogRemove?.(row.fileId);
+        } catch (hookError) {
+          errors.push(`${relative(root, row.path)}: ${(hookError as Error).message}`);
+        }
         missingRemoved += 1;
       }
     }
+
+    let discovered = 0;
+    let existing = 0;
+    for (const path of files) {
+      const current = byPath.get(path);
+      if (current) {
+        existing += 1;
+        try {
+          await this.#onCatalogUpsert?.(current, lib);
+        } catch (err) {
+          errors.push(`${relative(root, path)}: ${(err as Error).message}`);
+        }
+        continue;
+      }
+      const relativePath = relative(root, path).split(sep).join("/");
+      const identity = createHash("sha256")
+        .update(`existing\0${lib.id}\0${relativePath}`)
+        .digest("hex");
+      const out = await this.#mediaCatalog.put({
+        fileId: `existing:${identity}`,
+        libraryId: lib.id,
+        itemKey: `existing:${identity}`,
+        path,
+        quality: "unknown",
+        method: "existing",
+        sourceHash: identity,
+      });
+      if (out.created) discovered += 1;
+      else existing += 1;
+      try {
+        await this.#onCatalogUpsert?.(out.record, lib);
+      } catch (err) {
+        errors.push(`${relativePath}: ${(err as Error).message}`);
+      }
+    }
+    const result: LibraryScanResult = {
+      checked: files.length,
+      discovered,
+      existing,
+      missingRemoved,
+      skipped,
+      errors,
+    };
     await this.#emit(
       EventTypes.LibraryRescanCompleted,
-      { libraryId: lib.id, checked: rows.length, missingRemoved },
+      { libraryId: lib.id, ...result },
       correlationId,
     );
-    return { checked: rows.length, missingRemoved };
+    return result;
   }
 
   /** Free space on the library root's filesystem (bytes available). */
@@ -300,7 +434,7 @@ export class LibraryService {
     itemKey: string;
     path: string;
     quality: string;
-    method: "hardlink" | "copy";
+    method: "hardlink" | "copy" | "existing";
     sourceHash: string;
     fileId?: string;
     correlationId?: string;
@@ -326,6 +460,7 @@ export class LibraryService {
         input.correlationId,
       );
     }
+    await this.#onCatalogUpsert?.(out.record, lib);
     return out;
   }
 

@@ -1,9 +1,12 @@
-# Tantalar v1
+# Tantalar 0.0.1 Alpha
 
 One self-hosted web app to replace the Plex + \*arr + downloader stack. Library serving, wanted-list automation, indexer search, NZB/torrent acquisition, and post-processing — built "everything is a module/plugin" from the ground up.
 
 - **PRD**: [PRD.md](./PRD.md)
-- **Status**: v1 accepted locally on 2026-08-23. All six phases passed independent review. See [v1 acceptance evidence](./docs/reviews/v1-acceptance-evidence.md).
+- **Status**: `0.0.1-alpha.0` (**0.0.1 Alpha**) is under active development. Earlier v1 acceptance was reopened after the product audit.
+- **Documentation**: [docs/README.md](./docs/README.md) — central index and document authority
+- **Progress**: [docs/progress.md](./docs/progress.md) — current capabilities, validation work, and ordered backlog
+- **Current media plan**: [plans/media-discovery-and-metadata.md](./plans/media-discovery-and-metadata.md) — real discovery, dedicated management, and product metadata
 - **Architecture**: [docs/architecture.md](./docs/architecture.md) — components, topology, trust boundaries, failure modes
 - **Traceability**: [docs/traceability.md](./docs/traceability.md) — PRD stories 1–32 mapped to phases and tests
 - **Roadmap**: [docs/roadmap.md](./docs/roadmap.md) — 6 phases, core kernel first
@@ -36,12 +39,13 @@ node apps/server/dist/main.js                 # boots on 127.0.0.1:8790
 | `packages/plugin-sdk` | Public SDK for plugin authors |
 | `packages/testkit` | Conformance fixtures (Phase 2) |
 | `plugins/*` | First-party and fixture plugins using the same public contract |
+| `docs/` | Product, engineering, evidence, plans, research, and current progress |
 | `tests/` | Vitest unit, integration, plugin, acquisition, library and serving suites |
 | `e2e/` | Playwright viewer and admin acceptance flows |
 | `docker/` | SQLite/PostgreSQL compose files and backup/restore entrypoint |
 | `marketing-site/` | Own repo — Starlight marketing site + public wiki (launch-phase) |
 
-## Core guarantees verified by v1 tests
+## Core guarantees verified by current tests
 
 - Boot order: config → DB migrate → event log → container → supervisor → HTTP.
 - Events are append-only; append precedes fan-out; replay by time/type/subject/correlation/cursor.

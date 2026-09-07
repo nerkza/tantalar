@@ -15,7 +15,7 @@
  * All fixtures are legal synthetic torrents generated in-test.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, realpathSync, statSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Kysely } from "kysely";
@@ -61,7 +61,11 @@ async function mount(id: string, caps: string[], command: string, config: Record
     version: "0.1.0",
     protocolVersion: 1,
     provides: caps,
-    requires: ["dev.tantalar.capability.event.emit", "dev.tantalar.capability.log"],
+    requires: [
+      "dev.tantalar.capability.event.emit",
+      "dev.tantalar.capability.log",
+      ...(id === PLUGIN_ID ? ["dev.tantalar.capability.vpn-binding"] : []),
+    ],
     subscriptions: [],
     entry: { command },
   };
@@ -75,8 +79,27 @@ function cap(c: string): { invoke(op: string, p?: Record<string, unknown>): Prom
   return container.resolve(c) as any;
 }
 
+it("applies a reviewed rename without overwriting files and recovers a repeated request", async () => {
+  const source = join(importRoot, "rename-original.mkv");
+  const destination = join(importRoot, "Renamed", "movie.mkv");
+  writeFileSync(source, "legal synthetic media");
+  const info = statSync(source);
+  const fingerprint = `${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}`;
+  const input = { root: importRoot, source, destination, fingerprint };
+  await cap(LIBRARY_CAP).invoke("rename-file", input);
+  expect(existsSync(source)).toBe(false);
+  expect(readFileSync(destination, "utf8")).toBe("legal synthetic media");
+  await cap(LIBRARY_CAP).invoke("rename-file", input);
+  writeFileSync(destination, "changed after preview");
+  await expect(cap(LIBRARY_CAP).invoke("rename-file", input)).rejects.toThrow(/changed/);
+  const occupied = join(importRoot, "occupied.mkv"); writeFileSync(occupied, "keep");
+  const current = statSync(destination);
+  await expect(cap(LIBRARY_CAP).invoke("rename-file", { root: importRoot, source: destination, destination: occupied, fingerprint: `${current.dev}:${current.ino}:${current.size}:${current.mtimeMs}` })).rejects.toThrow(/exists/);
+  expect(readFileSync(occupied, "utf8")).toBe("keep");
+});
+
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "tantalar-wave10-"));
+  dir = realpathSync(mkdtempSync(join(tmpdir(), "tantalar-wave10-")));
   downloadRoot = join(dir, "downloads");
   fixtureDir = join(dir, "fixtures");
   importRoot = join(dir, "library");
@@ -89,6 +112,11 @@ beforeAll(async () => {
   container = new ServiceContainer();
   container.register({ pluginId: "core", capability: "dev.tantalar.capability.event.emit", invoke: async () => ({ ok: true }) });
   container.register({ pluginId: "core", capability: "dev.tantalar.capability.log", invoke: async () => ({ ok: true }) });
+  container.register({
+    pluginId: "core",
+    capability: "dev.tantalar.capability.vpn-binding",
+    invoke: async () => ({ allowDispatch: true, health: "healthy", profileId: "test-loopback" }),
+  });
   supervisor = new Supervisor({
     bus,
     container,
@@ -108,6 +136,7 @@ beforeAll(async () => {
   });
   await mount(PLUGIN_ID, [CLIENT_CAP, ENGINE_CAP, RULES_CAP], PLUGIN_ENTRY, {
     downloadRoots: [downloadRoot],
+    engineMode: "memory",
     maxConcurrent: 50,
   });
   await mount(LIBRARY_ID, [LIBRARY_CAP], LIBRARY_ENTRY, { importRoots: [importRoot], sourceRoots: [dir] });
@@ -244,6 +273,7 @@ describe("tracker rules (TAN-015)", () => {
     await supervisor.unmount(PLUGIN_ID);
     await mount(PLUGIN_ID, [CLIENT_CAP, ENGINE_CAP, RULES_CAP], PLUGIN_ENTRY, {
       downloadRoots: [downloadRoot],
+      engineMode: "memory",
       maxConcurrent: 50,
     });
     const list = (await cap(RULES_CAP).invoke("list-rules")) as { rules: Array<{ id: string }> };

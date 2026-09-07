@@ -73,7 +73,11 @@ function mountManifest(id: string, caps: string[], command: string) {
     version: "0.1.0",
     protocolVersion: 1,
     provides: caps,
-    requires: ["dev.tantalar.capability.event.emit", "dev.tantalar.capability.log"],
+    requires: [
+      "dev.tantalar.capability.event.emit",
+      "dev.tantalar.capability.log",
+      ...(id === TORRENT_ID ? ["dev.tantalar.capability.vpn-binding"] : []),
+    ],
     subscriptions: [],
     entry: { command },
   };
@@ -119,6 +123,11 @@ beforeAll(async () => {
   container = new ServiceContainer();
   container.register({ pluginId: "core", capability: "dev.tantalar.capability.event.emit", invoke: async () => ({ ok: true }) });
   container.register({ pluginId: "core", capability: "dev.tantalar.capability.log", invoke: async () => ({ ok: true }) });
+  container.register({
+    pluginId: "core",
+    capability: "dev.tantalar.capability.vpn-binding",
+    invoke: async () => ({ allowDispatch: true, health: "healthy", profileId: "test-loopback" }),
+  });
   supervisor = new Supervisor({
     bus,
     container,
@@ -144,10 +153,11 @@ beforeAll(async () => {
     importRoots: [libraryRoot],
     sourceRoots: [downloadRoot],
   });
-  await mount(METADATA_ID, METADATA_CAP, `node ${resolve("plugins/metadata-tmdb-tvdb/dist/plugin.js")}`);
+  await mount(METADATA_ID, METADATA_CAP, `node ${resolve("plugins/metadata-tmdb-tvdb/dist/plugin.js")}`, { fixtureMode: true });
   // One plugin, both capabilities (mirrors the real manifest).
   await mount(TORRENT_ID, [CLIENT_CAP, "dev.tantalar.capability.torrent.engine"], `node ${resolve("plugins/torrent-native/dist/plugin.js")}`, {
     downloadRoots: [downloadRoot],
+    engineMode: "memory",
     maxConcurrent: 4,
   });
   await mount(SERVING_ID, SERVING_CAP, `node ${resolve("plugins/serving/dist/plugin.js")}`, {
@@ -167,33 +177,63 @@ afterAll(async () => {
 
 describe("TAN-017: discovery and add flows", () => {
   it("discovers a movie via the metadata provider and adds it monitored (duplicate shown before save)", async () => {
-    const hit = (await capOf(METADATA_CAP)("lookup", { kind: "movie", name: "Fixture Movie", year: 2024 })) as {
-      found: boolean;
-      metadata: { externalId: string };
+    const discovery = (await capOf(METADATA_CAP)("search", { kind: "movie", query: "Fixture" })) as {
+      candidates: Array<{ externalId: string; provider: string; name: string; overview: string; year: number; artworkUrl?: string }>;
     };
-    expect(hit.found).toBe(true);
+    const hit = discovery.candidates[0]!;
+    expect(hit.name).toBe("Fixture Movie");
 
     const added = (await capOf(MOVIES_CAP)("add-movie", {
-      title: "Fixture Movie",
-      year: 2024,
+      title: hit.name,
+      year: hit.year,
       monitored: true,
+      externalId: hit.externalId,
+      provider: hit.provider,
+      overview: hit.overview,
+      artworkUrl: hit.artworkUrl,
     })) as { movieId: string; created: boolean };
     expect(added.created).toBe(true);
     // Duplicate add reports existing rather than creating twice.
-    const dup = (await capOf(MOVIES_CAP)("add-movie", { title: "Fixture Movie", year: 2024 })) as { created: boolean };
+    const dup = (await capOf(MOVIES_CAP)("add-movie", { title: hit.name, year: hit.year, externalId: hit.externalId, provider: hit.provider })) as { created: boolean };
     expect(dup.created).toBe(false);
+    const managed = (await capOf(MOVIES_CAP)("list-movies", {})) as { movies: Array<{ externalId: string; acquisitionState: string }> };
+    expect(managed.movies).toEqual([expect.objectContaining({ externalId: hit.externalId, acquisitionState: "wanted" })]);
   });
 
   it("adds a series with explicit season monitoring granularity", async () => {
+    const discovery = (await capOf(METADATA_CAP)("search", { kind: "series", query: "Fixture" })) as {
+      candidates: Array<{ externalId: string; provider: string; name: string; overview: string; year: number }>;
+    };
+    const hit = discovery.candidates[0]!;
+    const details = (await capOf(METADATA_CAP)("details", { kind: "series", externalId: hit.externalId, name: hit.name })) as {
+      episodes: Array<{ season: number; episode: number; airDate?: string }>;
+    };
     const added = (await capOf(SERIES_CAP)("add-series", {
-      name: "Fixture Show",
-      seasons: 2,
-      episodesPerSeason: 3,
-      monitored: true,
+      name: hit.name,
+      // Keep the future-monitoring test independent of the fixture's calendar dates.
+      episodes: details.episodes.map((episode, index) => ({
+        ...episode, airDate: new Date(Date.now() + (index + 1) * 86_400_000).toISOString().slice(0, 10),
+      })),
+      monitorMode: "future",
+      externalId: hit.externalId,
+      provider: hit.provider,
+      overview: hit.overview,
+      year: hit.year,
     })) as { seriesId: string; created: boolean };
     expect(added.created).toBe(true);
     const got = (await capOf(SERIES_CAP)("get-series", { seriesId: added.seriesId })) as { episodeCount: number };
-    expect(got.episodeCount).toBe(6); // 2 seasons × 3 episodes, each individually monitorable
+    expect(got.episodeCount).toBe(2);
+    const managed = (await capOf(SERIES_CAP)("list-series", {})) as { series: Array<{ externalId: string; episodeCount: number }> };
+    expect(managed.series).toEqual([expect.objectContaining({ externalId: hit.externalId, episodeCount: 2 })]);
+    await capOf(SERIES_CAP)("set-monitor-mode", { seriesId: added.seriesId, monitorMode: "none" });
+    expect((await capOf(SERIES_CAP)("wanted", {}) as { wanted: unknown[] }).wanted).toHaveLength(0);
+    await capOf(SERIES_CAP)("set-monitor-mode", { seriesId: added.seriesId, monitorMode: "future" });
+    const wanted = (await capOf(SERIES_CAP)("wanted", {})) as { wanted: Array<{ episodeKey: string }> };
+    const first = wanted.wanted[0]!;
+    await capOf(SERIES_CAP)("mark-acquired", { seriesId: added.seriesId, episodeKey: first.episodeKey });
+    expect((await capOf(SERIES_CAP)("wanted", {}) as { wanted: Array<{ episodeKey: string }> }).wanted.some((episode) => episode.episodeKey === first.episodeKey)).toBe(false);
+    await capOf(SERIES_CAP)("update-series", { seriesId: added.seriesId, name: "Manual Fixture Show", manualFields: ["title"] });
+    expect(await capOf(SERIES_CAP)("get-series", { seriesId: added.seriesId })).toEqual(expect.objectContaining({ name: "Manual Fixture Show", manualFields: ["title"] }));
   });
 
   it("surfaces wanted items for monitoring scans (movie + episodes)", async () => {
@@ -250,7 +290,7 @@ describe("TAN-019 tracer bullet: one movie through the complete product path", (
     expect(result.verdict.rejected.map((r) => r.reason)).toContain("seeders_below_minimum");
 
     // 5. embedded download to completion (no external client)
-    const { downloadId } = await driveToCompletion("https://indexer.invalid/g/m-best");
+    const { downloadId } = await driveToCompletion("movie:tracer-movie");
 
     // 6. verify pieces by hashing
     const v = (await capOf(ENGINE_CAP)("verify", { downloadId })) as { verifiedPieces: number; totalPieces: number; corruptedFiles: string[] };
@@ -272,6 +312,14 @@ describe("TAN-019 tracer bullet: one movie through the complete product path", (
     })) as { destinationPath: string; method: string };
     expect(existsSync(imported.destinationPath)).toBe(true);
     expect(imported.destinationPath).toContain("Tracer Movie (2024)");
+
+    // Restart recovery stays on the same operation trace.
+    await supervisor.unmount(TORRENT_ID);
+    await mount(TORRENT_ID, [CLIENT_CAP, ENGINE_CAP], `node ${resolve("plugins/torrent-native/dist/plugin.js")}`, {
+      downloadRoots: [downloadRoot],
+      engineMode: "memory",
+      maxConcurrent: 4,
+    });
 
     // 8. metadata enrichment: the fixture catalog has no "Tracer Movie", so
     // the truthful answer is found:false (outage-safe, no fabricated data).
@@ -305,8 +353,23 @@ describe("TAN-019 tracer bullet: one movie through the complete product path", (
     const types = events.map((e) => e.type);
     expect(types).toContain(EventTypes.ComparisonVerdict);
     expect(types).toContain(EventTypes.GrabDecision);
+    expect(types).toContain(EventTypes.DispatchGateChecked);
     expect(types).toContain(EventTypes.ClientDispatch);
+    expect(types).toContain(EventTypes.DownloadCompleted);
     expect(types).toContain(EventTypes.ImportStarted);
+    expect(types).toContain(EventTypes.ImportCompleted);
+    expect(events.some((event) => event.type === EventTypes.DownloadProgress && "verification" in event.payload)).toBe(true);
+    expect(events.some((event) => event.type === EventTypes.DownloadProgress && event.payload.recovered === true)).toBe(true);
+    const comparisonPayload = events.find((event) => event.type === EventTypes.ComparisonVerdict)?.payload;
+    expect(comparisonPayload).toMatchObject({
+      candidates: expect.arrayContaining([
+        expect.objectContaining({ guid: expect.stringMatching(/^[a-f0-9]{64}$/), quality: "1080p" }),
+      ]),
+    });
+    expect(JSON.stringify(comparisonPayload)).not.toContain("https://indexer.invalid/g/");
+    expect(events.find((event) => event.type === EventTypes.ClientDispatch)?.payload).toMatchObject({
+      clientId: TORRENT_ID,
+    });
   });
 
   it("serves the imported movie: register → browse → negotiate → stream bytes", async () => {
@@ -381,7 +444,7 @@ describe("TAN-019 tracer bullet: one episode through the complete product path",
     const result = await pipeline.decide({ itemKey: `${series.seriesId}:S01E01`, candidates, profile, mode: "automatic", correlationId: corr });
     expect(result.grabbed).toBe(true);
 
-    const { downloadId } = await driveToCompletion("https://indexer.invalid/g/e1");
+    const { downloadId } = await driveToCompletion(`${series.seriesId}:S01E01`);
     const v = (await capOf(ENGINE_CAP)("verify", { downloadId })) as { corruptedFiles: string[]; verifiedPieces: number; totalPieces: number };
     expect(v.corruptedFiles).toEqual([]);
     expect(v.verifiedPieces).toBe(v.totalPieces);

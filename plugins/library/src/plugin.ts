@@ -17,6 +17,7 @@
  *    idempotent on (itemKey + source hash).
  */
 import { runPlugin, definePlugin, type PluginContext, type PluginDefinition } from "@tantalar/plugin-sdk";
+import { preserveReplacedFile, recycleEntries, cleanupRecycleBin } from "./recycle-bin.js";
 import {
   PROTOCOL_VERSION,
   validateManifest,
@@ -24,6 +25,8 @@ import {
   ImportError,
   validateRenameTemplate,
   type ImportMethod,
+  type ImportMode,
+  type ImportPlan,
 } from "@tantalar/contracts";
 
 import {
@@ -31,7 +34,7 @@ import {
   lstatSync,
   statSync,
   mkdirSync,
-  copyFileSync,
+  createReadStream,
   linkSync,
   renameSync,
   unlinkSync,
@@ -40,8 +43,9 @@ import {
   truncateSync,
   writeFileSync,
 } from "node:fs";
+import { copyFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { join, dirname, resolve as pathResolve, basename, extname, sep } from "node:path";
+import { join, dirname, resolve as pathResolve, basename, extname, relative, sep } from "node:path";
 
 const IMPORTER_CAPABILITY = "dev.tantalar.capability.importer";
 const PLUGIN_ID = "dev.tantalar.plugin.library";
@@ -74,7 +78,7 @@ function defaultSchemes(): Map<string, CompiledScheme> {
   return out;
 }
 
-const PLACEHOLDER_RE = /\{(series|season|episode|title|year|quality|seasonPad2|episodePad2|codec|language|edition)\}/g;
+const PLACEHOLDER_RE = /\{(series|season|episode|title|year|quality|seasonPad2|episodePad2|codec|language|group|edition)\}/g;
 
 function renderTemplate(
   template: string,
@@ -124,6 +128,8 @@ const schemes = defaultSchemes();
 const libraryItems = new Map<string, LibraryFileRecord[]>();
 /** Idempotency ledger: `${itemKey}:${sourceHash}` -> result. */
 const importLedger = new Map<string, ImportOutcome>();
+// Keep staging names and the idempotency ledger serial while file I/O yields to health pings.
+let importWork = Promise.resolve();
 const calendarEntries = new Map<string, CalendarEntry>();
 
 /** Wave 3 (TAN-013): durable storage bridge; null when storage is unavailable. */
@@ -206,12 +212,23 @@ interface ImportOutcome {
   readonly itemKey: string;
   readonly destinationPath: string;
   readonly method: ImportMethod;
+  readonly sourceHash: string;
   readonly upgraded: boolean;
   readonly replacedPath?: string;
 }
 
-function sha256File(path: string): string {
-  return createHash("sha256").update(readFileSync(path)).digest("hex");
+interface PlannedImport {
+  readonly review: ImportPlan;
+  readonly root: string;
+  readonly existing?: LibraryFileRecord;
+  readonly deduplicatedOutcome?: ImportOutcome;
+  readonly persistDeduplication: boolean;
+}
+
+async function sha256File(path: string): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return hash.digest("hex");
 }
 
 /** True when `child` resolves inside `root` (both already realpaths). */
@@ -246,17 +263,15 @@ function rejectSymlink(p: string): void {
 
 function ensureRoots(config: Record<string, unknown>): void {
   const cfg = config as { importRoots?: unknown; sourceRoots?: unknown };
+  const imports = Array.isArray(cfg.importRoots) ? cfg.importRoots.filter((r): r is string => typeof r === "string" && r.length > 0).map(r => realpathSync(r)) : [...importRoots];
+  const sources = Array.isArray(cfg.sourceRoots) ? cfg.sourceRoots.filter((r): r is string => typeof r === "string" && r.length > 0).map(r => realpathSync(r)) : [...sourceRoots];
   if (Array.isArray(cfg.importRoots)) {
     importRoots.length = 0;
-    for (const r of cfg.importRoots) {
-      if (typeof r === "string" && r.length > 0) importRoots.push(realpathSync(r));
-    }
+    importRoots.push(...imports);
   }
   if (Array.isArray(cfg.sourceRoots)) {
     sourceRoots.length = 0;
-    for (const r of cfg.sourceRoots) {
-      if (typeof r === "string" && r.length > 0) sourceRoots.push(realpathSync(r));
-    }
+    sourceRoots.push(...sources);
   }
 }
 
@@ -276,13 +291,136 @@ function renderFor(req: Record<string, unknown>, scheme: CompiledScheme): string
     quality: String(req.quality ?? "unknown"),
     codec: String(req.codec ?? ""),
     language: String(req.language ?? ""),
+    group: String(req.releaseGroup ?? ""),
     edition: String(req.edition ?? ""),
   };
   return renderTemplate(template, values);
 }
 
+function normalizeImportMode(value: unknown): ImportMode {
+  if (value === undefined || value === "automatic") return "automatic";
+  if (value === "copy") return "copy";
+  throw new ImportError("invalid_mode", "mode must be automatic or copy");
+}
+
+/** Resolve the existing path prefix without creating the destination tree. */
+function plannedDestinationPath(root: string, candidate: string): string {
+  const absolute = pathResolve(candidate);
+  if (!isInside(root, absolute)) {
+    throw new ImportError("path_escape", "destination escapes the library root");
+  }
+  let existingParent = dirname(absolute);
+  while (!existsSync(existingParent)) {
+    const parent = dirname(existingParent);
+    if (parent === existingParent) throw new ImportError("outside_root", "destination parent cannot be resolved");
+    existingParent = parent;
+  }
+  const resolvedParent = realpathSync(existingParent);
+  if (!isInside(root, resolvedParent)) {
+    throw new ImportError("path_escape", "resolved destination escapes the library root");
+  }
+  const destination = join(resolvedParent, relative(existingParent, absolute));
+  if (!isInside(root, destination)) {
+    throw new ImportError("path_escape", "resolved destination escapes the library root");
+  }
+  return destination;
+}
+
+async function planImport(payload: Record<string, unknown>): Promise<PlannedImport> {
+  if (importRoots.length === 0) throw new ImportError("outside_root", "no import roots configured");
+  const sourceInput = String(payload.sourcePath ?? "");
+  if (!sourceInput) throw new ImportError("io_error", "sourcePath required");
+  const itemKey = String(payload.itemKey ?? "");
+  if (!itemKey) throw new ImportError("io_error", "itemKey required");
+  const quality = String(payload.quality ?? "unknown");
+  const title = String(payload.title ?? "");
+  if (!title) throw new ImportError("io_error", "title required");
+  const mode = normalizeImportMode(payload.mode);
+
+  const sourcePath = assertInsideRoot(sourceInput, [...importRoots, ...sourceRoots], "source");
+  rejectSymlink(sourcePath);
+  const sourceStat = statSync(sourcePath);
+  if (!sourceStat.isFile()) throw new ImportError("io_error", "source must be a regular file");
+  const sourceHash = await sha256File(sourcePath);
+
+  const scheme = String(payload.scheme ?? "default");
+  const compiledScheme = schemes.get(scheme);
+  if (!compiledScheme) throw new ImportError("invalid_template", `unknown scheme ${scheme}`);
+  const requestedRoot = typeof payload.destinationRoot === "string" ? realpathSync(payload.destinationRoot) : importRoots[0]!;
+  if (!importRoots.includes(requestedRoot)) {
+    throw new ImportError("outside_root", "destinationRoot is not a configured import root");
+  }
+  const renderedPath = join(requestedRoot, renderFor(payload, compiledScheme)) + extname(sourcePath);
+  const prior = importLedger.get(`${itemKey}:${sourceHash}`);
+  const destinationPath = plannedDestinationPath(requestedRoot, prior?.destinationPath ?? renderedPath);
+  let destinationHash: string | null = null;
+  if (existsSync(destinationPath)) {
+    rejectSymlink(destinationPath);
+    if (!statSync(destinationPath).isFile()) throw new ImportError("collision", "destination is not a regular file");
+    destinationHash = await sha256File(destinationPath);
+  }
+
+  const existing = libraryItems.get(itemKey)?.at(-1);
+  const deduplicatedOutcome = prior ?? (destinationHash === sourceHash
+    ? {
+        itemKey,
+        destinationPath,
+        method: existing?.method ?? "copy",
+        sourceHash,
+        upgraded: false,
+      }
+    : undefined);
+  if (existing && !deduplicatedOutcome && !payload.force) {
+    const rank = ["480p", "720p", "1080p", "2160p"];
+    const currentIndex = rank.indexOf(existing.quality);
+    const nextIndex = rank.indexOf(quality);
+    if (currentIndex >= 0 && nextIndex >= 0 && nextIndex <= currentIndex) {
+      throw new ImportError("collision", `existing ${existing.quality} is not worse than ${quality}`);
+    }
+  }
+
+  const kind = payload.kind === "movie" ? "movie" : "series";
+  const action: ImportPlan["action"] = deduplicatedOutcome ? "deduplicate" : existing ? "upgrade" : "import";
+  const publicPlan: Omit<ImportPlan, "fingerprint"> = {
+    itemKey,
+    sourcePath,
+    destinationPath,
+    sourceHash,
+    quality,
+    title,
+    kind,
+    ...(typeof payload.series === "string" ? { series: payload.series } : {}),
+    ...(typeof payload.season === "number" && Number.isFinite(payload.season) ? { season: Math.trunc(payload.season) } : {}),
+    ...(typeof payload.episode === "number" && Number.isFinite(payload.episode) ? { episode: Math.trunc(payload.episode) } : {}),
+    ...(typeof payload.year === "number" && Number.isFinite(payload.year) ? { year: Math.trunc(payload.year) } : {}),
+    scheme,
+    ...(typeof payload.codec === "string" ? { codec: payload.codec } : {}),
+    ...(typeof payload.language === "string" ? { language: payload.language } : {}),
+    ...(typeof payload.releaseGroup === "string" ? { releaseGroup: payload.releaseGroup } : {}),
+    ...(typeof payload.edition === "string" ? { edition: payload.edition } : {}),
+    mode,
+    action,
+  };
+  const fingerprint = createHash("sha256").update(JSON.stringify({
+    plan: publicPlan,
+    destinationHash,
+    existing: existing ? {
+      destinationPath: existing.destinationPath,
+      quality: existing.quality,
+      sourceHash: existing.sourceHash,
+    } : null,
+  })).digest("hex");
+  return {
+    review: { ...publicPlan, fingerprint },
+    root: requestedRoot,
+    ...(existing ? { existing } : {}),
+    ...(deduplicatedOutcome ? { deduplicatedOutcome } : {}),
+    persistDeduplication: Boolean(deduplicatedOutcome && !prior),
+  };
+}
+
 /** Atomic placement: write to temp name in dest dir, then fsync-rename in. */
-function placeAtomically(src: string, dest: string, preferHardlink: boolean): ImportMethod {
+async function placeAtomically(src: string, dest: string, preferHardlink: boolean): Promise<ImportMethod> {
   mkdirSync(dirname(dest), { recursive: true });
   const tmp = join(dirname(dest), `.tantalar-${basename(dest)}.tmp-${process.pid}`);
   try {
@@ -300,7 +438,7 @@ function placeAtomically(src: string, dest: string, preferHardlink: boolean): Im
       method = "copy";
     }
   }
-  if (method === "copy") copyFileSync(src, tmp);
+  if (method === "copy") await copyFile(src, tmp);
   // Partial-copy guard: byte length must match before the rename lands.
   if (statSync(tmp).size !== statSync(src).size)
     throw new ImportError("io_error", "partial copy detected (size mismatch)");
@@ -309,26 +447,24 @@ function placeAtomically(src: string, dest: string, preferHardlink: boolean): Im
 }
 
 async function doImport(payload: Record<string, unknown>): Promise<ImportOutcome & { deduplicated: boolean }> {
-  if (importRoots.length === 0)
-    throw new ImportError("outside_root", "no import roots configured");
-  const src = String(payload.sourcePath ?? "");
-  if (!src) throw new ImportError("io_error", "sourcePath required");
-  const itemKey = String(payload.itemKey ?? "");
-  if (!itemKey) throw new ImportError("io_error", "itemKey required");
-  const quality = String(payload.quality ?? "unknown");
-  const title = String(payload.title ?? "");
-  if (!title) throw new ImportError("io_error", "title required");
+  const planned = await planImport(payload);
+  const { review, root, existing, deduplicatedOutcome, persistDeduplication } = planned;
+  const suppliedFingerprint = payload.reviewFingerprint;
+  if (suppliedFingerprint !== undefined && suppliedFingerprint !== review.fingerprint) {
+    throw new ImportError("review_stale", "import review changed; review again");
+  }
 
-  // Source must be inside a configured source/import root and not a symlink.
-  assertInsideRoot(src, [...importRoots, ...sourceRoots], "source");
-  rejectSymlink(src);
-  const st = statSync(src);
-  if (!st.isFile()) throw new ImportError("io_error", "source must be a regular file");
-
-  const hash = sha256File(src);
+  const { itemKey, sourcePath: src, destinationPath: dest, sourceHash: hash, quality, mode } = review;
   const ledgerKey = `${itemKey}:${hash}`;
-  const prior = importLedger.get(ledgerKey);
-  if (prior) return { ...prior, deduplicated: true };
+  if (deduplicatedOutcome) {
+    if (persistDeduplication) {
+      importLedger.set(ledgerKey, deduplicatedOutcome);
+      await persist();
+    }
+    return { ...deduplicatedOutcome, sourceHash: deduplicatedOutcome.sourceHash ?? hash, deduplicated: true };
+  }
+
+  const st = statSync(src);
 
   await emitFn?.(
     EventTypes.ImportStarted,
@@ -336,51 +472,11 @@ async function doImport(payload: Record<string, unknown>): Promise<ImportOutcome
     typeof payload.correlationId === "string" ? { correlationId: payload.correlationId } : undefined,
   );
 
-  const schemeName = String(payload.scheme ?? "default");
-  const scheme = schemes.get(schemeName);
-  if (!scheme) throw new ImportError("invalid_template", `unknown scheme ${schemeName}`);
-  const rel = renderFor({ ...payload }, scheme);
-  const root = importRoots[0]!;
-  const ext = extname(src);
-  const destBase = join(root, rel) + ext;
-
   // Create the destination directory tree first, then verify containment
   // against real paths so a symlinked segment cannot escape.
-  mkdirSync(dirname(destBase), { recursive: true });
-  const destDirReal = realpathSync(dirname(destBase));
-  assertInsideRoot(join(destDirReal, basename(destBase)), importRoots, "destination");
-  const dest = join(destDirReal, basename(destBase));
-  if (!isInside(importRoots[0]!, dest))
-    throw new ImportError("path_escape", "resolved destination escapes the library root");
-
-  const existing = libraryItems.get(itemKey)?.at(-1);
-
-  // Same-destination collision handling:
-  //  - identical content hash at destination → idempotent no-op;
-  //  - different content → treated as an upgrade slot (replace below).
-  if (existsSync(dest)) {
-    if (sha256File(dest) === hash) {
-      const outcome: ImportOutcome = {
-        itemKey,
-        destinationPath: dest,
-        method: existing?.method ?? "copy",
-        upgraded: false,
-      };
-      importLedger.set(ledgerKey, outcome);
-      await persist();
-      return { ...outcome, deduplicated: true };
-    }
-  }
-
-  // Quality gate: never downgrade over an existing better-quality file
-  // unless the caller explicitly forces replacement.
-  const RANK = ["480p", "720p", "1080p", "2160p"];
-  if (existing && !payload.force) {
-    const curIdx = RANK.indexOf(existing.quality);
-    const newIdx = RANK.indexOf(quality);
-    if (curIdx >= 0 && newIdx >= 0 && newIdx <= curIdx) {
-      throw new ImportError("collision", `existing ${existing.quality} is not worse than ${quality}`);
-    }
+  mkdirSync(dirname(dest), { recursive: true });
+  if (plannedDestinationPath(root, dest) !== dest) {
+    throw new ImportError("path_escape", "resolved destination changed after review");
   }
 
   // Upgrade safety: place the NEW file first under a temp sibling, verify
@@ -396,22 +492,28 @@ async function doImport(payload: Record<string, unknown>): Promise<ImportOutcome
   try {
     if (existing) {
       // Stage via hardlink-or-copy to a staging name first.
-      try {
-        linkSync(src, staging);
-        method = "hardlink";
-      } catch {
-        copyFileSync(src, staging);
+      if (mode === "copy") {
+        await copyFile(src, staging);
         method = "copy";
+      } else {
+        try {
+          linkSync(src, staging);
+          method = "hardlink";
+        } catch {
+          await copyFile(src, staging);
+          method = "copy";
+        }
       }
       injectFault("short-copy");
       injectFault("corrupt-copy");
       if (statSync(staging).size !== st.size)
         throw new ImportError("io_error", "partial staged copy (size mismatch)");
       // Verify staged bytes match source before touching the old file.
-      if (sha256File(staging) !== hash)
+      if (await sha256File(staging) !== hash)
         throw new ImportError("io_error", "staged copy verification failed");
       const replacedPath = existing.destinationPath;
       injectFault("swap-fail");
+      preserveReplacedFile(root, replacedPath);
       renameSync(staging, dest); // atomic swap-in of verified new bytes
       // Only now remove superseded copies that are NOT this destination.
       if (replacedPath !== dest) {
@@ -422,7 +524,7 @@ async function doImport(payload: Record<string, unknown>): Promise<ImportOutcome
         }
       }
     } else {
-      method = placeAtomically(src, dest, true);
+      method = await placeAtomically(src, dest, mode === "automatic");
     }
 
     const rec: LibraryFileRecord = {
@@ -441,6 +543,7 @@ async function doImport(payload: Record<string, unknown>): Promise<ImportOutcome
       itemKey,
       destinationPath: dest,
       method,
+      sourceHash: hash,
       upgraded: Boolean(existing),
       ...(existing ? { replacedPath: existing.destinationPath } : {}),
     };
@@ -495,6 +598,9 @@ const plugin: PluginDefinition = definePlugin({
   handlers: {
     [IMPORTER_CAPABILITY]: async (operation, payload) => {
       switch (operation) {
+        case "configure-roots":
+          ensureRoots(payload);
+          return { configured: true };
         case "set-scheme": {
           const name = String(payload.name ?? "");
           if (!name) throw new ImportError("invalid_template", "scheme name required");
@@ -522,7 +628,8 @@ const plugin: PluginDefinition = definePlugin({
           );
           const rel = renderFor({ ...payload, kind }, { name: schemeName, episodeTemplate, movieTemplate });
           const ext = typeof payload.ext === "string" && payload.ext ? payload.ext : ".mkv";
-          const root = importRoots[0] ?? "(no import root configured)";
+          const root = typeof payload.destinationRoot === "string" ? realpathSync(payload.destinationRoot) : importRoots[0] ?? "(no import root configured)";
+          if (payload.destinationRoot && !importRoots.includes(root)) throw new Error("Unknown library root.");
           return { path: `${root}/${rel}${ext}`, scheme: schemeName, kind };
         }
         case "rename-plan": {
@@ -551,8 +658,70 @@ const plugin: PluginDefinition = definePlugin({
           plan.sort((a, b) => a.itemKey.localeCompare(b.itemKey));
           return { scheme: schemeName, total: plan.length, changed: plan.filter((p) => p.changes).length, plan };
         }
-        case "import":
-          return doImport(payload);
+        case "recycle-preview": {
+          const roots = payload.root ? importRoots.filter(root => root === payload.root) : importRoots;
+          if (payload.root && roots.length !== 1) throw new Error("Unknown library root.");
+          return { entries: recycleEntries(roots, Number(payload.days ?? 7)).map(({ directory: _directory, ...entry }) => entry) };
+        }
+        case "register-existing": {
+          const itemKey = String(payload.itemKey ?? "");
+          if (!itemKey) throw new Error("Missing media identity.");
+          if (libraryItems.has(itemKey)) return { registered: false };
+          const path = assertInsideRoot(String(payload.path), importRoots, "existing file");
+          rejectSymlink(path);
+          if (!statSync(path).isFile()) throw new Error("Existing media is not a file.");
+          const record: LibraryFileRecord = { itemKey, destinationPath: path, quality: String(payload.quality ?? "unknown"), method: "copy", sourceHash: await sha256File(path), importedAt: new Date().toISOString() };
+          libraryItems.set(itemKey, [record]);
+          await persist();
+          return { registered: true };
+        }
+        case "rename-file": {
+          const work = importWork.then(async () => {
+            const root = realpathSync(String(payload.root));
+            if (!importRoots.includes(root)) throw new Error("Unknown library root.");
+            const source = assertInsideRoot(String(payload.source), [root], "rename source");
+            const destination = plannedDestinationPath(root, String(payload.destination));
+            if (relative(root, destination).split(sep).includes(".tantalar-recycle")) throw new Error("Cannot rename media into the recycle bin.");
+            const path = existsSync(source) ? source : destination;
+            rejectSymlink(path);
+            const info = statSync(path);
+            const fingerprint = `${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}`;
+            if (!info.isFile() || fingerprint !== payload.fingerprint) throw new Error("File changed since preview. Create a new rename preview.");
+            if (source !== destination && existsSync(source)) {
+              mkdirSync(dirname(destination), { recursive: true });
+              if (plannedDestinationPath(root, destination) !== destination) throw new Error("Rename destination changed.");
+              // link is atomic and refuses an occupied destination. Retry can recover between link and unlink.
+              if (existsSync(destination)) {
+                rejectSymlink(destination);
+                const target = statSync(destination);
+                if (target.dev !== info.dev || target.ino !== info.ino) throw new Error("Rename destination already exists.");
+              } else linkSync(source, destination);
+              unlinkSync(source);
+            }
+            for (const records of libraryItems.values()) for (let i = 0; i < records.length; i++) if (records[i]!.destinationPath === source) records[i] = { ...records[i]!, destinationPath: destination };
+            for (const [key, outcome] of importLedger) if (outcome.destinationPath === source) importLedger.set(key, { ...outcome, destinationPath: destination });
+            await persist();
+            return { destination };
+          });
+          importWork = work.then(() => undefined, () => undefined);
+          return work;
+        }
+        case "recycle-cleanup": {
+          const work = importWork.then(() => {
+            const roots = payload.root ? importRoots.filter(root => root === payload.root) : importRoots;
+            if (payload.root && roots.length !== 1) throw new Error("Unknown library root.");
+            return cleanupRecycleBin(roots, Number(payload.days ?? 7), Array.isArray(payload.entries) ? payload.entries : undefined);
+          });
+          importWork = work.then(() => undefined, () => undefined);
+          return work;
+        }
+        case "review-import":
+          return (await planImport(payload)).review;
+        case "import": {
+          const work = importWork.then(() => doImport(payload));
+          importWork = work.then(() => undefined, () => undefined);
+          return work;
+        }
         case "library": {
           const out: Array<{ itemKey: string; path: string; quality: string; method: string; importedAt: string }> = [];
           for (const [key, records] of libraryItems) {

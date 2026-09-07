@@ -8,12 +8,12 @@
  * monitored media, and correlated event-chain reconstruction.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { mkdtempSync, existsSync, readFileSync, statSync, chmodSync } from "node:fs";
+import { mkdtempSync, existsSync, readFileSync, realpathSync, statSync, chmodSync, truncateSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Kysely } from "kysely";
-import { migrate, openDatabase, type Db } from "@tantalar/db";
-import { EventTypes } from "@tantalar/contracts";
+import { migrate, openDatabase, PluginDocumentStore, type Db } from "@tantalar/db";
+import { EventTypes, type ImportPlan } from "@tantalar/contracts";
 import { EventBus } from "../apps/server/src/events.js";
 import { ServiceContainer } from "../apps/server/src/container.js";
 import { Scheduler } from "../apps/server/src/scheduler.js";
@@ -43,7 +43,7 @@ let dir: string;
 let importRoot: string;
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "tantalar-p4-"));
+  dir = realpathSync(mkdtempSync(join(tmpdir(), "tantalar-p4-")));
   importRoot = join(dir, "library");
   const { mkdirSync } = require("node:fs") as typeof import("node:fs");
   mkdirSync(importRoot, { recursive: true });
@@ -59,6 +59,7 @@ beforeAll(async () => {
     scheduler: new Scheduler(db, 100_000),
     restartPolicy: policy,
     healthIntervalMs: 500,
+    documents: new PluginDocumentStore(db),
     resolveEntry: (m) => {
       const [cmd, ...rest] = m.entry.command.split(" ");
       const configJson = (m as unknown as { __config?: Record<string, unknown> }).__config;
@@ -71,7 +72,7 @@ beforeAll(async () => {
   });
 
   await mount(LIBRARY_ID, LIBRARY_CAP, LIBRARY_ENTRY, { importRoots: [importRoot], sourceRoots: [dir] });
-  await mount(METADATA_ID, METADATA_CAP, METADATA_ENTRY, {});
+  await mount(METADATA_ID, METADATA_CAP, METADATA_ENTRY, { fixtureMode: true });
 });
 
 afterAll(async () => {
@@ -106,6 +107,7 @@ function metadata(): { invoke(op: string, p?: Record<string, unknown>): Promise<
 interface ImportOutcomeShape {
   destinationPath: string;
   method: "hardlink" | "copy";
+  sourceHash: string;
   upgraded: boolean;
   replacedPath?: string;
   deduplicated?: boolean;
@@ -114,11 +116,23 @@ interface ImportOutcomeShape {
 // ---- Rename schemes -----------------------------------------------------------
 
 describe("rename schemes (story 10)", () => {
+  it("imports a video larger than Node's whole-file buffer limit", async () => {
+    const source = join(dir, "large.mkv");
+    mkdirWrite(dir, "large.mkv", "large video fixture");
+    truncateSync(source, 2 ** 31 + 1);
+    try {
+      const out = await importer().invoke("import", { itemKey: "movie-large", sourcePath: source, destinationRoot: importRoot, quality: "2160p", title: "Large video", year: 2026, kind: "movie" }) as ImportOutcomeShape;
+      expect(statSync(out.destinationPath).size).toBe(2 ** 31 + 1);
+      expect(out.sourceHash).toMatch(/^[a-f0-9]{64}$/);
+      unlinkSync(out.destinationPath);
+    } finally { unlinkSync(source); }
+  }, 30_000);
   it("renders the default episode template into nested library paths", async () => {
     mkdirWrite(join(dir, "dl-a"), "file.mkv", "episode one bytes\n");
     const out = (await importer().invoke("import", {
       itemKey: "series-fixture-show:S01E01",
       sourcePath: join(dir, "dl-a", "file.mkv"),
+      destinationRoot: importRoot,
       quality: "1080p",
       title: "Pilot",
       kind: "series",
@@ -128,6 +142,7 @@ describe("rename schemes (story 10)", () => {
       correlationId: "corr-import-1",
     })) as ImportOutcomeShape;
     expect(out.destinationPath).toBe(join(importRoot, "Fixture Show/Season 01/Fixture Show S01E01 1080p.mkv"));
+    expect(out.sourceHash).toMatch(/^[a-f0-9]{64}$/);
   });
 
   it("accepts a custom scheme and renders it; rejects traversal templates", async () => {
@@ -155,6 +170,85 @@ describe("rename schemes (story 10)", () => {
     await expect(
       importer().invoke("set-scheme", { name: "bad-ph", episodeTemplate: "{nope}", movieTemplate: "{title}" }),
     ).rejects.toThrow(/unknown placeholder/);
+  });
+});
+
+describe("import review", () => {
+  it("plans without mutation, rejects a stale review, and honours copy mode", async () => {
+    await importer().invoke("set-scheme", {
+      name: "review-facts",
+      episodeTemplate: "{series}/S{seasonPad2}E{episodePad2} {quality} {codec} {language} {group} {edition}",
+      movieTemplate: "{title} {quality} {codec} {language} {group} {edition}",
+    });
+    const sourceDir = join(dir, "dl-review");
+    const sourcePath = join(sourceDir, "review.mkv");
+    mkdirWrite(sourceDir, "review.mkv", "reviewed copy bytes\n");
+    const request = {
+      itemKey: "series-review-show:S02E03",
+      sourcePath,
+      destinationRoot: importRoot,
+      quality: "1080p",
+      title: "Third",
+      kind: "series",
+      series: "Review Show",
+      season: 2,
+      episode: 3,
+      scheme: "review-facts",
+      codec: "hevc",
+      language: "en",
+      releaseGroup: "NTb",
+      edition: "Directors Cut",
+      mode: "copy",
+      correlationId: "corr-import-review",
+    } as const;
+
+    const first = (await importer().invoke("review-import", request)) as ImportPlan;
+    const second = (await importer().invoke("review-import", request)) as ImportPlan;
+    expect(second).toEqual(first);
+    expect(first).toMatchObject({
+      action: "import",
+      itemKey: request.itemKey,
+      sourcePath,
+      quality: "1080p",
+      codec: "hevc",
+      language: "en",
+      releaseGroup: "NTb",
+      edition: "Directors Cut",
+      mode: "copy",
+    });
+    expect(first.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(first.destinationPath).toBe(join(importRoot, "Review Show/S02E03 1080p hevc en NTb Directors Cut.mkv"));
+    expect(existsSync(first.destinationPath)).toBe(false);
+    expect(existsSync(join(importRoot, "Review Show"))).toBe(false);
+    expect((await importer().invoke("history", { itemKey: request.itemKey }) as { history: unknown[] }).history).toEqual([]);
+    expect(await bus.read({ correlationId: request.correlationId })).toEqual([]);
+
+    await expect(
+      importer().invoke("import", { ...request, reviewFingerprint: "0".repeat(64) }),
+    ).rejects.toThrow(/review.*changed|stale/i);
+    expect(existsSync(first.destinationPath)).toBe(false);
+    expect(await bus.read({ correlationId: request.correlationId })).toEqual([]);
+
+    const imported = (await importer().invoke("import", {
+      ...request,
+      reviewFingerprint: first.fingerprint,
+    })) as ImportOutcomeShape;
+    expect(imported.destinationPath).toBe(first.destinationPath);
+    expect(imported.method).toBe("copy");
+    expect(statSync(imported.destinationPath).ino).not.toBe(statSync(sourcePath).ino);
+
+    const upgradeDir = join(dir, "dl-review-upgrade");
+    const upgradeSourcePath = join(upgradeDir, "review-2160p.mkv");
+    mkdirWrite(upgradeDir, "review-2160p.mkv", "reviewed copy upgrade bytes\n");
+    const upgradeRequest = { ...request, sourcePath: upgradeSourcePath, quality: "2160p" } as const;
+    const upgradeReview = (await importer().invoke("review-import", upgradeRequest)) as ImportPlan;
+    expect(upgradeReview.action).toBe("upgrade");
+    const upgraded = (await importer().invoke("import", {
+      ...upgradeRequest,
+      reviewFingerprint: upgradeReview.fingerprint,
+    })) as ImportOutcomeShape;
+    expect(upgraded.method).toBe("copy");
+    expect(statSync(upgraded.destinationPath).ino).not.toBe(statSync(upgradeSourcePath).ino);
   });
 });
 
@@ -414,6 +508,15 @@ describe("partial-copy guard and permission failures (stories 11, 12)", () => {
 // ---- Metadata + calendar ----------------------------------------------------------
 
 describe("metadata provider + calendar (stories 9, 14)", () => {
+  it("caches series snapshots without suppressing episode topology for add or refresh", async () => {
+    const query = { kind: "series", externalId: "tvdb-121", name: "Fixture Show", metadataOnly: true };
+    const first = await metadata().invoke("details", query);
+    expect(first).toMatchObject({ found: true, episodes: [], metadata: { kind: "series", runtimeMinutes: 45, status: "Returning Series" } });
+    expect(await metadata().invoke("details", query)).toMatchObject({ found: true, source: "cache", episodes: [] });
+    const full = await metadata().invoke("details", { ...query, metadataOnly: false }) as { episodes: unknown[] };
+    expect(full.episodes.length).toBeGreaterThan(0);
+  });
+
   it("enriches a series and a movie from fixture TVDB/TMDB adapters", async () => {
     const show = (await metadata().invoke("lookup", {
       kind: "series",
@@ -432,6 +535,26 @@ describe("metadata provider + calendar (stories 9, 14)", () => {
     };
     expect(movie.metadata.externalId).toBe("tmdb-9001");
     expect(movie.metadata.year).toBe(2024);
+
+    const firstDetails = (await metadata().invoke("details", { kind: "movie", externalId: "tmdb-9001" })) as {
+      found: boolean;
+      metadata: { runtimeMinutes: number | null; certification: string | null; fetchedAt: string };
+      source: string;
+    };
+    const cachedDetails = (await metadata().invoke("details", { kind: "movie", externalId: "tmdb-9001" })) as typeof firstDetails;
+    expect(firstDetails).toEqual(expect.objectContaining({
+      found: true,
+      source: "fixture",
+      metadata: expect.objectContaining({ runtimeMinutes: 100, certification: "PG" }),
+    }));
+    const cacheRow = await db.selectFrom("plugin_documents")
+      .select("doc")
+      .where("pluginId", "=", METADATA_ID)
+      .where("docKey", "=", "metadata-cache")
+      .executeTakeFirstOrThrow();
+    const cache = JSON.parse(cacheRow.doc) as Record<string, unknown>;
+    expect(Object.keys(cache).filter((key) => key === "snapshot:tmdb-fixture:movie:tmdb-9001")).toHaveLength(1);
+    expect(cachedDetails).toEqual(expect.objectContaining({ source: "cache", metadata: firstDetails.metadata }));
 
     const miss = (await metadata().invoke("lookup", { kind: "movie", name: "Unknown Film" })) as { found: boolean };
     expect(miss.found).toBe(false);

@@ -1,0 +1,14 @@
+{
+  "name": "@tantalar/metadata-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "wrangler deploy --dry-run --outdir dist/worker",
+    "dev": "wrangler dev",
+    "typecheck": "wrangler types && tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "wrangler": "^4.127.1"
+  }
+}

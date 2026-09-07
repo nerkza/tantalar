@@ -83,6 +83,7 @@ export class PluginLifecycleManager {
       }
     }
 
+    const pending: Array<{ id: string; want: PluginSetEntry; manifest: PluginManifest }> = [];
     for (const [id, want] of Object.entries(desired)) {
       if (want.enabled === false || !want.manifestPath) continue;
       const already = this.#opts.supervisor.get(id);
@@ -92,6 +93,49 @@ export class PluginLifecycleManager {
         if (manifest.id !== id) {
           throw new PackageError(`manifest id ${manifest.id} does not match configured key ${id}`);
         }
+        pending.push({ id, want, manifest });
+      } catch (err) {
+        result.failed.push({ pluginId: id, error: (err as Error).message });
+      }
+    }
+
+    // Config object order is not a dependency order. Mount providers before
+    // consumers when both are part of this apply (for example VPN before the
+    // native download engines that require its binding capability).
+    const providers = new Map<string, Set<string>>();
+    for (const { id, manifest } of pending) {
+      for (const capability of manifest.provides) {
+        const ids = providers.get(capability) ?? new Set<string>();
+        ids.add(id);
+        providers.set(capability, ids);
+      }
+    }
+    const ordered: typeof pending = [];
+    const remaining = [...pending];
+    const ready = new Set(
+      this.#opts.supervisor.list()
+        .filter((runtime) => runtime.state === "healthy")
+        .flatMap((runtime) => runtime.manifest.provides),
+    );
+    while (remaining.length > 0) {
+      const next = remaining.findIndex(({ manifest }) => manifest.requires.every((capability) => {
+        const desiredProviders = providers.get(capability);
+        return !desiredProviders || ready.has(capability);
+      }));
+      // Cycles remain truthful: preserve their configured order and let the
+      // supervisor report the unmet requirement instead of guessing.
+      if (next < 0) {
+        ordered.push(...remaining);
+        break;
+      }
+      const [entry] = remaining.splice(next, 1);
+      if (!entry) break;
+      ordered.push(entry);
+      for (const capability of entry.manifest.provides) ready.add(capability);
+    }
+
+    for (const { id, want, manifest } of ordered) {
+      try {
         const rt = await this.#opts.supervisor.mount(manifest, want.config ?? {});
         // A plugin that dies during startup is handed to the crash policy and
         // reported as not healthy; treat that as a failed apply.

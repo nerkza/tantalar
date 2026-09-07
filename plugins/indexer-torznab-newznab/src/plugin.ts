@@ -293,13 +293,17 @@ async function doSearch(rawQuery: unknown): Promise<IndexerSearchResult> {
     const code = err instanceof IndexerError ? err.code : "unavailable";
     const message = err instanceof Error ? err.message : String(err);
     lastError = { code, message, at: new Date().toISOString() };
-    await emitFn?.(EventTypes.IndexerProviderError, {
-      indexerId: PLUGIN_ID,
-      code,
-      message,
-      op: "search",
-      queryUrl: redactUrl(url),
-    });
+    await emitFn?.(
+      EventTypes.IndexerProviderError,
+      {
+        indexerId: PLUGIN_ID,
+        code,
+        message,
+        op: "search",
+        queryUrl: redactUrl(url),
+      },
+      q.correlationId !== undefined ? { correlationId: q.correlationId } : undefined,
+    );
     throw err;
   }
 

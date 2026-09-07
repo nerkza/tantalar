@@ -7,20 +7,30 @@
  *
  * Supported surface (the common real-world subset):
  *  - /api?t=caps → categories + search modes
- *  - /api?t=search|tvsearch|moviesearch&query/season/ep + apikey → results RSS
+ *  - /api?t=search|tvsearch|movie&query/season/ep + apikey → results RSS
  */
 import { IndexerError, type IndexerLimits, type IndexedRelease } from "@tantalar/contracts";
 import type { IndexerCapabilities } from "@tantalar/contracts";
 
 /** Minimal XML helpers — providers emit simple well-formed caps/RSS. */
+function decodeXml(value: string): string {
+  const entities: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
+  return value.replace(/&(#x[\da-f]+|#\d+|amp|lt|gt|quot|apos);/gi, (entity, key: string) => {
+    if (!key.startsWith("#")) return entities[key] ?? entity;
+    const code = key[1]?.toLowerCase() === "x" ? parseInt(key.slice(2), 16) : Number(key.slice(1));
+    return code > 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff) ? String.fromCodePoint(code) : entity;
+  });
+}
+
 function textOf(xml: string, tag: string): string {
-  const m = new RegExp(`<${tag}(?:\\s[^>]*)?>([^<]*)</${tag}>`).exec(xml);
-  return m?.[1]?.trim() ?? "";
+  const m = new RegExp(`<${tag}(?:\\s[^>]*)?>(<!\\[CDATA\\[[\\s\\S]*?\\]\\]>|[^<]*)</${tag}>`).exec(xml);
+  const value = m?.[1]?.trim() ?? "";
+  return value.startsWith("<![CDATA[") ? value.slice(9, -3).trim() : decodeXml(value);
 }
 
 function attrOf(tagXml: string, attr: string): string {
   const m = new RegExp(`${attr}="([^"]*)"`).exec(tagXml);
-  return m?.[1] ?? "";
+  return decodeXml(m?.[1] ?? "");
 }
 
 export interface CapsParseResult {
@@ -64,6 +74,7 @@ export interface WireRelease {
   publishedAt: string;
   seeders?: number;
   leechers?: number;
+  language?: string;
   categories: number[];
 }
 
@@ -103,6 +114,7 @@ export function parseResults(xml: string, kind: "nzb" | "torrent"): WireRelease[
     const seedersRaw = attrValue(item, "seeders");
     const peersRaw = attrValue(item, "peers");
     const leechersRaw = attrValue(item, "leechers");
+    const language = attrValue(item, "language");
     const cats: number[] = [];
     for (const c of item.matchAll(/<category(?:\s[^>]*)?>(\d+)<\/category>/g)) {
       cats.push(Number(c[1]));
@@ -122,6 +134,7 @@ export function parseResults(xml: string, kind: "nzb" | "torrent"): WireRelease[
         : peersRaw !== null
           ? { leechers: Math.max(0, Number(peersRaw) - Number(seedersRaw ?? 0)) }
           : {}),
+      ...(language ? { language } : {}),
       categories: cats,
     });
   }
@@ -147,7 +160,7 @@ export function buildQueryUrl(opts: {
     throw new IndexerError("invalid_query", `invalid indexer baseUrl: ${opts.baseUrl}`);
   }
   base.pathname = base.pathname.replace(/\/$/, "") + "/api";
-  base.searchParams.set("t", opts.mode === "tv-search" ? "tvsearch" : opts.mode === "movie-search" ? "moviesearch" : "search");
+  base.searchParams.set("t", opts.mode === "tv-search" ? "tvsearch" : opts.mode === "movie-search" ? "movie" : "search");
   base.searchParams.set("apikey", opts.apiKey);
   if (opts.query) base.searchParams.set("q", opts.query);
   if (opts.mode === "tv-search") {

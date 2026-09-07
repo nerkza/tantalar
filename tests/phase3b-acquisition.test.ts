@@ -9,7 +9,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Kysely } from "kysely";
-import { migrate, openDatabase, type Db } from "@tantalar/db";
+import { migrate, openDatabase, PluginDocumentStore, type Db } from "@tantalar/db";
 import {
   EventTypes,
   DownloadClientError,
@@ -77,6 +77,7 @@ beforeAll(async () => {
     bus,
     container,
     scheduler: new Scheduler(db, 100_000),
+    documents: new PluginDocumentStore(db),
     restartPolicy: policy,
     healthIntervalMs: 500,
     resolveEntry: (m) => {
@@ -161,6 +162,71 @@ describe("release comparison engine (deep module, external behavior)", () => {
     }) as ComparisonVerdict;
     expect(out.winnerGuid).toBeNull();
     expect(out.rejected[0]?.reason).toBe("seeders_below_minimum");
+  });
+
+  it("distinguishes a missing seeder count from a low count", () => {
+    const out = compareReleases({
+      candidates: [release({ guid: "unknown", title: "Show 1080p", seeders: undefined })],
+      profile: { ...BASE_PROFILE, minSeeders: 10 },
+    }) as ComparisonVerdict;
+    expect(out.assessments[0]).toMatchObject({
+      guid: "unknown",
+      accepted: false,
+      reasons: ["seeders_not_reported"],
+    });
+  });
+
+  it("rejects qualities outside the ordered profile", () => {
+    const out = compareReleases({
+      candidates: [release({ guid: "low", title: "Show 720p" })],
+      profile: BASE_PROFILE,
+    }) as ComparisonVerdict;
+    expect(out.winnerGuid).toBeNull();
+    expect(out.rejected[0]).toEqual({ guid: "low", reason: "quality_below_profile" });
+  });
+
+  it("rejects a provider-reported language outside the profile", () => {
+    const out = compareReleases({
+      candidates: [release({ guid: "dub", title: "Show 1080p", language: "de" })],
+      profile: { ...BASE_PROFILE, preferredLanguages: ["en"] },
+    }) as ComparisonVerdict;
+    expect(out.rejected[0]).toEqual({ guid: "dub", reason: "language_not_allowed" });
+  });
+
+  it("reports every policy and ranking reason for every candidate", () => {
+    const out = compareReleases({
+      candidates: [
+        release({ guid: "winner", title: "Show 1080p", sizeBytes: 900, seeders: 50, language: "en" }),
+        release({ guid: "eligible", title: "Show 1080p", sizeBytes: 950, seeders: 20, language: "en" }),
+        release({ guid: "blocked", title: "Show 720p", sizeBytes: 2_000, seeders: 1, language: "de" }),
+      ],
+      profile: {
+        ...BASE_PROFILE,
+        maxSizeBytes: 1_000,
+        minSeeders: 10,
+        preferredLanguages: ["en"],
+      },
+      blacklistedGuids: ["blocked"],
+    }) as ComparisonVerdict;
+
+    expect(out.assessments).toEqual([
+      {
+        guid: "winner",
+        accepted: true,
+        reasons: ["size_within_limits", "seeders_sufficient", "preferred_quality", "language_allowed", "best_quality_available"],
+      },
+      {
+        guid: "eligible",
+        accepted: true,
+        reasons: ["size_within_limits", "seeders_sufficient", "preferred_quality", "language_allowed", "eligible_lower_ranked"],
+      },
+      {
+        guid: "blocked",
+        accepted: false,
+        reasons: ["blacklisted_release", "size_exceeds_limit", "seeders_below_minimum", "quality_below_profile", "language_not_allowed"],
+      },
+    ]);
+    expect(out.rejected).toEqual([{ guid: "blocked", reason: "blacklisted_release" }]);
   });
 
   it("returns no_qualifying_release for an empty candidate set", () => {
@@ -346,6 +412,7 @@ describe("grab decision pipeline (every step is an event)", () => {
       [
         EventTypes.ComparisonVerdict,
         EventTypes.GrabDecision,
+        EventTypes.DispatchGateChecked,
         EventTypes.ClientDispatch,
         EventTypes.DownloadQueued,
         EventTypes.DownloadProgress,
@@ -378,11 +445,11 @@ describe("grab decision pipeline (every step is an event)", () => {
       mode: "interactive",
       chosenGuid: "lose",
       correlationId: "corr-grab-inter",
-      candidates: [release({ guid: "win", title: "M 1080p" }), release({ guid: "lose", title: "M 720p" })],
+      candidates: [release({ guid: "win", title: "M 1080p" }), release({ guid: "lose", title: "M 1080p alt" })],
       profile: BASE_PROFILE,
     });
     expect(picked.grabbed).toBe(true);
-    expect(picked.download?.itemKey).toBe("lose");
+    expect(picked.download?.itemKey).toBe("movie-3");
     await expect(
       pipeline.decide({
         itemKey: "movie-4",
@@ -404,13 +471,13 @@ describe("grab decision pipeline (every step is an event)", () => {
       correlationId: "corr-blacklist",
       candidates: [
         release({ guid: "bad-guid", title: "M 2160p" }),
-        release({ guid: "ok", title: "M 720p" }),
+        release({ guid: "ok", title: "M 1080p" }),
       ],
       profile: BASE_PROFILE,
     });
     expect(result.grabbed).toBe(true);
     expect(result.verdict.winnerGuid).toBe("ok");
-    expect(result.verdict.rejected).toMatchObject([{ guid: "bad-guid", reason: "blacklisted_release" }]);
+    expect(result.verdict.rejected).toContainEqual({ guid: "bad-guid", reason: "blacklisted_release" });
     await supervisor.unmount(CLIENT_ID);
   });
 });
@@ -475,7 +542,7 @@ describe("VPN manager (per-client tunnel binding, kill switch)", () => {
   const VPN_ID = "dev.tantalar.plugin.vpn-manager";
   const CLIENT_ID = "dev.tantalar.plugin.fixture-download-client";
 
-  it("binds clients to openvpn/wireguard profiles and unbinds explicitly", async () => {
+  it("stores blocked WireGuard intent, keeps OpenVPN disabled, and unbinds explicitly", async () => {
     await mount(VPN_ID, "dev.tantalar.capability.vpn-binding", "node " + resolve("plugins/vpn-manager/dist/plugin.js"), {
       profiles: [
         { profileId: "wg-main", protocol: "wireguard", endpointHost: "vpn1.fixture.invalid" },
@@ -484,14 +551,15 @@ describe("VPN manager (per-client tunnel binding, kill switch)", () => {
     });
     const vpn = container.resolve("dev.tantalar.capability.vpn-binding");
     const bound = (await vpn.invoke("set-binding", { clientId: CLIENT_ID, profileId: "wg-main" })) as Record<string, unknown>;
-    expect(bound.profileId).toBe("wg-main");
+    expect(bound).toMatchObject({ profileId: "wg-main", applied: false, blocked: true });
+    await expect(vpn.invoke("set-binding", { clientId: CLIENT_ID, profileId: "ovpn-backup" })).rejects.toThrow(/openvpn apply is disabled/);
     const unbound = (await vpn.invoke("set-binding", { clientId: CLIENT_ID, profileId: null })) as Record<string, unknown>;
     expect(unbound.profileId).toBeNull();
     await expect(vpn.invoke("set-binding", { clientId: CLIENT_ID, profileId: "ghost" })).rejects.toThrow(/unknown vpn profile/);
     await supervisor.unmount(VPN_ID);
   });
 
-  it("fail-closed gate: dispatch blocked unless health is explicitly healthy", async () => {
+  it("fail-closed gate rejects caller-forged health and remains blocked", async () => {
     await mount(VPN_ID, "dev.tantalar.capability.vpn-binding", "node " + resolve("plugins/vpn-manager/dist/plugin.js"), {
       profiles: [{ profileId: "wg-main", protocol: "wireguard", endpointHost: "vpn1.fixture.invalid" }],
     });
@@ -502,19 +570,17 @@ describe("VPN manager (per-client tunnel binding, kill switch)", () => {
     let check = (await vpn.invoke("pre-dispatch-check", { clientId: CLIENT_ID })) as { allowDispatch: boolean };
     expect(check.allowDispatch).toBe(false);
 
-    // Degraded → blocked.
-    await vpn.invoke("health-report", { profileId: "wg-main", health: "degraded" });
+    await expect(vpn.invoke("health-report", { profileId: "wg-main", health: "degraded" })).rejects.toThrow(/runtime-internal/);
     check = (await vpn.invoke("pre-dispatch-check", { clientId: CLIENT_ID })) as { allowDispatch: boolean };
     expect(check.allowDispatch).toBe(false);
 
-    // Explicit healthy → allowed.
-    await vpn.invoke("health-report", { profileId: "wg-main", health: "healthy" });
+    await expect(vpn.invoke("health-report", { profileId: "wg-main", health: "healthy" })).rejects.toThrow(/runtime-internal/);
     check = (await vpn.invoke("pre-dispatch-check", { clientId: CLIENT_ID })) as { allowDispatch: boolean };
-    expect(check.allowDispatch).toBe(true);
+    expect(check.allowDispatch).toBe(false);
     await supervisor.unmount(VPN_ID);
   });
 
-  it("kill switch blocks the grab pipeline while the tunnel is down and resumes only on healthy", async () => {
+  it("kill switch blocks the grab pipeline while trusted lifecycle control is absent", async () => {
     await mount(VPN_ID, "dev.tantalar.capability.vpn-binding", "node " + resolve("plugins/vpn-manager/dist/plugin.js"), {
       profiles: [{ profileId: "wg-main", protocol: "wireguard", endpointHost: "vpn1.fixture.invalid" }],
     });
@@ -523,7 +589,6 @@ describe("VPN manager (per-client tunnel binding, kill switch)", () => {
     // Regression (round-1 review): the pipeline must consult the DOWNLOAD
     // CLIENT's plugin id, not the release's indexerId. Bind the actual client.
     await vpn.invoke("set-binding", { clientId: CLIENT_ID, profileId: "wg-main" });
-    await vpn.invoke("health-report", { profileId: "wg-main", health: "down" });
 
     // Tunnel down → grab blocked BEFORE any client dispatch happens.
     await expect(
@@ -543,16 +608,14 @@ describe("VPN manager (per-client tunnel binding, kill switch)", () => {
     // But the block itself was traced.
     expect(blockedEvents.map((e) => e.type)).toContain(EventTypes.TunnelHealthChanged);
 
-    // Resume ONLY through explicit healthy state.
-    await vpn.invoke("health-report", { profileId: "wg-main", health: "healthy" });
-    const resumed = await pipeline.decide({
+    await expect(vpn.invoke("health-report", { profileId: "wg-main", health: "healthy" })).rejects.toThrow(/runtime-internal/);
+    await expect(pipeline.decide({
       itemKey: "ks-movie",
       mode: "automatic",
-      correlationId: "corr-ks-resumed",
+      correlationId: "corr-ks-still-blocked",
       candidates: [release({ guid: "k1", title: "KS Movie 1080p" })],
       profile: BASE_PROFILE,
-    });
-    expect(resumed.grabbed).toBe(true);
+    })).rejects.toThrow(/kill switch/);
     await supervisor.unmount(CLIENT_ID);
     await supervisor.unmount(VPN_ID);
   });
@@ -573,13 +636,13 @@ describe("VPN manager (per-client tunnel binding, kill switch)", () => {
     };
 
     await vpn("set-binding", { clientId: CLIENT_ID, profileId: "wg-main" });
-    await vpn("health-report", { profileId: "wg-main", health: "healthy" });
-    expect(calls).toEqual([`bind:${CLIENT_ID}`]);
+    await core.trustedHealthReport("wg-main", "healthy");
+    expect(calls).toEqual([`bind:${CLIENT_ID}`, `bind:${CLIENT_ID}`]);
 
     // Tunnel loss: block for the BOUND CLIENT must be the FIRST net action,
     // before any unbind/fallback could occur.
     calls.length = 0;
-    await vpn("health-report", { profileId: "wg-main", health: "down" });
+    await core.trustedHealthReport("wg-main", "down");
     expect(calls[0]).toBe(`block:${CLIENT_ID}`);
     expect(calls).not.toContain(`unbind:${CLIENT_ID}`);
 

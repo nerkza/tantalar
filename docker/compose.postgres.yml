@@ -3,8 +3,14 @@
 # the image or a plain environment entry).
 services:
   tantalar:
-    build: .
-    image: tantalar:v1
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        TANTALAR_BUILD_VERSION: ${TANTALAR_IMAGE_TAG:-0.0.1-alpha.0}
+        TANTALAR_BUILD_REVISION: ${TANTALAR_BUILD_REVISION:-}
+        TANTALAR_BUILD_DATE: ${TANTALAR_BUILD_DATE:-}
+    image: tantalar:${TANTALAR_IMAGE_TAG:-0.0.1-alpha.0}
     ports:
       - "8790:8790"
     environment:

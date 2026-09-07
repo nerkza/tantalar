@@ -58,7 +58,8 @@ async function main() {
     title: "Evidence Episode S01E01",
     source: "torrent",
     providerPluginId: "dev.tantalar.plugin.torrent-native",
-    sourceRef: "magnet:?xt=urn:btih:evidence",
+    providerJobId: "torrent-wave9-evidence",
+    sourceRef: `sha256:${"e".repeat(64)}`,
   });
   await jobs.updateProgress(record.jobId, { state: "downloading", progressPercent: 63 });
 

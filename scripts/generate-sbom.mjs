@@ -24,6 +24,8 @@ for (const [expression, packages] of Object.entries(licenseGroups)) {
 
 const encodePackageName = (name) => name.split("/").map(encodeURIComponent).join("/");
 const purl = (name, version) => `pkg:npm/${encodePackageName(name)}@${encodeURIComponent(version)}`;
+const applicationVersion = JSON.parse(readFileSync("package.json", "utf8")).version;
+const applicationPurl = purl("tantalar", applicationVersion);
 const components = new Map();
 const dependencyEdges = new Map();
 
@@ -74,10 +76,10 @@ const bom = {
   metadata: {
     component: {
       type: "application",
-      "bom-ref": "pkg:npm/tantalar@0.1.0",
+      "bom-ref": applicationPurl,
       name: "tantalar",
-      version: "0.1.0",
-      purl: "pkg:npm/tantalar@0.1.0",
+      version: applicationVersion,
+      purl: applicationPurl,
     },
   },
   components: componentList,
