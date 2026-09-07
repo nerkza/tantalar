@@ -244,9 +244,10 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AdminDeps): void
     const { id } = request.params as { id: string };
     if (actor.role !== "admin" && actor.userId !== id) return reply.code(403).send({ error: "forbidden" });
     const user = await deps.db.selectFrom("users").select("avatar").where("id", "=", id).executeTakeFirst();
-    if (!user?.avatar?.startsWith("data:image/webp;base64,")) return reply.code(404).send({ error: "No uploaded picture." });
-    return reply.header("content-type", "image/webp").header("x-content-type-options", "nosniff")
-      .header("cache-control", "private, no-cache").send(Buffer.from(user.avatar.slice("data:image/webp;base64,".length), "base64"));
+    const picture = user?.avatar?.match(/^data:(image\/(?:png|webp));base64,(.+)$/);
+    if (!picture) return reply.code(404).send({ error: "No uploaded picture." });
+    return reply.header("content-type", picture[1]).header("x-content-type-options", "nosniff")
+      .header("cache-control", "private, no-cache").send(Buffer.from(picture[2]!, "base64"));
   });
 
   app.post("/api/v1/users", { schema: { body: CreateUserBody } }, async (request: Req, reply: any) => {

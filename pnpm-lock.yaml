@@ -144,9 +144,6 @@ importers:
       pino:
         specifier: ^9.7.0
         version: 9.14.0
-      sharp:
-        specifier: 0.35.2
-        version: 0.35.2
 
   apps/web:
     dependencies:

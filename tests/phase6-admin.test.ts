@@ -151,9 +151,11 @@ describe("users + preferences + themes", () => {
     const uploaded = await upload.json() as { avatar: { url: string; preset: null } };
     expect(uploaded.avatar.preset).toBeNull();
     const image = await adminFetch(uploaded.avatar.url);
-    expect(image.headers.get("content-type")).toBe("image/webp");
-    expect(Buffer.from(await image.arrayBuffer()).toString("ascii", 8, 12)).toBe("WEBP");
-    expect((await db.selectFrom("users").select("avatar").where("id", "=", viewerId).executeTakeFirst())?.avatar).toMatch(/^data:image\/webp;base64,/);
+    expect(image.headers.get("content-type")).toBe("image/png");
+    const picture = Buffer.from(await image.arrayBuffer());
+    expect(picture.subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+    expect([picture.readUInt32BE(16), picture.readUInt32BE(20)]).toEqual([256, 256]);
+    expect((await db.selectFrom("users").select("avatar").where("id", "=", viewerId).executeTakeFirst())?.avatar).toMatch(/^data:image\/png;base64,/);
     const list = await (await adminFetch("/api/v1/users?search=viewer&pageSize=1")).json() as { users: Array<{ username: string; active: boolean; avatar: { url: string } }>; total: number };
     expect(list.users).toHaveLength(1);
     expect(list.users[0]).toMatchObject({ username: "viewer", active: true, avatar: uploaded.avatar });
