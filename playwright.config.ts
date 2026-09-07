@@ -15,6 +15,7 @@ export default defineConfig({
     ? undefined
     : {
         command: "pnpm --filter @tantalar/web exec vite --host 127.0.0.1 --port 5173 --strictPort",
+        env: { TANTALAR_API: `http://127.0.0.1:${process.env.TANTALAR_API_PORT ?? 3199}` },
         url: "http://127.0.0.1:5173",
         reuseExistingServer: true,
         timeout: 120_000,
