@@ -10,13 +10,13 @@ audit:
 allowBuilds:
   argon2: true
   better-sqlite3: true
-  bufferutil: set this to true or false
+  bufferutil: false
   esbuild: true
-  ip-set: set this to true or false
-  node-datachannel: set this to true or false
+  ip-set: false
+  node-datachannel: false
   protobufjs: true
-  utf-8-validate: set this to true or false
-  utp-native: set this to true or false
+  utf-8-validate: false
+  utp-native: false
   workerd: true
 onlyBuiltDependencies:
   - esbuild
