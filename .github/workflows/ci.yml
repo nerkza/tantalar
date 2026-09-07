@@ -50,7 +50,7 @@ jobs:
         run: pnpm exec vitest run --no-file-parallelism
 
       - name: Test (web)
-        run: pnpm --filter @tantalar/web test
+        run: pnpm --filter @tantalar/web test --no-file-parallelism
 
       - name: Postgres
         run: |
@@ -67,7 +67,7 @@ jobs:
 
       - name: Playwright
         run: |
-          pnpm exec playwright install --with-deps chromium || sudo apt-get update && sudo apt-get install -y chromium ffmpeg
+          pnpm exec playwright install --with-deps chromium
           TANTALAR_E2E_FFMPEG=ffmpeg pnpm exec playwright test --workers=1
 
   licenses:

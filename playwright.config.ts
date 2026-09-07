@@ -7,14 +7,14 @@ export default defineConfig({
   use: {
     baseURL: process.env.TANTALAR_WEB_URL ?? "http://127.0.0.1:5173",
     launchOptions: {
-      executablePath: process.env.CHROMIUM_PATH ?? "/usr/bin/chromium",
+      ...(process.env.CHROMIUM_PATH ? { executablePath: process.env.CHROMIUM_PATH } : {}),
     },
     trace: "retain-on-failure",
   },
   webServer: process.env.TANTALAR_WEB_URL
     ? undefined
     : {
-        command: "pnpm --filter @tantalar/web exec vite --port 5173 --strictPort",
+        command: "pnpm --filter @tantalar/web exec vite --host 127.0.0.1 --port 5173 --strictPort",
         url: "http://127.0.0.1:5173",
         reuseExistingServer: true,
         timeout: 120_000,
