@@ -87,8 +87,8 @@
 }
 
 .tantalar-notice__dismiss {
-  min-width: 28px;
-  min-height: 28px;
+  min-width: 40px;
+  min-height: 40px;
   align-self: start;
   color: var(--tantalar-color-text-dimmed, #9aa0b4);
 }
@@ -96,7 +96,7 @@
 .tantalar-notice__activate {
   grid-column: 1;
   width: fit-content;
-  min-height: 28px;
+  min-height: 40px;
   margin-left: 30px;
 }
 

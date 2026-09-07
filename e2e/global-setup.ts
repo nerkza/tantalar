@@ -174,6 +174,10 @@ async function start() {
     "-c:a", "aac", "-shortest", "-f", "mpegts", "-y", tsSegment,
   ], { stdio: "ignore" });
   const tsBytes = readFileSync(tsSegment);
+  const hlsRoot = join(dir, "hls");
+  mkdirSync(hlsRoot);
+  writeFileSync(join(hlsRoot, "seg0.ts"), tsBytes);
+  writeFileSync(join(hlsRoot, "playlist.m3u8"), "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:8\n#EXTINF:8.0,\nseg0.ts\n#EXT-X-ENDLIST\n");
 
   // fileId → fixture key
   const fixtureOf: Record<string, string> = {
@@ -259,6 +263,8 @@ async function start() {
       invoke,
       resolvePath: (fileId: string) => files[fixtureOf[fileId] ?? fileId.replace(/^f-/, "")] ?? null,
       mediaRoots: [mediaRoot],
+      hlsRoot,
+      resolveSegmentPath: (_sessionId, name) => join(hlsRoot, name),
       segmentPayload: () => tsBytes,
     }),
   });

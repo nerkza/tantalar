@@ -18,10 +18,12 @@ test("viewer sign-in succeeds and shows home", async ({ page }) => {
 
 test("product navigation exposes the full information architecture", async ({ page }) => {
   await signIn(page);
-  for (const name of ["Movies", "Series", "Calendar", "Activity", "Settings", "Home"]) {
+  for (const name of ["Movies", "Series", "Calendar", "Activity", "Home"]) {
     await page.getByTestId(`nav-${name.toLowerCase()}`).click();
     await expect(page.getByTestId(`${name.toLowerCase()}-page`)).toBeVisible();
   }
+  await page.getByRole("button", { name: "Control", exact: true }).click();
+  await expect(page.getByTestId("control-overview-dashboard")).toBeVisible();
 });
 
 test("library browsing shows visible items only (visibility boundaries)", async ({ page }) => {

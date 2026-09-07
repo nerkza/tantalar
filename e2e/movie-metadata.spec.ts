@@ -26,7 +26,7 @@ test("movie cards, details and playback retain metadata across widths and themes
     for (const width of [390, 1440]) {
       await page.setViewportSize({ width, height: 1000 });
       await page.getByRole("button", { name: "Details for The Last Observatory" }).focus();
-      await page.keyboard.press("Enter");
+      await page.getByRole("button", { name: "Details for The Last Observatory" }).press("Enter");
       const dialog = page.getByRole("dialog");
       await expect(dialog).toHaveCSS("opacity", "1");
       await expect(dialog.getByText("2026 · 101 min · PG")).toBeVisible();

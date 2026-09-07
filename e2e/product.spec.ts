@@ -46,13 +46,11 @@ test("home page states render across desktop and mobile", async ({ page }) => {
   }
 });
 
-test("settings page renders all twelve sections and switches theme by name", async ({ page }) => {
+test("Control exposes its areas and switches theme by name", async ({ page }) => {
   await signIn(page);
-  await page.getByTestId("nav-settings").click();
-  await expect(page.getByTestId("settings-page")).toBeVisible();
-  for (const name of ["General", "Libraries", "Downloads", "Indexers", "Quality", "Import",
-    "Metadata", "Playback", "Users", "Integrations", "VPN", "System"]) {
-    await expect(page.getByRole("tab", { name })).toBeVisible();
+  await page.goto("/#/admin/system/appearance");
+  for (const area of ["overview", "media", "acquisition", "jobs", "integrations", "extensions", "people", "playback", "audit", "system"]) {
+    await expect(page.getByTestId(`control-nav-${area}`)).toBeVisible();
   }
 
   // Theme switch uses human names only; no internal token names in the UI.
@@ -112,7 +110,7 @@ test("keyboard-only operation: navigate, open player, control playback", async (
 test("screen-reader semantics: navigation landmarks, current page, live regions", async ({ page }) => {
   await signIn(page);
   // Navbar is a labelled landmark with aria-current on the active item.
-  await expect(page.getByLabel("Main navigation")).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Media navigation" })).toBeVisible();
   await page.getByTestId("nav-movies").click();
   await expect(page.getByTestId("movies-page")).toBeVisible();
   await expect(page.getByTestId("nav-movies")).toHaveAttribute("aria-current", "page");
@@ -126,5 +124,5 @@ test("screen-reader semantics: navigation landmarks, current page, live regions"
   // Search inputs are labelled.
   await page.goto("/#/movies");
   await expect(page.getByTestId("movies-page")).toBeVisible();
-  await expect(page.getByLabel("Search Movies")).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "Filter Movies" })).toBeVisible();
 });

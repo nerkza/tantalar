@@ -65,10 +65,42 @@ jobs:
       - name: Plugin conformance
         run: pnpm exec vitest run tests/phase2-lifecycle-conformance.test.ts
 
-      - name: Playwright
+      - name: Browser smoke tests (staging)
+        if: github.ref == 'refs/heads/staging'
+        run: |
+          pnpm exec playwright install --with-deps chromium
+          TANTALAR_E2E_FFMPEG=ffmpeg pnpm exec playwright test e2e/viewer.spec.ts --workers=1 --grep 'viewer sign-in|library browsing|direct play:'
+
+      - name: Playwright (main and pull requests)
+        if: github.ref != 'refs/heads/staging'
         run: |
           pnpm exec playwright install --with-deps chromium
           TANTALAR_E2E_FFMPEG=ffmpeg pnpm exec playwright test --workers=1
+
+  browser-staging:
+    # Report the full suite separately; staging deployment requires the smoke tests above.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/staging'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: pnpm run build
+      - run: pnpm exec playwright install --with-deps chromium
+      - name: Full browser suite (does not gate staging)
+        run: TANTALAR_E2E_FFMPEG=ffmpeg pnpm exec playwright test --workers=1
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: staging-browser-failures
+          path: test-results/
+          retention-days: 7
 
   licenses:
     runs-on: ubuntu-latest

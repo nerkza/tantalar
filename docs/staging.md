@@ -18,7 +18,10 @@ Production remains on its existing configuration. This change does not add produ
 The marketing workflow runs its build and browser tests before staging deployment.
 It adds staging-only crawler exclusions. See `tantalar_web/DEPLOYMENT.md`.
 
-Application CI runs the existing checks, license gate, dependency audit, and Docker smoke test.
+Application CI requires typecheck, build, backend/web tests, license checks, dependency audit, and Docker smoke boot.
+On `staging`, browser checks require sign-in, library visibility, and direct playback.
+The complete browser suite runs in the separate `browser-staging` job. Its failures remain visible but do not block staging deployment.
+Failure traces are attached to that job for seven days. Main and pull requests still require the full browser suite.
 It publishes the tested image to GHCR with the source commit in its tag.
 The metadata workflow deploys first and checks a real TMDB configuration request.
 The application job then sends the Compose configuration to the VPS and deploys the immutable image digest.
@@ -29,6 +32,16 @@ An older run skips deployment when a newer commit exists.
 The VPS script backs up a running staging database before replacement.
 It waits for container health, checks readiness, and verifies the running source commit.
 A failed check fails the workflow. It does not restore a database automatically.
+
+## Development deployments and releases
+
+The `staging` branch updates a private test installation. Its Docker image identifies the source commit.
+This is not a public application release. Release tags, version policy, stable/beta channels, and self-hoster updates remain undecided.
+There is no automatic promotion from staging to production.
+
+The application runs separately on the VPS with its own persistent database and settings.
+Replacing its container preserves the staging data volume. Cloudflare Access protects the application address before Tantalar handles requests.
+Access email authentication and the Tantalar administrator account are separate logins.
 
 ## Resource isolation
 
