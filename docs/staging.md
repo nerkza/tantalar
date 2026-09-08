@@ -1,162 +1,66 @@
 # Staging deployment
 
-Staging covers the marketing site, self-hosted application, and metadata Worker.
-Both GitHub staging environments exist and permit only the `staging` branch.
-The marketing and metadata Workers are live. Tunnel, Access, and CI credentials are provisioned.
-The first application deployment and complete GitHub workflow acceptance are pending.
+Staging covers the marketing site and metadata Worker. Lewis requested removal of self-hosted application staging on 8 September 2026.
 
 | Part | Source | Staging target |
 | --- | --- | --- |
 | Marketing | `nerkza/tantalar_web`, branch `staging` | Worker `tantalar-web-staging`, `staging.tantalar.app` |
-| Application | `nerkza/tantalar`, branch `staging` | Scaleway VPS, `app-staging.tantalar.app`, Tunnel and Access |
 | Metadata | `nerkza/tantalar`, branch `staging` | Worker `tantalar-metadata-staging`, `metadata-staging.tantalar.app` |
-
-Production remains on its existing configuration. This change does not add production deployment triggers.
 
 ## Deployment flow
 
-The marketing workflow runs its build and browser tests before staging deployment.
-It adds staging-only crawler exclusions. See `tantalar_web/DEPLOYMENT.md`.
+Both GitHub staging environments permit only the `staging` branch.
+The marketing workflow builds and tests the website before deployment. See `tantalar_web/DEPLOYMENT.md`.
+Application CI retains its checks and Docker build/boot test. It no longer needs image publication or VPS deployment.
+Metadata deployment requires the existing checks, license checks, and dependency audit.
+The metadata workflow deploys the Worker and checks a real TMDB configuration request.
+Each deployment checks the current branch commit and skips an obsolete run.
 
-Application CI requires typecheck, build, backend/web tests, license checks, dependency audit, and Docker smoke boot.
-On `staging`, browser checks require sign-in, library visibility, and direct playback.
-The complete browser suite runs in the separate `browser-staging` job. Its failures remain visible but do not block staging deployment.
-Failure traces are attached to that job for seven days. Main and pull requests still require the full browser suite.
-It publishes the tested image to GHCR with the source commit in its tag.
-The metadata workflow deploys first and checks a real TMDB configuration request.
-The application job then sends the Compose configuration to the VPS and deploys the immutable image digest.
+The existing browser checks remain unchanged. Main and pull requests require the full browser suite.
+The staging branch requires core browser flows. Its separate full browser job remains nonblocking.
 
-Deployments are serial for each target. Each job checks the latest staging branch commit before deployment.
-An older run skips deployment when a newer commit exists.
+## Access and isolation
 
-The VPS script backs up a running staging database before replacement.
-It waits for container health, checks readiness, and verifies the running source commit.
-A failed check fails the workflow. It does not restore a database automatically.
+Marketing staging requires Cloudflare Access email-code login for `lewis@cookson.xyz`, with a 24-hour session.
+The existing **Tantalar staging** Access application protects this hostname.
+Crawler exclusions remain enabled. Both staging Workers disable `workers.dev` and preview URLs.
+Production marketing at `tantalar.app` remains public.
 
-## Development deployments and releases
+Metadata staging uses the public, rate-limited gateway model for server calls.
+Its route is `metadata-staging.tantalar.app`; its rate-limit namespace is `2026090701`.
+Its `TMDB_API_TOKEN` is stored directly on the staging Worker.
+Both GitHub staging environments retain `CLOUDFLARE_API_TOKEN` for Worker deployment.
+Do not add native Cloudflare Builds to these targets; that creates competing deployments.
 
-The `staging` branch updates a private test installation. Its Docker image identifies the source commit.
-This is not a public application release. Release tags, version policy, stable/beta channels, and self-hoster updates remain undecided.
-There is no automatic promotion from staging to production.
+## Application staging removal — 8 September 2026
 
-The application runs separately on the VPS with its own persistent database and settings.
-Replacing its container preserves the staging data volume. Cloudflare Access protects the application address before Tantalar handles requests.
-Access email authentication and the Tantalar administrator account are separate logins.
+Completed:
+- Removed VPS containers `tantalar-staging-tantalar-1` and `tantalar-staging-cloudflared-1`.
+- Locked the `tantalar-staging` account, set its shell to `/usr/sbin/nologin`, and removed its authorized SSH key.
+- Removed GitHub's four `TANTALAR_STAGING_*` secrets and two SSH variables.
+- Removed the application deployment job, GHCR staging publication, Compose configuration, and deployment script from staging CI.
+- Preserved metadata staging configuration and its isolation test.
 
-## Resource isolation
+Pending completion:
+- Delete the dedicated `tantalar-staging` Cloudflare Tunnel, deployment Access application, and CI service token.
+- Remove `app-staging.tantalar.app` from the shared Access application. Preserve marketing's hostname and policy.
+- Delete application and deployment SSH DNS records.
+- Database volume `tantalar-staging_staging-data` and files under `/srv/tantalar-staging` remain for recovery. Data deletion needs confirmation.
 
-- Compose project: `tantalar-staging`.
-- Data volume: `tantalar-staging_staging-data`.
-- Application port: `127.0.0.1:8791`; no public origin port.
-- Application configuration: `docker/staging.yaml`, mounted read-only.
-- Metadata URL: `https://metadata-staging.tantalar.app/v1/tmdb`.
-- Metadata rate-limit namespace: `2026090701`, separate from production.
-- Metadata secret: staging Worker's own `TMDB_API_TOKEN`.
-- Tunnel: a dedicated remotely managed `tantalar-staging` tunnel.
+Verified: no staging application containers remain, and port 8791 has no listener.
+No in-progress staging workflow existed during removal. Removed credentials prevent the old workflow from redeploying.
+Six metadata and staging tests passed after the local changes.
 
-Use synthetic data and test accounts. Do not mount production media, databases, or download directories.
-Do not configure a personal TMDB override on staging; that override bypasses the staging gateway.
-The standard image includes FFmpeg. PAR2 and full archive extraction require separately supplied tools, as documented in `deploy.md`.
+## Releases
 
-## Provisioned infrastructure
-
-### Cloudflare
-
-Use Lewis's account: `8a7e656cee230b4e541ab2caa3ff382e`.
-
-- Dedicated Tunnel: `tantalar-staging`, ID `0b07e2bc-e7e3-4b8b-aa6a-3972acd709b0`.
-- Human Access: `app-staging.tantalar.app`, email allowlist `lewis@cookson.xyz`, one-time PIN.
-- Application origin: `http://127.0.0.1:8791` through the host-networked connector.
-- Deployment Access: `ssh-staging.tantalar.app`, service-token-only policy, origin `ssh://127.0.0.1:22`.
-- Both ingress rules require Access token validation with their own application audiences.
-- Tunnel token: `/srv/tantalar-staging/secrets/tunnel-token`, UID `65532`, mode `0400`, parent root-only.
-- `TMDB_API_TOKEN` is installed on the staging metadata Worker. A real configuration request passed.
-- CI Access service token expires on 7 September 2027. Rotate its two GitHub secrets before expiry.
-
-The metadata endpoint uses the existing public, rate-limited gateway model. Browser-only Access would block its server-side caller.
-Marketing staging is public with `noindex`. Add Access separately if marketing previews need restricted access.
-Both staging Workers disable `workers.dev` and preview URLs.
-
-### VPS
-
-Target: `scaleway-start9`. Do not use the frozen OVH host.
-The read-only inspection found 836 GiB free on `/data`, about 27 GiB available RAM, and port `8791` unused.
-Docker Compose v5.5.0 validated the staging configuration. The dedicated cloudflared connector is running.
-
-`/srv/tantalar-staging/releases` belongs to the dedicated `tantalar-staging` user with Docker access.
-Keep `/srv` and Docker storage on the existing `/data` filesystem.
-A dedicated restricted SSH key is authorized. GitHub holds that key and the independently verified VPS host key.
-Docker access gives host-level control; use the key only for this environment.
-
-The GitHub runner uses `cloudflared access ssh` with the dedicated service credential.
-The existing VPS firewall remains unchanged. SSH and the application use outbound Tunnel connections.
-
-The VPS must be able to pull `ghcr.io/nerkza/tantalar`.
-Each deployment supplies its GitHub job token through standard input for a temporary registry login.
-The deploy script removes its temporary Docker credential directory on exit.
-Do not change package visibility without approval.
-
-### GitHub
-
-Both repositories now have a `staging` environment restricted to the `staging` branch.
-The following environment settings are installed.
-
-| Repository | Environment setting | Purpose |
-| --- | --- | --- |
-| Both | Secret `CLOUDFLARE_API_TOKEN` | Workers Scripts Edit on Lewis's account; Zone Read and Workers Routes Edit on `tantalar.app` |
-| `tantalar` | Variable `TANTALAR_STAGING_SSH_HOST` | SSH address reachable from the runner |
-| `tantalar` | Variable `TANTALAR_STAGING_SSH_USER` | Dedicated VPS deployment user |
-| `tantalar` | Secret `TANTALAR_STAGING_SSH_KEY` | Deployment private key |
-| `tantalar` | Secret `TANTALAR_STAGING_KNOWN_HOSTS` | Independently verified SSH host-key record |
-| `tantalar` | Secrets `TANTALAR_STAGING_ACCESS_CLIENT_ID`, `TANTALAR_STAGING_ACCESS_CLIENT_SECRET` | Service credential for the SSH Access application |
-
-Temporary Tunnel, Access, and DNS edit permissions were removed from the API token before storage in GitHub.
-
-The Docker job uses its GitHub token to publish the image. No personal write token is required.
-The reusable metadata workflow obtains its Cloudflare secret from the `staging` environment.
-Do not also connect native Cloudflare Builds to these staging targets; that would create competing deployments.
+Application release tags, version policy, release channels, and self-hoster updates remain undecided.
+Removing the VPS test installation does not publish an application release or create a production deployment trigger.
 
 ## Using staging
 
-1. Commit the changes you want to test in the relevant repository.
-2. Push the reviewed commit to that repository's `staging` branch.
-3. Open GitHub Actions and check the deployment job result.
-4. Open the relevant staging address from the table above.
+1. Commit the relevant changes.
+2. Push the reviewed commit to the repository's `staging` branch after approval.
+3. Check the GitHub Actions deployment result.
+4. Open the staging address from the table above.
 
-The marketing repository updates only the website. The application repository updates the metadata Worker and VPS application.
-For application staging, check `app-staging` for deployment success. A separate `browser-staging` failure can make the overall run red after a successful deployment.
-Do not infer deployment failure from the overall icon alone. Open the failed job and inspect its result.
-
-### First application visit
-
-1. Open `https://app-staging.tantalar.app`.
-2. Enter `lewis@cookson.xyz` at the Cloudflare Access login.
-3. Enter the one-time code sent to that email address.
-4. Create a staging-only Tantalar administrator in the first-run screen.
-5. Complete the application setup with staging libraries and test data.
-
-Access controls who can reach Tantalar. The Tantalar account controls permissions inside the application.
-The metadata gateway is already configured. You do not need to enter a personal TMDB key.
-The first account and setup remain operator actions; deployment does not create credentials for you.
-
-## Verified locally
-
-On 7 September 2026: eight marketing browser tests and seven staging/metadata tests passed.
-Marketing build, both Worker staging dry runs, metadata type generation/typecheck, and workflow YAML/shell syntax checks passed.
-The dependency update and torrent/staging checks passed: 32 tests across four files.
-The dependency audit passes with one documented unreachable `ip.isPublic` advisory exception; see the torrent dependency record.
-The existing VPS validated Compose configuration and runs the Tunnel connector.
-The complete application CI, image publish, and live acceptance remain unrun.
-
-## Rollback
-
-Keep prior release directories and image digests.
-For a code-only reversal, revert the commit and push it to staging after approval.
-For a migration reversal, stop staging and restore its pre-upgrade database backup before starting the previous image.
-Use the backup and restore procedure in `deploy.md`. Never run `docker compose down --volumes` during rollback.
-
-## References
-
-- [Cloudflare Worker environments](https://developers.cloudflare.com/workers/wrangler/environments/)
-- [Self-hosted applications with Access](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/)
-- [Cloudflared token-file parameter](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/cloudflared-parameters/run-parameters/#token-file)
+For rollback, revert the relevant commit and deploy it to staging after approval.
