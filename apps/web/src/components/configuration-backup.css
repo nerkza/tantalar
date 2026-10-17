@@ -1,0 +1,9 @@
+.tantalar-configuration-backup {
+  width: 100%;
+  max-width: 65ch;
+  min-width: 0;
+}
+
+.tantalar-configuration-backup p {
+  overflow-wrap: anywhere;
+}

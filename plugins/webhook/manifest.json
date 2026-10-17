@@ -1,0 +1,9 @@
+{
+  "id": "dev.tantalar.plugin.webhook",
+  "version": "0.1.0",
+  "protocolVersion": 1,
+  "provides": ["dev.tantalar.capability.webhook.status"],
+  "requires": ["dev.tantalar.capability.event.emit", "dev.tantalar.capability.log"],
+  "subscriptions": ["dev.tantalar.event."],
+  "entry": { "command": "node dist/plugin.js" }
+}

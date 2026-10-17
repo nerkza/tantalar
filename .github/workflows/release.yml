@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    if: github.repository == 'nerkza/tantalar'
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Resolve version
+        id: version
+        run: |
+          version="$(node scripts/version.mjs show version)"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $version" >&2
+            exit 1
+          fi
+          case "$version" in *-*) prerelease=true ;; *) prerelease=false ;; esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        run: |
+          docker build \
+            --build-arg TANTALAR_BUILD_VERSION="${{ steps.version.outputs.version }}" \
+            --build-arg TANTALAR_BUILD_REVISION="$GITHUB_SHA" \
+            --build-arg TANTALAR_BUILD_DATE="${{ steps.version.outputs.created }}" \
+            -t "ghcr.io/nerkza/tantalar:${{ steps.version.outputs.version }}" .
+
+      - name: Smoke boot (SQLite)
+        run: |
+          docker run -d --name tantalar-smoke -p 8790:8790 "ghcr.io/nerkza/tantalar:${{ steps.version.outputs.version }}"
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8790/healthz | grep -q "\"version\":\"${{ steps.version.outputs.version }}\""; then
+              echo "smoke boot OK"; docker rm -f tantalar-smoke; exit 0
+            fi
+            sleep 2
+          done
+          docker logs tantalar-smoke >&2 || true
+          exit 1
+
+      - name: SBOM and license report
+        run: ./scripts/generate-sbom.sh
+
+      - name: Push image
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "ghcr.io/nerkza/tantalar:${{ steps.version.outputs.version }}"
+          if [ "${{ steps.version.outputs.prerelease }}" = "false" ]; then
+            docker tag "ghcr.io/nerkza/tantalar:${{ steps.version.outputs.version }}" ghcr.io/nerkza/tantalar:latest
+            docker push ghcr.io/nerkza/tantalar:latest
+          fi
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          flags="--verify-tag --generate-notes"
+          if [ "${{ steps.version.outputs.prerelease }}" = "true" ]; then flags="$flags --prerelease"; fi
+          gh release create "$GITHUB_REF_NAME" $flags \
+            --title "Tantalar ${{ steps.version.outputs.version }}" \
+            artifacts/sbom.json artifacts/licenses.json artifacts/licenses-summary.txt

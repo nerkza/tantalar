@@ -1,0 +1,48 @@
+.tantalar-setup {
+  max-width: 76rem;
+  margin: calc(var(--tantalar-space-unit, 4px) * 8) auto;
+  padding: calc(var(--tantalar-space-unit, 4px) * 3);
+}
+.tantalar-setup--account { max-width: 30rem; }
+.tantalar-setup__layout {
+  display: grid;
+  grid-template-columns: 14rem minmax(0, 1fr);
+  gap: calc(var(--tantalar-space-unit, 4px) * 4);
+  margin-top: calc(var(--tantalar-space-unit, 4px) * 6);
+}
+.tantalar-setup__steps { list-style: none; padding: 0; margin: 0; }
+.tantalar-setup__steps button {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--tantalar-space-unit, 4px);
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  padding: calc(var(--tantalar-space-unit, 4px) * 3);
+  text-align: left;
+  font: inherit;
+  color: var(--tantalar-color-text, #eef0f6);
+  background: transparent;
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+.tantalar-setup__steps button[aria-current="step"] {
+  background: var(--tantalar-color-surface, #191c27);
+  border-color: var(--tantalar-color-border, #2c3143);
+  border-radius: var(--tantalar-radius-md, 8px);
+}
+.tantalar-setup__steps button:focus-visible { outline: 2px solid var(--tantalar-color-primary, #4d8df6); }
+.tantalar-setup__panel { min-width: 0; }
+.tantalar-setup__panel[data-step="experience"],
+.tantalar-setup__panel[data-step="administrator"],
+.tantalar-setup__panel[data-step="metadata"],
+.tantalar-setup__panel[data-step="final-health"] { max-width: 46rem; width: 100%; align-self: start; }
+.tantalar-setup__result, .tantalar-setup__actions {
+  border-top: 1px solid var(--tantalar-color-border, #2c3143);
+  padding-top: calc(var(--tantalar-space-unit, 4px) * 3);
+}
+@media (max-width: 47.99em) {
+  .tantalar-setup { margin-top: calc(var(--tantalar-space-unit, 4px) * 3); }
+  .tantalar-setup__layout { grid-template-columns: minmax(0, 1fr); }
+  .tantalar-setup__steps { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

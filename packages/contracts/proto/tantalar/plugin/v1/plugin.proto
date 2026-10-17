@@ -1,0 +1,144 @@
+// Tantalar plugin contract — canonical protobuf IDL (ADR-0004).
+// PROTOCOL_VERSION: 1. Breaking changes to any message or service below
+// require a major bump of protocolVersion and a compatibility shim window
+// (phase-2-plugin-sdk.md, "Rollback / migration notes").
+syntax = "proto3";
+
+package tantalar.plugin.v1;
+
+// ---- Manifest -------------------------------------------------------------
+
+message Manifest {
+  string id = 1;              // reverse-DNS, e.g. dev.tantalar.plugin.hello-world
+  string version = 2;         // semver of the plugin package
+  uint32 protocol_version = 3; // must equal the negotiated contract major (1)
+  repeated string provides = 4;      // capability names (reverse-DNS)
+  repeated string requires = 5;      // capability names
+  repeated string subscriptions = 6; // event type prefixes
+  Entry entry = 7;
+  message Entry {
+    string command = 1;
+    repeated string args = 2;
+  }
+}
+
+// ---- Handshake / health ----------------------------------------------------
+
+message HelloRequest {
+  uint32 protocol_version = 1; // requested major version
+}
+
+message HelloResponse {
+  bool accepted = 1;           // false => incompatible major
+  uint32 negotiated_version = 2;
+  Manifest manifest = 3;
+}
+
+message MountRequest {
+  string plugin_id = 1;
+  bytes config_json = 2; // canonical JSON of the plugin's config slice
+}
+
+message MountResponse {
+  bool ok = 1;
+}
+
+message UnmountRequest {}
+message UnmountResponse {
+  bool ok = 1;
+}
+
+message PingRequest {
+  uint64 nonce = 1;
+}
+message PingResponse {
+  uint64 nonce = 1;
+}
+
+// ---- Capability invocation --------------------------------------------------
+
+message InvokeRequest {
+  string capability = 1;
+  string operation = 2;
+  bytes payload_json = 3;
+}
+message InvokeResponse {
+  oneof outcome {
+    bytes value_json = 1;
+    string error = 2;
+  }
+}
+
+// ---- Events -----------------------------------------------------------------
+
+message EventEnvelope {
+  uint32 schema_version = 1;
+  string event_id = 2;      // UUIDv7 (ADR-0008)
+  string type = 3;          // reverse-DNS
+  string occurred_at = 4;   // ISO-8601 UTC
+  string producer = 5;
+  string subject = 6;
+  string correlation_id = 7;
+  string causation_id = 8;
+  bytes payload_json = 9;
+  bytes metadata_json = 10;
+}
+
+message PublishRequest {
+  EventEnvelope envelope = 1;
+}
+message PublishResponse {
+  bool ok = 1;
+}
+
+message SubscribeRequest {
+  string type_prefix = 1;
+}
+message EventDelivery {
+  EventEnvelope envelope = 1;
+}
+message AckDelivery {
+  string event_id = 1;
+}
+
+// Bidirectional stream: core sends EventDelivery, plugin acks with AckDelivery.
+service EventBusStream {
+  rpc Stream(stream AckDelivery) returns (stream EventDelivery);
+}
+
+// ---- Auth introspection (Phase 2) -------------------------------------------
+
+message IntrospectRequest {
+  string api_key = 1;        // raw presented credential; never logged
+}
+message IntrospectResponse {
+  bool valid = 1;
+  string identity = 2;       // owning key id when valid
+  repeated string scopes = 3;
+}
+
+// Core-owned service implemented by the host and exposed to plugins over the
+// control channel as op "introspect".
+service AuthIntrospection {
+  rpc Introspect(IntrospectRequest) returns (IntrospectResponse);
+}
+
+// ---- Control service (stdio framing in Phase 1/2; gRPC transport later) ------
+// Each op maps 1:1 to the newline-delimited JSON messages on the control pipe:
+//   handshake -> HelloRequest/HelloResponse
+//   mount     -> MountRequest/MountResponse
+//   unmount   -> UnmountRequest/UnmountResponse
+//   ping      -> PingRequest/PingResponse
+//   call      -> InvokeRequest/InvokeResponse
+//   emit      -> PublishRequest/PublishResponse
+//   subscribe-delivery -> EventDelivery/AckDelivery
+//   introspect -> IntrospectRequest/IntrospectResponse
+service PluginControl {
+  rpc Hello(HelloRequest) returns (HelloResponse);
+  rpc Mount(MountRequest) returns (MountResponse);
+  rpc Unmount(UnmountRequest) returns (UnmountResponse);
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc Call(InvokeRequest) returns (InvokeResponse);
+  rpc Emit(PublishRequest) returns (PublishResponse);
+  rpc Introspect(IntrospectRequest) returns (IntrospectResponse);
+}

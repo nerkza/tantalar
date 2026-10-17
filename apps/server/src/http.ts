@@ -1,0 +1,710 @@
+/**
+ * Fastify HTTP/WS server: REST /api/v1 + WS /api/v1/events feed,
+ * runtime-generated OpenAPI, health endpoints (architecture §10, §12).
+ * Handlers are typed loosely against FastifyRequest to keep the route table
+ * readable; runtime validation is done by the schema objects and the auth
+ * helpers below.
+ */
+import Fastify, { type FastifyInstance } from "fastify";
+import cookie from "@fastify/cookie";
+import fastifyStatic, { type FastifyStaticOptions } from "@fastify/static";
+import websocket from "@fastify/websocket";
+import { constants, existsSync } from "node:fs";
+import { access, stat } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { Type } from "@sinclair/typebox";
+import { userAvatar } from "./user-avatar.js";
+import { AuthService, API_KEY_PREFIX } from "./auth.js";
+import type { EventBus } from "./events.js";
+import type { Supervisor } from "./supervisor.js";
+import type { ServiceContainer } from "./container.js";
+import { registerServingRoutes, type ServingDeps } from "./serving.js";
+import { registerAdminRoutes, type AdminDeps } from "./admin.js";
+import { registerLibraryRoutes, type LibraryDeps } from "./library-routes.js";
+import { registerIndexerRoutes, type IndexerDeps } from "./indexer-routes.js";
+import { registerOpsRoutes, type OpsDeps } from "./ops-routes.js";
+import { createMovieMetadataService } from "./movie-metadata.js";
+import { registerNamingRoutes, type NamingDeps } from "./naming-routes.js";
+import type { IndexerSettingsService } from "./indexer-settings.js";
+import { OnboardingService, OnboardingError, ONBOARDING_STEPS } from "./onboarding.js";
+import { uuidv7, type OnboardingState, type OnboardingStepState } from "@tantalar/contracts";
+import { getVersionMetadata, TANTALAR_RELEASE } from "./version.js";
+import type { Kysely } from "kysely";
+import type { Db } from "@tantalar/db";
+
+export interface ServerDeps {
+  auth: AuthService;
+  db?: Kysely<Db>;
+  bus: EventBus;
+  supervisor: Supervisor;
+  container: ServiceContainer;
+  ready: () => boolean;
+  /** Truthful readiness detail (missing capabilities etc.). Optional for direct buildServer callers. */
+  readiness?: () => {
+    ready: boolean;
+    listening: boolean;
+    missingCapabilities: string[];
+  };
+  /** Phase 5A serving surface; absent until the serving plugin is configured. */
+  serving?: (invoke: (operation: string, payload: Record<string, unknown>) => Promise<unknown>) => ServingDeps;
+  /** Test hook: omit the guided-onboarding routes. */
+  onboardingDisabled?: boolean;
+  /** Wave 3 (TAN-020/021) library management surface; present with a DB handle. */
+  library?: LibraryDeps["service"];
+  /** Wave 7 (TAN-014) indexer add/test/enable surface; present with a DB handle. */
+  indexerSettings?: IndexerSettingsService;
+  /** Wave 9 (TAN-030–043) operations surface deps; present with a DB handle. */
+  ops?: OpsDeps;
+}
+
+interface AuthContext {
+  kind: "session" | "apiKey";
+  scopes: string[];
+  userId?: string;
+  role?: string;
+}
+
+const LoginBody = Type.Object({ username: Type.String(), password: Type.String() });
+const StepActionBody = Type.Object({ action: Type.Union([Type.Literal("complete"), Type.Literal("skip")]) });
+const SetupPreferencesBody = Type.Object({
+  currentStep: Type.Optional(Type.Union(ONBOARDING_STEPS.map(id => Type.Literal(id)))),
+  mediaEnabled: Type.Optional(Type.Boolean()),
+  acquisitionMode: Type.Optional(Type.Union([Type.Literal("none"), Type.Literal("usenet"), Type.Literal("torrent")])),
+  titleFileId: Type.Optional(Type.Union([Type.String({ minLength: 1, maxLength: 256 }), Type.Null()])),
+  metadataQuery: Type.Optional(Type.String({ maxLength: 120 })),
+  releaseTarget: Type.Optional(Type.Union([Type.Null(), Type.Object({
+    kind: Type.Union([Type.Literal("movie"), Type.Literal("series")]),
+    id: Type.String({ minLength: 1, maxLength: 256 }),
+    episodeKey: Type.Optional(Type.String({ pattern: "^S[0-9]{2,3}E[0-9]{2,4}$" })),
+  }, { additionalProperties: false })])),
+  downloadJobId: Type.Optional(Type.Union([Type.Null(), Type.String({ minLength: 1, maxLength: 256 })])),
+}, { additionalProperties: false });
+
+function bearerToken(header: unknown): string | undefined {
+  if (typeof header !== "string") return undefined;
+  const m = /^Bearer (.+)$/.exec(header);
+  return m ? m[1] : undefined;
+}
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
+  const app: FastifyInstance = Fastify({ logger: false });
+  const version = getVersionMetadata();
+  const movieMetadata = createMovieMetadataService(deps.container);
+  await app.register(cookie);
+  await app.register(websocket);
+
+  // Route scope requirements: API keys must hold the required scope (enforced
+  // in verifyApiKey); cookie sessions carry the admin role and satisfy any
+  // scope (ADR-0011, phase-1 doc: mutations authenticated under scope lists).
+  const authenticate = async (
+    request: any,
+    requiredScope?: string,
+  ): Promise<AuthContext | "forbidden" | null> => {
+    const token = bearerToken(request.headers?.authorization);
+    if (token && token.startsWith(API_KEY_PREFIX)) {
+      const key = await deps.auth.verifyApiKey(token);
+      if (!key) return null;
+      // Valid key but missing the route's required scope → explicit 403.
+      if (requiredScope && !key.scopes.includes(requiredScope)) return "forbidden";
+      return { kind: "apiKey", scopes: key.scopes };
+    }
+    const sessionToken: string | undefined = token ?? request.cookies?.["tantalar_session"];
+    if (!sessionToken) return null;
+    const session = await deps.auth.getSession(sessionToken);
+    if (!session) return null;
+    return { kind: "session", scopes: [], userId: session.userId, role: session.role };
+  };
+
+  // Standard auth guard: null → 401, "forbidden" (scope mismatch) → 403.
+  const requireAuth = async (
+    reply: any,
+    request: any,
+    requiredScope?: string,
+  ): Promise<AuthContext | null> => {
+    const auth = await authenticate(request, requiredScope);
+    if (auth === "forbidden") {
+      await reply.code(403).send({ error: "insufficient scope" });
+      return null;
+    }
+    if (!auth) await reply.code(401).send({ error: "unauthorized" });
+    return auth;
+  };
+
+  // Cookie-authenticated mutations require CSRF double-submit (ADR-0011).
+  const csrfOk = (request: any): boolean => {
+    if (!["POST", "PUT", "PATCH", "DELETE"].includes(request.method)) return true;
+    if (request.headers?.authorization) return true;
+    const headerToken = request.headers?.["x-csrf-token"];
+    const header = Array.isArray(headerToken) ? String(headerToken[0]) : typeof headerToken === "string" ? headerToken : undefined;
+    return AuthService.verifyCsrf(request.cookies?.["tantalar_csrf"], header);
+  };
+
+  app.setErrorHandler((err: any, _req: any, reply: any) => {
+    const code = typeof err?.statusCode === "number" ? err.statusCode : 500;
+    reply.code(code).send({ error: err.message });
+  });
+
+  app.get("/healthz", async () => ({ ok: true, version }));
+  app.get("/readyz", async (_req: any, reply: any) => {
+    if (deps.ready()) return { ok: true, version };
+    const detail = deps.readiness?.();
+    return reply.code(503).send({
+      ok: false,
+      version,
+      listening: detail?.listening ?? null,
+      missingCapabilities: detail?.missingCapabilities ?? [],
+    });
+  });
+  app.get("/api/v1/version", async () => version);
+
+  // Secure one-time bootstrap (wave 2, TAN-002): when no user exists yet,
+  // exactly one administrator may be created without a session. The check
+  // and insert share a database transaction (AuthService.createInitialAdmin),
+  // so concurrent requests cannot create two bootstrap administrators. Once
+  // any user exists the endpoint is permanently closed (403) — it can never
+  // create a second account or overwrite an existing one.
+  app.get("/api/v1/bootstrap/status", async () => ({
+    required: await deps.auth.isBootstrapRequired(),
+  }));
+
+  app.post("/api/v1/bootstrap/admin", async (request: any, reply: any) => {
+    if (!deps.db) return reply.code(503).send({ error: "storage unavailable" });
+    const body = (request.body ?? {}) as { username?: string; password?: string };
+    const result = await deps.auth.createInitialAdmin(
+      String(body.username ?? ""),
+      String(body.password ?? ""),
+    );
+    if (!result.ok) {
+      return reply.code(result.reason === "closed" ? 403 : 400).send({
+        error:
+          result.reason === "closed"
+            ? "Setup is already complete. Sign in with your administrator account."
+            : "Choose a username and a password of at least 8 characters.",
+      });
+    }
+    return { ok: true };
+  });
+
+  // ---- Wave 2 guided onboarding (TAN-003): durable, resumable wizard ----
+  if (deps.db && !deps.onboardingDisabled) {
+    const onboarding = new OnboardingService(deps.db);
+
+    app.put("/api/v1/onboarding/preferences", { schema: { body: SetupPreferencesBody } }, async (request: any, reply: any) => {
+      const auth = await requireAuth(reply, request);
+      if (!auth) return;
+      if (auth.kind !== "session" || auth.role !== "admin") return reply.code(403).send({ error: "administrator access required" });
+      if (!csrfOk(request)) return reply.code(403).send({ error: "csrf required" });
+      return onboarding.preferences(request.body);
+    });
+
+    // Reuse authenticated operations, including their validation and credential handling.
+    // Only fixed summaries enter the draft; provider responses and credentials never do.
+    const checkStep = async (id: string, request: any, state: OnboardingState): Promise<OnboardingStepState | undefined> => {
+      if (id === "administrator" || id === "experience") return undefined;
+      const call = async (url: string, method: "GET" | "POST" = "GET", payload?: object): Promise<any> => {
+        const response = await app.inject({ method, url,
+          headers: { cookie: request.headers.cookie ?? "", "x-csrf-token": request.headers["x-csrf-token"] ?? "" },
+          ...(payload ? { payload } : {}),
+        });
+        if (response.statusCode >= 400) throw new Error("check failed");
+        return response.json();
+      };
+      const fail = (detail: string): OnboardingStepState => ({ status: "failed", detail });
+      try {
+        if (id === "libraries") {
+          const { results } = await call("/api/v1/libraries/validate");
+          const enabled = results.filter((row: any) => row.library.enabled);
+          if (!enabled.length || enabled.some((row: any) => !row.ok)) return fail("Add an enabled library and test its server path.");
+          return { status: "done", detail: `${enabled.length} library paths verified. Scan libraries to check their contents.` };
+        }
+        if (id === "acquisition") {
+          if (state.acquisitionMode === "none") return { status: "skipped", detail: "Acquisition left for later." };
+          const engine = await call(`/api/v1/acquisition/${state.acquisitionMode}`);
+          if (!engine.ready) return fail("Configure the selected download engine and its download paths, then retry.");
+          if (!engine.downloadRoots?.length) return fail("Configure a download root for the selected engine.");
+          for (const root of engine.downloadRoots) {
+            if (!(await stat(root)).isDirectory()) return fail("A download root is not a directory. Correct the engine settings.");
+            await access(root, constants.R_OK | constants.W_OK);
+          }
+          if (state.acquisitionMode === "usenet") {
+            if (!engine.servers?.length || !engine.downloadRoots?.length) return fail("Configure a Usenet server and download root.");
+            for (const server of engine.servers) {
+              const result = await call("/api/v1/acquisition/usenet/test", "POST", { server });
+              if (!result.ok) return fail("The Usenet connection test failed. Check the server settings.");
+            }
+          } else if (!engine.downloadRootsConfigured) return fail("Configure a torrent download root.");
+          const { indexers } = await call("/api/v1/indexers");
+          const selected = indexers.filter((row: any) => row.enabled && row.protocol === (state.acquisitionMode === "usenet" ? "newznab" : "torznab"));
+          if (!selected.length) return fail("Add an enabled indexer for the selected download engine.");
+          for (const indexer of selected) {
+            if (!(await call(`/api/v1/indexers/${encodeURIComponent(indexer.id)}/test`, "POST")).ok) return fail("An indexer test failed. Check its settings and retry.");
+          }
+          const { results } = await call("/api/v1/libraries/validate");
+          if (!results.some((row: any) => row.library.enabled && row.ok)) return fail("Add and verify an import destination in Libraries.");
+          return { status: "done", detail: "Engine configuration, indexer connections, download roots and library paths checked. Download and import are not yet verified." };
+        }
+        if (id === "metadata") {
+          if (state.metadataQuery.trim().length < 2) return fail("Enter a title with at least two characters and run a search.");
+          const status = await call("/api/v1/acquisition/metadata");
+          if (status.mode === "fixture") return fail("Fixture metadata cannot verify a real search. Configure hosted or direct access.");
+          const result = await call(`/api/v1/acquisition/search?${new URLSearchParams({ query: state.metadataQuery, kind: "all" })}`);
+          if (!result.candidates?.length) return fail("No titles returned. Check the query or provider settings and retry.");
+          return { status: "done", detail: "A real metadata title search succeeded." };
+        }
+        if (id === "first-title") {
+          const { items } = await call("/api/v1/catalog");
+          const item = items.find((row: any) => row.fileId === state.titleFileId);
+          if (!item) return fail("Select a catalogued title. Scan a library or wait for the selected download to import.");
+          if (state.downloadJobId) {
+            const { jobs } = await call("/api/v1/queue?includeHistory=1");
+            const job = jobs.find((row: any) => row.jobId === state.downloadJobId);
+            if (!job || job.itemKey !== item.itemKey) return fail("Select the catalogued file for the chosen download.");
+            if (job.state !== "completed") return fail("The selected download has not completed. Check Downloads or leave it for later.");
+            if (item.method === "existing") return fail("This is an existing local file. Select the imported download to verify acquisition.");
+            return { status: "done", detail: "Selected download completed. Import and catalog entry verified separately. Playback remains a separate check." };
+          }
+          return { status: "done", detail: item.method === "existing" ? "Existing file is catalogued. No download was tested." : "Selected file is imported and catalogued." };
+        }
+        if (id === "playback") {
+          if (!state.mediaEnabled) return { status: "skipped", detail: "Tantalar Media is disabled." };
+          if (!state.titleFileId) return fail("Select a title before checking playback.");
+          const result = await call(`/api/v1/library/${encodeURIComponent(state.titleFileId)}/resume`);
+          return result.resumePoint?.positionMs > 0 ? { status: "done", detail: "The browser reported playback progress for the selected title." } : fail("Start the selected title. If playback fails, check Playback in Control.");
+        }
+        if (id === "final-health") {
+          // Media capability readiness is separate from the Control backend.
+          const missing = deps.readiness?.().missingCapabilities ?? [];
+          const ready = deps.ready() || missing.length > 0 && missing.every(cap => cap === "dev.tantalar.capability.serving");
+          return { status: "done", detail: ready ? "Control is reachable. No missing backend capabilities reported." : "Control is reachable. Required backend capabilities have warnings; review System health." };
+        }
+        return undefined;
+      } catch {
+        return fail("The check could not finish. Review this step's settings and retry, or leave it for later.");
+      }
+    };
+
+    app.get("/api/v1/onboarding", async (request: any, reply: any) => {
+      // First-run probe: before the administrator exists there is no session
+      // to authenticate, so the wizard could never appear. The read is
+      // anonymous only while bootstrap is required (zero users); it exposes
+      // nothing but step statuses. Mutations always require auth + CSRF.
+      if (await deps.auth.isBootstrapRequired()) {
+        return onboarding.getState();
+      }
+      const auth = await requireAuth(reply, request);
+      if (!auth) return;
+      return onboarding.getState();
+    });
+
+    app.post(
+      "/api/v1/onboarding/steps/:stepId",
+      { schema: { body: StepActionBody } },
+      async (request: any, reply: any) => {
+        const auth = await requireAuth(reply, request);
+        if (!auth) return;
+        if (auth.kind !== "session" || auth.role !== "admin") {
+          return reply.code(403).send({ error: "administrator access required" });
+        }
+        if (!csrfOk(request)) return reply.code(403).send({ error: "csrf required" });
+        try {
+          const snapshot = await onboarding.getState();
+          const state = await onboarding.setStep(
+            String(request.params?.stepId ?? ""),
+            request.body.action,
+            request.body.action === "complete" ? await checkStep(String(request.params?.stepId ?? ""), request, snapshot) : undefined,
+            snapshot,
+          );
+          return state;
+        } catch (err) {
+          const status = err instanceof OnboardingError ? err.statusCode : 500;
+          return reply.code(status).send({ error: (err as Error).message });
+        }
+      },
+    );
+  }
+
+  // Sign-in and sign-out audit. A failed attempt names the account only when it
+  // exists, so a password typed into the username field is never stored.
+  const auditSession = async (action: string, userId: string | null, username: string | null, ip: string) => {
+    if (!deps.db) return;
+    await deps.db
+      .insertInto("audit_log")
+      .values({
+        id: uuidv7(),
+        actorUserId: userId,
+        actorUsername: username,
+        action,
+        targetType: "session",
+        targetId: userId ?? "unknown",
+        detail: JSON.stringify({ ip }),
+        occurredAt: new Date().toISOString(),
+      })
+      .execute();
+  };
+
+  app.post(
+    "/api/v1/auth/login",
+    { schema: { body: LoginBody } },
+    async (request: any, reply: any) => {
+      const body = request.body as { username: string; password: string } | undefined;
+      const verified = await deps.auth.verifyPassword(body?.username ?? "", body?.password ?? "");
+      if (!verified) {
+        const known = await deps.db
+          ?.selectFrom("users")
+          .select(["id", "username"])
+          .where("username", "=", body?.username ?? "")
+          .executeTakeFirst();
+        await auditSession("auth.login.failed", known?.id ?? null, known?.username ?? null, request.ip);
+        return reply.code(401).send({ error: "invalid credentials" });
+      }
+      await auditSession("auth.login.succeeded", verified.userId, body?.username ?? null, request.ip);
+      const { token, csrfToken } = await deps.auth.createSession(verified.userId);
+      reply.setCookie("tantalar_session", token, {
+        httpOnly: true,
+        sameSite: "lax",
+        secure: false, // TLS terminates at the reverse proxy (architecture §5)
+        path: "/",
+      });
+      reply.setCookie("tantalar_csrf", csrfToken, {
+        httpOnly: false,
+        sameSite: "lax",
+        secure: false,
+        path: "/",
+      });
+      return { csrfToken, role: verified.role };
+    },
+  );
+
+  // Session introspection: 401 without a session; user id + role with one.
+  app.get("/api/v1/auth/me", async (request: any, reply: any) => {
+    const token: string | undefined = request.cookies?.["tantalar_session"];
+    if (!token) return reply.code(401).send({ error: "unauthorized" });
+    const session = await deps.auth.getSession(token);
+    if (!session) return reply.code(401).send({ error: "unauthorized" });
+    const [user] = await deps.db!
+      .selectFrom("users")
+      .select(["id", "username", "role", "avatar"])
+      .where("id", "=", session.userId)
+      .execute();
+    return { user: user ? { ...user, avatar: userAvatar(user.id, user.avatar) } : null };
+  });
+
+  app.post("/api/v1/auth/logout", async (request: any, reply: any) => {
+    if (!csrfOk(request)) return reply.code(403).send({ error: "csrf required" });
+    const token: string | undefined = request.cookies?.["tantalar_session"];
+    if (token) {
+      const session = await deps.auth.getSession(token);
+      if (session) {
+        const user = await deps.db?.selectFrom("users").select("username").where("id", "=", session.userId).executeTakeFirst();
+        await auditSession("auth.logout", session.userId, user?.username ?? null, request.ip);
+      }
+      await deps.auth.destroySession(token);
+    }
+    reply.clearCookie("tantalar_session");
+    reply.clearCookie("tantalar_csrf");
+    return { ok: true };
+  });
+
+  app.get("/api/v1/events", async (request: any, reply: any) => {
+    if (!(await requireAuth(reply, request, "events.read"))) return;
+    const q = (request.query ?? {}) as Record<string, string | undefined>;
+    const requestedLimit = q.limit === undefined ? 100 : Number(q.limit);
+    if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1) {
+      return reply.code(400).send({ error: "limit must be a positive integer" });
+    }
+    const limit = Math.min(requestedLimit, 500);
+    const events = await deps.bus.read({
+      ...(q.typePrefix ? { typePrefix: q.typePrefix } : {}),
+      ...(q.correlationId ? { correlationId: q.correlationId } : {}),
+      ...(q.subject ? { subject: q.subject } : {}),
+      ...(q.afterEventId ? { afterEventId: q.afterEventId } : {}),
+      limit,
+      newestFirst: true,
+    });
+    return { events };
+  });
+
+  app.get("/api/v1/events/feed", { websocket: true } as any, (socket: any, request: any) => {
+    void (async () => {
+      const auth = await authenticate(request, "events.read");
+      if (auth === "forbidden") {
+        socket.close(4403, "insufficient scope");
+        return;
+      }
+      if (!auth) {
+        socket.close(4401, "unauthorized");
+        return;
+      }
+      const query: Record<string, string | undefined> = request.query ?? {};
+      const unsub = deps.bus.subscribe(query.typePrefix ?? "", (envelope) => {
+        if (query.subject && envelope.subject !== query.subject) return;
+        socket.send(JSON.stringify(envelope));
+      });
+      socket.on("close", unsub);
+    })();
+  });
+
+  app.get("/api/v1/plugins", async (request: any, reply: any) => {
+    if (!(await requireAuth(reply, request, "plugins.read"))) return;
+    return { plugins: deps.supervisor.list() };
+  });
+
+  // ---- Phase 5A serving routes ----
+  // The serving capability provider is resolved lazily so routes exist only
+  // when the plugin is mounted; every handler authorizes via the plugin.
+  if (deps.serving) {
+    let cached: ServingDeps | null = null;
+    const servingDeps = (): ServingDeps => {
+      if (!cached) {
+        cached = deps.serving!((operation, payload) => {
+          const provider = deps.container.resolve("dev.tantalar.capability.serving");
+          return provider.invoke(operation, payload);
+        });
+        // The core guard's signature is (reply, request, scope); serving
+        // routes call (request, reply, scope), so swap the first two args.
+        cached.requireAuth = ((req: unknown, rep: unknown, scope?: string) => {
+          // Cookie-authenticated MUTATIONS require the CSRF double-submit
+          // token (ADR-0011) — enforced here so every serving route
+          // (resume, negotiate, transcode-session, subtitles POST, DELETE)
+          // is covered without relying on each handler remembering it.
+          const method = (req as { method?: string }).method ?? "";
+          const hasAuthHeader = typeof (req as { headers?: Record<string, unknown> }).headers?.authorization === "string";
+          const hasSessionCookie = !!(req as { cookies?: Record<string, string | undefined> }).cookies?.["tantalar_session"];
+          if (!hasAuthHeader && hasSessionCookie && ["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
+            const headers = (req as { headers?: Record<string, unknown> }).headers ?? {};
+            const raw = headers["x-csrf-token"];
+            const headerToken = Array.isArray(raw) ? String(raw[0]) : typeof raw === "string" ? raw : undefined;
+            const cookies = (req as { cookies?: Record<string, string | undefined> }).cookies;
+            if (!AuthService.verifyCsrf(cookies?.["tantalar_csrf"], headerToken)) {
+              void ((rep as { code: (n: number) => { send: (b: unknown) => unknown } }).code(403).send({ error: "csrf required" }));
+              return Promise.resolve(null);
+            }
+          }
+          return (requireAuth as unknown as (
+            rep2: unknown,
+            req2: unknown,
+            sc?: string,
+          ) => Promise<{ kind: "session" | "apiKey"; scopes: string[]; userId?: string; role?: string } | null>)(
+            rep,
+            req,
+            scope,
+          );
+        }) as ServingDeps["requireAuth"];
+      }
+      return cached;
+    };
+    registerServingRoutes(app, {
+      ...servingDeps(),
+      enrichItems: async items => {
+        const enriched = await movieMetadata.enrichItems(items);
+        const files = await deps.db?.selectFrom("media_catalog").select(["fileId", "quality"]).execute() ?? [];
+        const quality = new Map(files.map(file => [file.fileId, file.quality]));
+        return enriched.map(item => ({ ...item, ...(quality.get(item.fileId) && quality.get(item.fileId) !== "unknown" ? { qualityProfile: quality.get(item.fileId) } : {}) }));
+      },
+      artwork: async (fileId, variant) => {
+        const item = await deps.db?.selectFrom("media_catalog").select("itemKey").where("fileId", "=", fileId).executeTakeFirst();
+        if (!item) throw new Error("artwork unavailable");
+        return movieMetadata.itemArtwork(item.itemKey, variant);
+      },
+    });
+  }
+
+  app.post("/api/v1/plugins/:id/capabilities/:capability/:operation", async (request: any, reply: any) => {
+    const auth = await requireAuth(reply, request, "plugins.invoke");
+    if (!auth) return;
+    if (auth.kind === "session" && auth.role !== "admin") {
+      return reply.code(403).send({ error: "administrator required" });
+    }
+    if (!csrfOk(request)) return reply.code(403).send({ error: "csrf required" });
+    const capability: string = request.params?.["capability"] ?? "";
+    const pluginId: string = request.params?.["id"] ?? "";
+    let provider;
+    try {
+      provider = deps.container.resolveProvider(capability, pluginId);
+    } catch (err) {
+      return reply.code(503).send({ error: (err as Error).message });
+    }
+    const result = await provider.invoke(
+      request.params?.["operation"] ?? "",
+      (request.body as Record<string, unknown>) ?? {},
+    );
+    return { result };
+  });
+
+  // ---- Phase 6 admin surface (users, ui-preferences, themes, health) ----
+  // Routes exist when the caller supplies a DB handle; the guard chain is
+  // the same requireAuth + CSRF discipline as every other route, plus an
+  // admin-only role check inside registerAdminRoutes.
+  if (deps.db) {
+    const adminDeps: AdminDeps = {
+      auth: deps.auth,
+      db: deps.db,
+      supervisorList: () =>
+        deps.supervisor.list().map((p) => ({
+          manifest: { id: p.manifest.id, version: p.manifest.version },
+          state: p.state,
+          restartCount: p.restartCount,
+        })),
+      ready: deps.ready,
+    };
+    registerAdminRoutes(app, adminDeps);
+  }
+
+  // ---- Wave 3 library management (TAN-020/021) ----
+  // Same guard chain as admin: authenticated, admin-only for mutations,
+  // CSRF on cookie mutations. Reads are available to any signed-in user.
+  if (deps.library) {
+    registerLibraryRoutes(app, {
+      service: deps.library,
+      // Reads: any authenticated user. Mutations: admin + CSRF.
+      requireUser: async (request: any, reply: any) => {
+        const auth = await requireAuth(reply, request);
+        return auth ? { userId: auth.userId ?? "", role: auth.role ?? "viewer" } : null;
+      },
+      requireAdmin: async (request: any, reply: any) => {
+        const auth = await requireAuth(reply, request);
+        if (!auth) return null;
+        if (auth.kind !== "session" || auth.role !== "admin") {
+          await reply.code(403).send({ error: "administrator access required" });
+          return null;
+        }
+        return { userId: auth.userId ?? "", role: "admin" };
+      },
+      csrfOk,
+    });
+  }
+
+  // ---- Wave 7 indexer management (TAN-014) ----
+  // Same guard chain as libraries: authenticated reads, admin + CSRF
+  // mutations. Indexer records are always redacted (no apikey leaves core).
+  if (deps.indexerSettings) {
+    registerIndexerRoutes(app, {
+      service: deps.indexerSettings,
+      requireUser: async (request: any, reply: any) => {
+        const auth = await requireAuth(reply, request);
+        return auth ? { userId: auth.userId ?? "", role: auth.role ?? "viewer" } : null;
+      },
+      requireAdmin: async (request: any, reply: any) => {
+        const auth = await requireAuth(reply, request);
+        if (!auth) return null;
+        if (auth.kind !== "session" || auth.role !== "admin") {
+          await reply.code(403).send({ error: "administrator access required" });
+          return null;
+        }
+        return { userId: auth.userId ?? "", role: "admin" };
+      },
+      csrfOk,
+    });
+  }
+
+  // ---- Wave 10 naming/import settings (TAN-022) ----
+  // Reads for any signed-in user; mutations admin-only with CSRF. All work
+  // flows through the library plugin's public importer capability.
+  {
+    const invokeImporter = async (operation: string, payload: Record<string, unknown>) => {
+      const provider = deps.container.resolve("dev.tantalar.capability.importer");
+      return provider.invoke(operation, payload);
+    };
+    const importerAvailable = deps.container.hasProviders("dev.tantalar.capability.importer");
+    if (importerAvailable) {
+    registerNamingRoutes(app, {
+      invoke: invokeImporter,
+      requireUser: async (request: any, reply: any) => {
+        const auth = await requireAuth(reply, request);
+        return auth ? { userId: auth.userId ?? "", role: auth.role ?? "viewer" } : null;
+      },
+      requireAdmin: async (request: any, reply: any) => {
+        const auth = await requireAuth(reply, request);
+        if (!auth) return null;
+        if (auth.kind !== "session" || auth.role !== "admin") {
+          await reply.code(403).send({ error: "administrator access required" });
+          return null;
+        }
+        return { userId: auth.userId ?? "", role: "admin" };
+      },
+      csrfOk,
+    });
+    }
+  }
+
+  // ---- Wave 9 operations surface (TAN-030–043) ----
+  // Same guard chain as admin: authenticated, admin-only mutations with CSRF.
+  if (deps.ops) {
+    registerOpsRoutes(app, { ...deps.ops, ...(deps.library ? { library: deps.library } : {}) }, movieMetadata);
+  }
+
+  // Web UI (architecture §4): in production the built SPA under apps/web/dist
+  // is served by this process. Absent dist (dev: vite dev server on :5173
+  // proxies /api here) means API-only — never a hard failure.
+  const webRoot = resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    "../../web/dist",
+  );
+  if (existsSync(join(webRoot, "index.html"))) {
+    await app.register(fastifyStatic, { root: webRoot, index: "index.html" } satisfies FastifyStaticOptions);
+    // SPA fallback: any non-API GET serves the app shell.
+    app.setNotFoundHandler((request, reply) => {
+      if (request.method === "GET" && !request.url.startsWith("/api/") &&
+          !request.url.startsWith("/healthz") && !request.url.startsWith("/readyz")) {
+        return (reply as unknown as { sendFile(f: string): unknown }).sendFile("index.html");
+      }
+      return reply.code(404).send({ message: `Route ${request.method}:${request.url} not found`, error: "Not Found", statusCode: 404 });
+    });
+  }
+
+  // Runtime OpenAPI document (architecture §10: generated, not hand-written).
+  app.get("/openapi.json", async () => ({
+    openapi: "3.0.3",
+    info: {
+      title: "Tantalar API",
+      version: TANTALAR_RELEASE.version,
+      "x-tantalar-release-label": TANTALAR_RELEASE.label,
+      "x-tantalar-release-channel": TANTALAR_RELEASE.channel,
+    },
+    paths: {
+      "/healthz": { get: { responses: { "200": { description: "liveness" } } } },
+      "/readyz": { get: { responses: { "200": { description: "readiness" }, "503": { description: "not ready" } } } },
+      "/api/v1/version": { get: { responses: { "200": { description: "application and build version" } } } },
+      "/api/v1/auth/login": {
+        post: {
+          requestBody: { content: { "application/json": { schema: LoginBody } } },
+          responses: { "200": { description: "session established" }, "401": { description: "invalid credentials" } },
+        },
+      },
+      "/api/v1/auth/logout": { post: { responses: { "200": { description: "logged out" }, "403": { description: "csrf required" } } } },
+      "/api/v1/events": { get: { responses: { "200": { description: "event replay" }, "401": { description: "unauthorized" } } } },
+      "/api/v1/events/feed": { get: { responses: { "101": { description: "websocket event feed" } } } },
+      "/api/v1/plugins": { get: { responses: { "200": { description: "plugin list" } } } },
+      "/api/v1/plugins/{id}/capabilities/{capability}/{operation}": {
+        post: { responses: { "200": { description: "capability result" }, "503": { description: "capability unavailable" } } },
+      },
+      "/api/v1/bootstrap/admin": {
+        post: {
+          responses: {
+            "200": { description: "initial administrator created" },
+            "400": { description: "invalid credentials" },
+            "403": { description: "bootstrap already completed" },
+          },
+        },
+      },
+      "/api/v1/onboarding": {
+        get: { responses: { "200": { description: "guided-onboarding state" } } },
+      },
+      "/api/v1/onboarding/steps/{stepId}": {
+        post: {
+          requestBody: { content: { "application/json": { schema: StepActionBody } } },
+          responses: {
+            "200": { description: "step updated" },
+            "400": { description: "step cannot be skipped" },
+            "404": { description: "unknown step" },
+            "409": { description: "earlier steps still pending" },
+          },
+        },
+      },
+    },
+  }));
+
+  return app;
+}

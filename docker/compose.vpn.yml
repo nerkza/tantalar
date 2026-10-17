@@ -1,0 +1,13 @@
+# Download-only WireGuard support. Use with your existing Tantalar Compose file.
+# From the repository root:
+# docker compose -f docker/compose.sqlite.yml -f docker/compose.vpn.yml up -d --build
+# Existing named data volumes are preserved. No VPN credentials belong in this file.
+services:
+  tantalar:
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
+    environment:
+      TANTALAR_INSTALL_VPN_TOOLS: "1"

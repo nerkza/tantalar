@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../../plugins/vpn-manager" },
+    { "path": "../../plugins/indexer-torznab-newznab" }
+  ],
+  "include": ["src"]
+}

@@ -1,0 +1,40 @@
+# PostgreSQL deployment. The database URL is supplied through the
+# TANTALAR_SECRET_DATABASE_POSTGRES_URL secret variable (never bake it into
+# the image or a plain environment entry).
+services:
+  tantalar:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        TANTALAR_BUILD_VERSION: ${TANTALAR_IMAGE_TAG:-0.0.1-alpha.0}
+        TANTALAR_BUILD_REVISION: ${TANTALAR_BUILD_REVISION:-}
+        TANTALAR_BUILD_DATE: ${TANTALAR_BUILD_DATE:-}
+    image: tantalar:${TANTALAR_IMAGE_TAG:-0.0.1-alpha.0}
+    ports:
+      - "8790:8790"
+    environment:
+      TANTALAR_DB_DIALECT: postgres
+      TANTALAR_SECRET_DATABASE_POSTGRES_URL: "postgres://tantalar:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@db:5432/tantalar"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: tantalar
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}"
+      POSTGRES_DB: tantalar
+    volumes:
+      - tantalar-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tantalar -d tantalar"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+volumes:
+  tantalar-pg:

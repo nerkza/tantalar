@@ -1,0 +1,120 @@
+.tantalar-grid-resizer {
+  position: absolute;
+  inset-block: 0;
+  inset-inline-end: -0.25rem;
+  width: 0.5rem;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+  z-index: 1;
+}
+
+.tantalar-grid-resizer::after {
+  content: "";
+  position: absolute;
+  inset-block: 20%;
+  inset-inline-start: calc(50% - 1px);
+  width: 2px;
+  border-radius: 1px;
+  background: var(--tantalar-color-border);
+  opacity: 0;
+  transition: opacity 120ms ease, background-color 120ms ease;
+}
+
+.tantalar-grid-resizer:hover::after,
+.tantalar-grid-resizer:focus-visible::after {
+  opacity: 1;
+  background: var(--tantalar-color-primary);
+}
+
+.tantalar-grid-row-action {
+  cursor: pointer;
+}
+
+.tantalar-grid-row-action:focus-visible {
+  outline: 2px solid var(--tantalar-color-primary);
+  outline-offset: -2px;
+}
+
+.tantalar-grid-row-action[data-selected] {
+  background: color-mix(in srgb, var(--tantalar-color-primary) 11%, transparent);
+}
+
+.tantalar-dense-grid__toolbar {
+  min-height: 2.25rem;
+  align-items: flex-start;
+}
+
+.tantalar-explorer { min-width: 0; width: 100%; }
+.tantalar-explorer__search { width: 15rem; max-width: 100%; }
+.tantalar-explorer__controls { flex: 1; justify-content: flex-end; }
+.tantalar-explorer__layouts { flex-wrap: wrap; }
+.tantalar-explorer__layouts button { min-height: 1.5rem; height: 1.5rem; padding-inline: calc(var(--tantalar-space-unit, 4px) * 1.5); font-size: calc(var(--tantalar-font-size-base, 15px) * .8); font-weight: 500; }
+.tantalar-explorer__layouts button .mantine-Button-section { margin-inline-end: var(--tantalar-space-unit, 4px); }
+.tantalar-explorer__layouts button svg { width: .8rem; height: .8rem; }
+@media (pointer: coarse) { .tantalar-explorer__layouts button { min-height: 2rem; height: 2rem; } }
+.tantalar-explorer__layouts button[aria-pressed="true"] { border-color: color-mix(in srgb, var(--tantalar-color-text-dimmed) 45%, var(--tantalar-color-border)); background: color-mix(in srgb, var(--tantalar-color-text) 7%, var(--tantalar-color-surface-raised)); box-shadow: none; }
+.tantalar-explorer__filter-panel { min-width: 0; margin-bottom: calc(var(--tantalar-space-unit, 4px) * 3); padding: calc(var(--tantalar-space-unit, 4px) * 3); border: 1px solid var(--tantalar-color-border, #2c3143); border-radius: var(--tantalar-radius-md, 8px); background: var(--tantalar-color-surface, #191c27); }
+.tantalar-explorer__filter-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 13rem), 1fr)); gap: calc(var(--tantalar-space-unit, 4px) * 3); padding-top: calc(var(--tantalar-space-unit, 4px) * 3); }
+.tantalar-explorer__filter-fields > * { min-width: 0; }
+.tantalar-explorer__labels { display: flex; flex-wrap: wrap; gap: calc(var(--tantalar-space-unit) * 2); }
+.tantalar-metadata-tag, .tantalar-explorer__label-button { display: inline-flex; align-items: center; max-width: 100%; padding: var(--tantalar-space-unit, 4px) calc(var(--tantalar-space-unit, 4px) * 2); border: 1px solid var(--tantalar-color-border, #2c3143); border-radius: calc(var(--tantalar-radius-md, 8px) * .5); background: var(--tantalar-color-surface-raised, #222634); color: var(--tantalar-color-text, #eef0f6); font: inherit; font-size: .85em; line-height: 1.2; text-align: start; text-decoration: none; overflow-wrap: anywhere; }
+.tantalar-explorer__label-button { cursor: pointer; }
+.tantalar-explorer__label-button:hover { border-color: var(--tantalar-color-primary, #4d8df6); }
+.tantalar-explorer__label-button:focus-visible { outline: 2px solid var(--tantalar-color-primary); outline-offset: 3px; }
+.tantalar-explorer__items { display: grid; gap: calc(var(--tantalar-space-unit) * 3); }
+.tantalar-explorer[data-view="columns"] .tantalar-explorer__items { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.tantalar-explorer[data-view="small"] .tantalar-explorer__items { grid-template-columns: repeat(auto-fill, minmax(min(100%, 10rem), 1fr)); }
+.tantalar-explorer[data-view="medium"] .tantalar-explorer__items { grid-template-columns: repeat(auto-fill, minmax(min(100%, 15rem), 1fr)); }
+.tantalar-explorer[data-view="large"] .tantalar-explorer__items { grid-template-columns: repeat(auto-fill, minmax(min(100%, 21rem), 1fr)); }
+.tantalar-explorer__item {
+  min-width: 0; display: flex; flex-direction: column; gap: calc(var(--tantalar-space-unit) * 3);
+  padding: calc(var(--tantalar-space-unit) * 3); border: 1px solid var(--tantalar-color-border);
+  border-radius: var(--tantalar-radius-md, 8px); background: var(--tantalar-color-surface);
+}
+.tantalar-explorer__item[data-selected] { border-color: var(--tantalar-color-primary); background: color-mix(in srgb, var(--tantalar-color-primary) 10%, var(--tantalar-color-surface)); }
+.tantalar-explorer__fields { min-width: 0; display: flex; flex-direction: column; gap: calc(var(--tantalar-space-unit) * 2); }
+.tantalar-explorer__basics > div { min-width: 0; max-width: 100%; }
+.tantalar-explorer__field { min-width: 0; overflow-wrap: anywhere; }
+.tantalar-explorer__field[data-primary] { font-weight: 600; }
+.tantalar-explorer__label { color: var(--tantalar-color-text-dimmed); font-size: 0.8em; }
+.tantalar-explorer__field[data-action] { margin-top: auto; }
+.tantalar-explorer__more { grid-column: 1 / -1; flex-basis: 100%; font-size: 0.9em; }
+.tantalar-explorer__more > summary { cursor: pointer; color: var(--tantalar-color-text-dimmed); }
+.tantalar-explorer__more[open] { display: grid; gap: calc(var(--tantalar-space-unit) * 3); }
+.tantalar-explorer__basics { display: flex; flex-wrap: wrap; gap: calc(var(--tantalar-space-unit) * 3); color: var(--tantalar-color-text-dimmed); font-size: 0.875rem; }
+.tantalar-explorer__basics:empty { display: none; }
+.tantalar-explorer__basics .tantalar-explorer__label-button { color: inherit; text-decoration: none; }
+.tantalar-explorer__basics .tantalar-explorer__label-button:hover { border-color: var(--tantalar-color-primary, #4d8df6); }
+.tantalar-explorer:is([data-view="columns"], [data-view="small"], [data-view="medium"], [data-view="large"]) .tantalar-explorer__fields { flex: 1; }
+.tantalar-explorer:is([data-view="columns"], [data-view="small"], [data-view="medium"], [data-view="large"]) .tantalar-explorer__field[data-primary] { font-size: 1.0625rem; line-height: 1.4; }
+.tantalar-explorer:is([data-view="columns"], [data-view="small"], [data-view="medium"], [data-view="large"]) .tantalar-explorer__field[data-action] { padding-top: calc(var(--tantalar-space-unit) * 2); }
+.tantalar-explorer__artwork { width: 100%; min-width: 0; }
+.tantalar-explorer__artwork > * { width: 100%; max-width: 100%; }
+.tantalar-explorer__table-title { display: flex; align-items: center; gap: calc(var(--tantalar-space-unit) * 3); min-width: 0; }
+.tantalar-explorer__table-title > div { flex: 0 0 2.5rem; }
+.tantalar-explorer__table-title > span { overflow: hidden; text-overflow: ellipsis; }
+.tantalar-explorer__table-title .tantalar-movie-artwork { width: 100%; max-width: 100%; }
+.tantalar-explorer[data-view="list"] .tantalar-explorer__item { flex-direction: row; align-items: flex-start; }
+.tantalar-explorer[data-view="list"] .tantalar-explorer__artwork { flex: 0 0 4rem; }
+.tantalar-explorer[data-view="columns"] .tantalar-explorer__item { flex-direction: row; align-items: stretch; }
+.tantalar-explorer[data-view="columns"] .tantalar-explorer__artwork { flex: 0 0 clamp(4.5rem, 9vw, 7rem); align-self: flex-start; }
+.tantalar-explorer[data-view="list"] .tantalar-explorer__fields { flex: 1; flex-direction: row; flex-wrap: wrap; gap: calc(var(--tantalar-space-unit) * 3) calc(var(--tantalar-space-unit) * 5); align-items: flex-start; }
+.tantalar-explorer[data-view="list"] .tantalar-explorer__field[data-primary] { flex-basis: 100%; }
+.tantalar-explorer[data-view="list"] .tantalar-explorer__field[data-action] { margin-inline-start: auto; align-self: center; }
+.tantalar-explorer[data-density="comfortable"] .tantalar-explorer__item { padding: calc(var(--tantalar-space-unit) * 4); }
+@media (max-width: 48em) {
+  .tantalar-explorer__controls { justify-content: flex-start; }
+  .tantalar-explorer[data-view="columns"] .tantalar-explorer__items { grid-template-columns: minmax(0, 1fr); }
+  .tantalar-explorer[data-view="list"] .tantalar-explorer__fields { display: flex; align-items: stretch; }
+}
+
+.tantalar-grid-table th,
+.tantalar-grid-table td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tantalar-grid-table td[data-action] { white-space: normal; }

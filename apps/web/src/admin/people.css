@@ -1,0 +1,9 @@
+.tantalar-people { max-width: 76rem; }
+.tantalar-people .tantalar-explorer:is([data-view="small"], [data-view="medium"], [data-view="large"]) .tantalar-explorer__artwork { aspect-ratio: 1; }
+.tantalar-people .tantalar-explorer__artwork .tantalar-profile-picture { width: 100%; height: 100%; }
+.tantalar-people__name { padding: 0; border: 0; background: transparent; color: inherit; font: inherit; font-weight: 600; text-align: left; cursor: pointer; }
+.tantalar-people__name:focus-visible { outline: 2px solid var(--tantalar-color-primary, #4d8df6); outline-offset: 2px; }
+.tantalar-people__picture { display: block; width: 100%; padding: 0; border: 0; background: transparent; cursor: pointer; border-radius: var(--tantalar-radius-md, 8px); }
+.tantalar-people__picture:focus-visible { outline: 2px solid var(--tantalar-color-primary, #4d8df6); outline-offset: 2px; }
+.tantalar-people__identity > div:first-child { width: calc(var(--tantalar-space-unit, 4px) * 16); flex-shrink: 0; }
+.tantalar-people__confirmation { border: 1px solid var(--tantalar-color-border, #2c3143); border-radius: var(--tantalar-radius-md, 8px); padding: calc(var(--tantalar-space-unit, 4px) * 3); }

@@ -1,0 +1,21 @@
+.tantalar-logo {
+  display: block;
+  width: calc(var(--tantalar-space-unit, 4px) * 40);
+  max-width: 100%;
+  flex-shrink: 0;
+}
+
+.tantalar-logo img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.tantalar-logo .tantalar-logo__light,
+:root[data-mantine-color-scheme="light"] .tantalar-logo__dark {
+  display: none;
+}
+
+:root[data-mantine-color-scheme="light"] .tantalar-logo__light {
+  display: block;
+}
