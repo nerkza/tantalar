@@ -1,7 +1,7 @@
 {
   "name": "tantalar",
   "private": true,
-  "version": "0.0.1-alpha.0",
+  "version": "0.0.1-alpha.1",
   "tantalarRelease": {
     "label": "0.0.1 Alpha",
     "channel": "alpha"

@@ -6,10 +6,10 @@ services:
       context: ..
       dockerfile: Dockerfile
       args:
-        TANTALAR_BUILD_VERSION: ${TANTALAR_IMAGE_TAG:-0.0.1-alpha.0}
+        TANTALAR_BUILD_VERSION: ${TANTALAR_IMAGE_TAG:-0.0.1-alpha.1}
         TANTALAR_BUILD_REVISION: ${TANTALAR_BUILD_REVISION:-}
         TANTALAR_BUILD_DATE: ${TANTALAR_BUILD_DATE:-}
-    image: tantalar:${TANTALAR_IMAGE_TAG:-0.0.1-alpha.0}
+    image: tantalar:${TANTALAR_IMAGE_TAG:-0.0.1-alpha.1}
     ports:
       - "8790:8790"
     volumes:

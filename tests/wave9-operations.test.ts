@@ -1259,7 +1259,7 @@ describe("wave 9 diagnostics + support bundle (TAN-043)", () => {
       capabilities: { downloadClientMounted: boolean; torrentEngineMounted: boolean; usenetEngineMounted: boolean; vpnMounted: boolean };
     };
     expect(diag.versions.node).toMatch(/^v\d+/);
-    expect(diag.versions.tantalar).toMatchObject({ version: "0.0.1-alpha.0", label: "0.0.1 Alpha" });
+    expect(diag.versions.tantalar).toMatchObject({ version: "0.0.1-alpha.1", label: "0.0.1 Alpha" });
     expect(Array.isArray(diag.plugins)).toBe(true);
     expect(diag.resources.uptimeSeconds).toBeGreaterThanOrEqual(0);
     expect(Number.isNaN(Date.parse(diag.resources.startedAt))).toBe(false);
@@ -1301,7 +1301,7 @@ describe("wave 9 diagnostics + support bundle (TAN-043)", () => {
     const b = (await bundle.json()) as {
       bundle: { versions: { tantalar: { version: string; label: string } } } & Record<string, unknown>;
     };
-    expect(b.bundle.versions.tantalar).toMatchObject({ version: "0.0.1-alpha.0", label: "0.0.1 Alpha" });
+    expect(b.bundle.versions.tantalar).toMatchObject({ version: "0.0.1-alpha.1", label: "0.0.1 Alpha" });
     const serialized = JSON.stringify(b.bundle);
     expect(serialized).not.toContain("Wave Nine"); // media titles redacted
     expect(serialized).not.toMatch(/tantalar_[A-Za-z0-9_-]{10,}/); // no API keys

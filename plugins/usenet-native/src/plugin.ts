@@ -295,6 +295,24 @@ async function saveResume(doc: ResumeDoc): Promise<void> {
   await storePut(RESUME_KEY, doc);
 }
 
+let resumeUpdates: Promise<unknown> = Promise.resolve();
+
+/**
+ * Read, change, and save the resume state as one queued step. The worker and
+ * the control operations interleave across awaits; with separate load and
+ * save calls, a worker save from a stale read erased newly added jobs.
+ */
+function updateResume<T>(change: (doc: ResumeDoc) => T | Promise<T>): Promise<T> {
+  const update = resumeUpdates.then(async () => {
+    const doc = await loadResume();
+    const result = await change(doc);
+    await saveResume(doc);
+    return result;
+  });
+  resumeUpdates = update.catch(() => undefined);
+  return update;
+}
+
 // ---- Storage safety ----------------------------------------------------------------
 
 export function containedInRoot(p: string): string | null {
@@ -473,11 +491,11 @@ async function addJob(rawPayload: unknown): Promise<DownloadStatus> {
   );
   assertNntpReady();
 
-  const doc = await loadResume();
   // Idempotent add by itemKey.
-  const existingId = Object.entries(doc.jobs).find(
+  const activeJob = (doc: ResumeDoc) => Object.entries(doc.jobs).find(
     ([, j]) => j.itemKey === req.itemKey && !j.failedReason && engine.get(j.jobId),
   );
+  const existingId = activeJob(await loadResume());
   if (existingId) return statusOf(existingId[0], existingId[1]);
 
   assertStorageSafe(0);
@@ -495,23 +513,29 @@ async function addJob(rawPayload: unknown): Promise<DownloadStatus> {
   );
   assertStorageSafe(declaredSize);
 
-  doc.seq += 1;
-  const downloadId = `un-${String(doc.seq).padStart(4, "0")}`;
-  const downloadPath = join(cfg.downloadRoots[0] ?? "", downloadId);
-  assertPerJobRoot(downloadPath);
-  const added = await engine.add({ sourceKind: "nzb-path", sourcePath, downloadPath });
-  const job: StoredJob = {
-    itemKey: req.itemKey,
-    title: req.title,
-    jobId: added.id,
-    nzbPath: sourcePath,
-    downloadPath,
-    queuePosition: await nextQueuePosition(doc),
-    resume: engine.snapshot(added.id),
-    ...(req.correlationId ? { correlationId: req.correlationId } : {}),
-  };
-  doc.jobs[downloadId] = job;
-  await saveResume(doc);
+  const stored = await updateResume(async (doc) => {
+    const concurrent = activeJob(doc);
+    if (concurrent) return { downloadId: concurrent[0], job: concurrent[1], added: null };
+    doc.seq += 1;
+    const downloadId = `un-${String(doc.seq).padStart(4, "0")}`;
+    const downloadPath = join(cfg.downloadRoots[0] ?? "", downloadId);
+    assertPerJobRoot(downloadPath);
+    const added = await engine.add({ sourceKind: "nzb-path", sourcePath, downloadPath });
+    const job: StoredJob = {
+      itemKey: req.itemKey,
+      title: req.title,
+      jobId: added.id,
+      nzbPath: sourcePath,
+      downloadPath,
+      queuePosition: await nextQueuePosition(doc),
+      resume: engine.snapshot(added.id),
+      ...(req.correlationId ? { correlationId: req.correlationId } : {}),
+    };
+    doc.jobs[downloadId] = job;
+    return { downloadId, job, added };
+  });
+  const { downloadId, job, added } = stored;
+  if (!added) return statusOf(downloadId, job);
 
   await emitFn?.(
     EventTypes.DownloadQueued,
@@ -564,9 +588,9 @@ async function pauseJob(payload: Record<string, unknown>): Promise<DownloadStatu
   const { job, id } = await requireJob(payload);
   engine.pause(job.jobId);
   job.resume = engine.snapshot(job.jobId);
-  const doc = await loadResume();
-  doc.jobs[id] = job;
-  await saveResume(doc);
+  await updateResume((doc) => {
+    doc.jobs[id] = job;
+  });
   await emitFn?.(EventTypes.DownloadProgress, { downloadId: id, itemKey: job.itemKey, paused: true }, jobEventOptions(job));
   return statusOf(id, job);
 }
@@ -580,9 +604,9 @@ async function resumeJob(payload: Record<string, unknown>): Promise<DownloadStat
   assertNntpReady();
   engine.resume(job.jobId);
   job.resume = engine.snapshot(job.jobId);
-  const doc = await loadResume();
-  doc.jobs[id] = job;
-  await saveResume(doc);
+  await updateResume((doc) => {
+    doc.jobs[id] = job;
+  });
   return statusOf(id, job);
 }
 
@@ -590,9 +614,9 @@ async function removeJob(payload: Record<string, unknown>): Promise<{ removed: b
   const { job } = await requireJob(payload);
   const keepFiles = payload.keepFiles !== false;
   await engine.remove(job.jobId, { keepFiles });
-  const doc = await loadResume();
-  delete doc.jobs[String(payload.downloadId ?? "")];
-  await saveResume(doc);
+  await updateResume((doc) => {
+    delete doc.jobs[String(payload.downloadId ?? "")];
+  });
   return { removed: true };
 }
 
@@ -615,9 +639,9 @@ async function retryJob(payload: Record<string, unknown>): Promise<DownloadStatu
   engine.resume(added.id);
   job.resume = engine.snapshot(added.id);
   job.failedReason = undefined;
-  const doc = await loadResume();
-  doc.jobs[id] = job;
-  await saveResume(doc);
+  await updateResume((doc) => {
+    doc.jobs[id] = job;
+  });
   return statusOf(id, job);
 }
 
@@ -652,13 +676,14 @@ async function advanceAll(): Promise<{ downloads: DownloadStatus[] }> {
     await publishJobStatus(downloadId, job);
   }
   // Controls may change the stored queue while an article or extraction is running.
-  const current = await loadResume();
-  for (const [downloadId, job] of ordered) {
-    if (current.jobs[downloadId]?.jobId === job.jobId && engine.get(job.jobId)) {
-      current.jobs[downloadId] = { ...current.jobs[downloadId]!, resume: engine.snapshot(job.jobId), failedReason: job.failedReason };
+  const current = await updateResume((current) => {
+    for (const [downloadId, job] of ordered) {
+      if (current.jobs[downloadId]?.jobId === job.jobId && engine.get(job.jobId)) {
+        current.jobs[downloadId] = { ...current.jobs[downloadId]!, resume: engine.snapshot(job.jobId), failedReason: job.failedReason };
+      }
     }
-  }
-  await saveResume(current);
+    return current;
+  });
   const downloads = Object.entries(current.jobs)
     .map(([id, job]) => statusOf(id, job))
     .sort((a, b) => a.downloadId.localeCompare(b.downloadId));
@@ -710,55 +735,55 @@ async function setQueuePosition(payload: Record<string, unknown>): Promise<Downl
   const { job, id } = await requireJob(payload);
   const pos = Number(payload.queuePosition ?? 0);
   if (!(pos >= 1)) throw new DownloadClientError("invalid_request", "queuePosition must be >= 1");
-  const doc = await loadResume();
   job.queuePosition = pos;
-  doc.jobs[id] = job;
-  await saveResume(doc);
+  await updateResume((doc) => {
+    doc.jobs[id] = job;
+  });
   return statusOf(id, job);
 }
 
 /** Restart recovery: reload persisted jobs; the engine re-adds from the NZB path. */
 async function recoverOnMount(): Promise<number> {
-  const doc = await loadResume();
-  let recovered = 0;
-  for (const [downloadId, job] of Object.entries(doc.jobs)) {
-    if (engine.get(job.jobId)) {
-      recovered += 1;
-      await emitFn?.(EventTypes.DownloadProgress, {
-        downloadId,
-        itemKey: job.itemKey,
-        recovered: true,
-      }, jobEventOptions(job));
-      continue;
-    }
-    try {
-      job.downloadPath = job.downloadPath || join(cfg.downloadRoots[0] ?? "", downloadId);
-      assertPerJobRoot(job.downloadPath);
-      assertSafeNzbSource(job.nzbPath);
-      const added = await engine.add({
-        sourceKind: "nzb-path",
-        sourcePath: job.nzbPath,
-        downloadPath: job.downloadPath,
-        ...(job.resume ? { resume: job.resume } : {}),
-      });
-      if (added.id !== job.jobId) {
-        // Re-add produced a fresh engine id — remap so the durable record keeps working.
-        job.jobId = added.id;
-        doc.jobs[downloadId] = job;
+  return updateResume(async (doc) => {
+    let recovered = 0;
+    for (const [downloadId, job] of Object.entries(doc.jobs)) {
+      if (engine.get(job.jobId)) {
+        recovered += 1;
+        await emitFn?.(EventTypes.DownloadProgress, {
+          downloadId,
+          itemKey: job.itemKey,
+          recovered: true,
+        }, jobEventOptions(job));
+        continue;
       }
-      job.resume = engine.snapshot(added.id);
-      recovered += 1;
-      await emitFn?.(EventTypes.DownloadProgress, {
-        downloadId,
-        itemKey: job.itemKey,
-        recovered: true,
-      }, jobEventOptions(job));
-    } catch (err) {
-      logFn?.("warn", `recovery skipped ${job.itemKey}: ${(err as Error).message}`);
+      try {
+        job.downloadPath = job.downloadPath || join(cfg.downloadRoots[0] ?? "", downloadId);
+        assertPerJobRoot(job.downloadPath);
+        assertSafeNzbSource(job.nzbPath);
+        const added = await engine.add({
+          sourceKind: "nzb-path",
+          sourcePath: job.nzbPath,
+          downloadPath: job.downloadPath,
+          ...(job.resume ? { resume: job.resume } : {}),
+        });
+        if (added.id !== job.jobId) {
+          // Re-add produced a fresh engine id — remap so the durable record keeps working.
+          job.jobId = added.id;
+          doc.jobs[downloadId] = job;
+        }
+        job.resume = engine.snapshot(added.id);
+        recovered += 1;
+        await emitFn?.(EventTypes.DownloadProgress, {
+          downloadId,
+          itemKey: job.itemKey,
+          recovered: true,
+        }, jobEventOptions(job));
+      } catch (err) {
+        logFn?.("warn", `recovery skipped ${job.itemKey}: ${(err as Error).message}`);
+      }
     }
-  }
-  await saveResume(doc);
-  return recovered;
+    return recovered;
+  });
 }
 
 async function loadPersistedServers(): Promise<UsenetServerConfig[] | null> {
@@ -940,6 +965,8 @@ const plugin: PluginDefinition = definePlugin({
     },
   },
 });
+
+export default plugin;
 
 // Unit tests import the fail-closed gate from this module. Do not attach the
 // plugin control protocol to their process stdin. The supervisor always sets

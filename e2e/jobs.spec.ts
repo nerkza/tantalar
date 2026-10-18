@@ -3,6 +3,8 @@ import { fillSafely, signIn } from "./helpers";
 import { BUILT_IN_THEMES } from "../apps/web/src/theme/tokens";
 
 test("Jobs controls operate through the API and remain usable at desktop and phone widths", async ({ page }) => {
+  // Three themes at two widths with full-page screenshots.
+  test.slow();
   let scheme = "dark";
   await page.route("**/api/v1/users/*/ui-preferences", route => route.fulfill({ json: { preferences: { colorScheme: scheme === "light" ? "light" : "dark", tokenOverrides: scheme === "graphite" ? BUILT_IN_THEMES.find(p => p.id === "graphite")!.tokens : {} } } }));
   await signIn(page);
@@ -47,6 +49,8 @@ test("Jobs controls operate through the API and remain usable at desktop and pho
     await page.getByRole("button", { name: "Edit HD profile", exact: true }).click();
     const editor = page.getByRole("dialog");
     const order = editor.getByRole("list", { name: "Allowed qualities" });
+    // Hover waits for the dialog transition to end, so the boxes are final.
+    await editor.getByRole("button", { name: "Reorder 720p", exact: true }).hover();
     const source = await editor.getByRole("button", { name: "Reorder 720p", exact: true }).boundingBox();
     const target = await editor.getByRole("button", { name: "Reorder 1080p", exact: true }).boundingBox();
     await page.mouse.move(source!.x + 20, source!.y + source!.height / 2);
@@ -63,6 +67,7 @@ test("Jobs controls operate through the API and remain usable at desktop and pho
     await page.getByRole("button", { name: "Edit HD profile", exact: true }).click();
     await expect(editor.getByRole("checkbox", { name: "Allow upgrades" })).toBeChecked();
     await editor.getByRole("checkbox", { name: "Prefer proper / repack releases" }).uncheck();
+    await editor.getByRole("button", { name: "Reorder 720p", exact: true }).hover();
     const touchSource = await editor.getByRole("button", { name: "Reorder 720p", exact: true }).boundingBox();
     const touchTarget = await editor.getByRole("button", { name: "Reorder 1080p", exact: true }).boundingBox();
     const cdp = await page.context().newCDPSession(page);

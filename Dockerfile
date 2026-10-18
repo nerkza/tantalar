@@ -5,7 +5,7 @@
 #   docker run -p 8790:8790 -v tantalar-data:/data tantalar:<version>
 # See docs/deploy.md for PostgreSQL mode and compose examples.
 
-ARG TANTALAR_BUILD_VERSION=0.0.1-alpha.0
+ARG TANTALAR_BUILD_VERSION=0.0.1-alpha.1
 ARG TANTALAR_BUILD_REVISION=""
 ARG TANTALAR_BUILD_DATE=""
 

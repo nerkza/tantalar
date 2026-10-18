@@ -1,6 +1,6 @@
 # Releasing Tantalar
 
-Current release: **0.0.1 Alpha** (`0.0.1-alpha.0`).
+Current release: **0.0.1 Alpha** (`0.0.1-alpha.1`).
 
 Status: **pre-release**. Alpha releases can change configuration and data
 formats between versions. Back up before every upgrade (see [deploy.md](deploy.md)).
@@ -14,7 +14,7 @@ Plugin manifest versions remain independent because plugins have separate
 compatibility and release lifecycles.
 
 ```sh
-pnpm version:set -- <semver> "<human label>" <channel>
+pnpm version:set <semver> "<human label>" <channel>
 pnpm run version:check
 ```
 

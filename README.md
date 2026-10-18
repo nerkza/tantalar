@@ -2,7 +2,7 @@
 
 One self-hosted web app to replace the Plex + \*arr + downloader stack. Library serving, wanted-list automation, indexer search, NZB/torrent acquisition, and post-processing — built "everything is a module/plugin" from the ground up.
 
-- **Status**: `0.0.1-alpha.0` (**0.0.1 Alpha**) is under active development.
+- **Status**: `0.0.1-alpha.1` (**0.0.1 Alpha**) is under active development.
 - **Architecture**: [docs/architecture.md](./docs/architecture.md) — components, topology, trust boundaries, failure modes
 - **Deployment**: [docs/deploy.md](./docs/deploy.md) — Docker, PostgreSQL, upgrades, and backups
 - **Releases**: [docs/release.md](./docs/release.md) — versions, tags, and images

@@ -70,7 +70,7 @@ describe("HTTP auth boundaries", () => {
     expect(health.status).toBe(200);
     expect(await health.json()).toMatchObject({
       ok: true,
-      version: { version: "0.0.1-alpha.0", label: "0.0.1 Alpha", channel: "alpha" },
+      version: { version: "0.0.1-alpha.1", label: "0.0.1 Alpha", channel: "alpha" },
     });
     const ready = await fetch(`${address}/readyz`);
     expect(ready.status).toBe(200);
@@ -78,7 +78,7 @@ describe("HTTP auth boundaries", () => {
 
     const version = await fetch(`${address}/api/v1/version`);
     expect(version.status).toBe(200);
-    expect(await version.json()).toMatchObject({ version: "0.0.1-alpha.0", label: "0.0.1 Alpha" });
+    expect(await version.json()).toMatchObject({ version: "0.0.1-alpha.1", label: "0.0.1 Alpha" });
   });
 
   it("login sets opaque session + CSRF cookies; wrong password rejected", async () => {
@@ -278,7 +278,7 @@ describe("events REST API", () => {
       paths: Record<string, unknown>;
     };
     expect(doc.openapi.startsWith("3.")).toBe(true);
-    expect(doc.info.version).toBe("0.0.1-alpha.0");
+    expect(doc.info.version).toBe("0.0.1-alpha.1");
     expect(doc.info["x-tantalar-release-label"]).toBe("0.0.1 Alpha");
     expect(Object.keys(doc.paths)).toContain("/api/v1/auth/login");
     expect(Object.keys(doc.paths)).toContain("/api/v1/version");

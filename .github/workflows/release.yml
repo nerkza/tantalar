@@ -3,6 +3,8 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Recovery: run manually on the release tag if the tag push did not start a run.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -18,7 +20,7 @@ jobs:
 
   publish:
     needs: ci
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
       packages: write

@@ -24,7 +24,7 @@ describe("Tantalar release version", () => {
       channel: manifest.tantalarRelease.channel,
     });
     expect(TANTALAR_RELEASE).toEqual({
-      version: "0.0.1-alpha.0",
+      version: "0.0.1-alpha.1",
       label: "0.0.1 Alpha",
       channel: "alpha",
     });
@@ -33,15 +33,15 @@ describe("Tantalar release version", () => {
   it("reports exact supplied build metadata and rejects a version mismatch", () => {
     expect(
       getVersionMetadata({
-        TANTALAR_BUILD_VERSION: "0.0.1-alpha.0",
+        TANTALAR_BUILD_VERSION: "0.0.1-alpha.1",
         TANTALAR_BUILD_COMMIT: "0123456789abcdef",
         TANTALAR_BUILD_DATE: "2026-08-24T19:00:00Z",
       }),
     ).toMatchObject({
-      version: "0.0.1-alpha.0",
+      version: "0.0.1-alpha.1",
       label: "0.0.1 Alpha",
       build: {
-        version: "0.0.1-alpha.0",
+        version: "0.0.1-alpha.1",
         commit: "0123456789abcdef",
         builtAt: "2026-08-24T19:00:00Z",
       },
@@ -51,11 +51,11 @@ describe("Tantalar release version", () => {
     );
     expect(
       formatStartupBanner("http://127.0.0.1:8790", {
-        TANTALAR_BUILD_VERSION: "0.0.1-alpha.0",
+        TANTALAR_BUILD_VERSION: "0.0.1-alpha.1",
         TANTALAR_BUILD_COMMIT: "0123456789abcdef",
       }),
     ).toBe(
-      "Tantalar 0.0.1 Alpha (0.0.1-alpha.0; 0123456789abcdef) listening on http://127.0.0.1:8790\n",
+      "Tantalar 0.0.1 Alpha (0.0.1-alpha.1; 0123456789abcdef) listening on http://127.0.0.1:8790\n",
     );
   });
 
@@ -65,7 +65,7 @@ describe("Tantalar release version", () => {
         cwd: root,
         encoding: "utf8",
       }),
-    ).toContain("0.0.1 Alpha (0.0.1-alpha.0, alpha)");
+    ).toContain("0.0.1 Alpha (0.0.1-alpha.1, alpha)");
   });
 
   it("updates every derived release marker through the bump command", () => {

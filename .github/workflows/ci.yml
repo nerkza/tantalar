@@ -8,7 +8,7 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         node: ["22"]
@@ -81,7 +81,7 @@ jobs:
   browser-staging:
     # Report the full suite separately; staging deployment requires the smoke tests above.
     if: github.event_name == 'push' && github.ref == 'refs/heads/staging'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -104,7 +104,7 @@ jobs:
           retention-days: 7
 
   licenses:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -123,7 +123,7 @@ jobs:
           path: artifacts/
 
   docker:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: check
     permissions:
       contents: read
@@ -156,7 +156,7 @@ jobs:
         if: always()
         run: docker rm -f tantalar-smoke || true
   vulnerability-scan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

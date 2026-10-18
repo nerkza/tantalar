@@ -1,6 +1,6 @@
 # Deploying Tantalar
 
-Current release: **0.0.1 Alpha** (`0.0.1-alpha.0`).
+Current release: **0.0.1 Alpha** (`0.0.1-alpha.1`).
 
 One command, one image. SQLite is the default database; PostgreSQL is a
 configuration choice, not a different image.
